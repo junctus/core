@@ -243,4 +243,20 @@ mod tests {
         let shares = encrypt_and_slice(&KEY, b"", 2, 1).unwrap();
         assert_eq!(reassemble_and_decrypt(&KEY, &shares).unwrap(), b"");
     }
+
+    #[test]
+    fn share_from_bytes_roundtrips_and_survives_garbage() {
+        let shares = encrypt_and_slice(&KEY, b"hi", 2, 1).unwrap();
+        assert_eq!(Share::from_bytes(&shares[0].to_bytes()).unwrap(), shares[0]);
+
+        let mut seed = 0xabcd_ef01u64;
+        for _ in 0..3000 {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let len = (seed >> 40) as usize % 96;
+            let bytes: Vec<u8> = (0..len).map(|i| (seed >> (i % 8 * 8)) as u8).collect();
+            let _ = Share::from_bytes(&bytes);
+        }
+    }
 }

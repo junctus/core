@@ -4,6 +4,24 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Decentralized peer/relay discovery (libp2p DHT) and NAT traversal."
+description = "Decentralized peer/relay discovery and NAT-traversal strategy for neo."
+
+[features]
+default = []
+# The real rust-libp2p backend (Kademlia DHT + identify). Off by default because
+# it pulls a large dependency tree; the in-memory backend needs none of it.
+libp2p = ["dep:libp2p"]
 
 [dependencies]
+neo-core.workspace = true
+tokio.workspace = true
+getrandom.workspace = true
+libp2p = { version = "0.54", optional = true, features = [
+    "tokio",
+    "tcp",
+    "noise",
+    "yamux",
+    "kad",
+    "identify",
+    "macros",
+] }

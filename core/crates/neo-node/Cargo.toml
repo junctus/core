@@ -6,10 +6,17 @@ rust-version.workspace = true
 license.workspace = true
 description = "The neo engine: wires the crates together and runs node roles."
 
+[features]
+default = []
+# Enables the real TUN device in the data plane (needs root to run).
+tun = ["neo-dataplane/tun"]
+
 [dependencies]
 neo-core.workspace = true
 neo-crypto.workspace = true
 neo-slicing.workspace = true
 neo-routing.workspace = true
+neo-mix.workspace = true
+neo-dataplane.workspace = true
 tokio.workspace = true
 tracing.workspace = true

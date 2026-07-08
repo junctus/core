@@ -7,3 +7,6 @@ license.workspace = true
 description = "Cover traffic and per-hop Poisson timing mixing for neo."
 
 [dependencies]
+neo-core.workspace = true
+tokio.workspace = true
+getrandom.workspace = true

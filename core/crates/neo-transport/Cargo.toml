@@ -4,6 +4,23 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Pluggable transport trait and DPI-resistant obfuscation for neo."
+description = "Pluggable, DPI-resistant transport for neo (obfuscation over TCP)."
+
+[features]
+default = []
+# A real QUIC transport (quinn). Off by default — pulls quinn/rustls/rcgen.
+quic = ["dep:quinn", "dep:rustls", "dep:rcgen"]
 
 [dependencies]
+neo-core.workspace = true
+tokio.workspace = true
+getrandom.workspace = true
+quinn = { version = "0.11", optional = true, default-features = false, features = [
+    "runtime-tokio",
+    "rustls-ring",
+] }
+rustls = { version = "0.23", optional = true, default-features = false, features = [
+    "ring",
+    "std",
+] }
+rcgen = { version = "0.13", optional = true }

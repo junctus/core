@@ -5,21 +5,25 @@
 //! - an **X25519** key-exchange key (classical KEX), and
 //! - an **ML-KEM-768** key-encapsulation key (post-quantum KEX).
 //!
-//! The X25519 and ML-KEM keys together give a hybrid key exchange that stays
-//! secure if *either* component holds — the defense against "harvest-now,
-//! decrypt-later" quantum attacks. `neo-crypto` folds both into the handshake
-//! (plan M0/M2); this module owns the long-term keys and the stable [`NodeId`]
-//! derived from all three public keys.
+//! A **Ristretto** routing key for Sphinx (`neo-crypto`) is derived
+//! deterministically from the signing seed, so it needs no extra storage and is
+//! bound to the identity. The X25519 and ML-KEM keys together give a hybrid key
+//! exchange secure if *either* holds — the defense against "harvest-now,
+//! decrypt-later" quantum attacks.
 //!
-//! TODO(security): wrap secret key material in `zeroize` types so it is scrubbed
-//! on drop. The current handling is not sufficient for a release.
+//! Secret buffers are scrubbed with `zeroize`; the dalek key types also zeroize
+//! their own material on drop.
 
 use crate::error::{Error, Result};
 use core::fmt;
 
+use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
+use curve25519_dalek::ristretto::CompressedRistretto;
+use curve25519_dalek::Scalar;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use ml_kem::{Encoded, EncodedSizeUser, KemCore, MlKem768};
 use x25519_dalek::{PublicKey as KexPublic, StaticSecret as KexSecret};
+use zeroize::Zeroize;
 
 /// ML-KEM secret (decapsulation) key type for the chosen parameter set.
 type KemDecapKey = <MlKem768 as KemCore>::DecapsulationKey;
@@ -29,7 +33,7 @@ type KemEncapKey = <MlKem768 as KemCore>::EncapsulationKey;
 /// Length of the two classical seeds at the start of a serialized identity.
 const CLASSICAL_SEED_LEN: usize = 64;
 
-/// A stable, self-certifying node identifier: BLAKE3 over all public keys.
+/// A stable, self-certifying node identifier: BLAKE3 over the public keys.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId([u8; 32]);
 
@@ -37,6 +41,11 @@ impl NodeId {
     /// The raw 32-byte identifier.
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    /// Reconstruct an identifier from raw bytes (e.g. a discovery record).
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        NodeId(bytes)
     }
 
     /// Full lowercase-hex encoding of the identifier.
@@ -76,6 +85,8 @@ pub struct NodePublic {
     pub kex: KexPublic,
     /// ML-KEM-768 encapsulation key (post-quantum KEX).
     pub kem: KemEncapKey,
+    /// Compressed Ristretto routing public key (for Sphinx).
+    pub sphinx: [u8; 32],
     /// Stable identifier derived from the public keys.
     pub id: NodeId,
 }
@@ -93,10 +104,12 @@ impl NodeIdentity {
         let mut signing_seed = [0u8; 32];
         getrandom::getrandom(&mut signing_seed).map_err(|e| Error::Rng(e.to_string()))?;
         let signing = SigningKey::from_bytes(&signing_seed);
+        signing_seed.zeroize();
 
         let mut kex_seed = [0u8; 32];
         getrandom::getrandom(&mut kex_seed).map_err(|e| Error::Rng(e.to_string()))?;
         let kex = KexSecret::from(kex_seed);
+        kex_seed.zeroize();
 
         // ML-KEM keygen draws directly from the OS CSPRNG.
         let (kem, _kem_public) = MlKem768::generate(&mut rand_core::OsRng);
@@ -114,6 +127,7 @@ impl NodeIdentity {
             signing,
             kex,
             kem,
+            sphinx: self.sphinx_public(),
             id,
         }
     }
@@ -131,15 +145,46 @@ impl NodeIdentity {
     /// Static X25519 Diffie–Hellman with a peer's KEX public key.
     ///
     /// Returns the raw shared secret; callers must run it through a KDF before
-    /// use. This backs per-hop onion key agreement in `neo-crypto`.
+    /// use. This backs classical key agreement in `neo-crypto`.
     pub fn diffie_hellman(&self, peer: &KexPublic) -> [u8; 32] {
         self.kex.diffie_hellman(peer).to_bytes()
+    }
+
+    /// Compressed Ristretto routing public key used by Sphinx (`neo-crypto`).
+    pub fn sphinx_public(&self) -> [u8; 32] {
+        (RISTRETTO_BASEPOINT_POINT * self.route_scalar())
+            .compress()
+            .to_bytes()
+    }
+
+    /// Sphinx shared secret `route_scalar · alpha` (compressed). Errors if
+    /// `alpha` is not a valid Ristretto point.
+    pub fn sphinx_shared(&self, alpha: [u8; 32]) -> Result<[u8; 32]> {
+        let point = CompressedRistretto::from_slice(&alpha)
+            .map_err(|_| Error::Decode("bad Ristretto point length".into()))?
+            .decompress()
+            .ok_or_else(|| Error::Crypto("alpha is not a valid Ristretto point".into()))?;
+        Ok((point * self.route_scalar()).compress().to_bytes())
+    }
+
+    /// Derive the Sphinx routing scalar from the signing seed (never stored).
+    fn route_scalar(&self) -> Scalar {
+        let mut seed = self.signing.to_bytes();
+        let mut wide = [0u8; 64];
+        let mut xof = blake3::Hasher::new_derive_key("neo-sphinx-routing-key-v1");
+        xof.update(&seed);
+        xof.finalize_xof().fill(&mut wide);
+        let scalar = Scalar::from_bytes_mod_order_wide(&wide);
+        seed.zeroize();
+        wide.zeroize();
+        scalar
     }
 
     /// Serialize the secret identity for on-disk persistence.
     ///
     /// Layout: `[0..32]` Ed25519 seed, `[32..64]` X25519 secret scalar, then the
-    /// ML-KEM-768 decapsulation key (fixed length for the parameter set).
+    /// ML-KEM-768 decapsulation key (fixed length for the parameter set). The
+    /// Ristretto routing key is re-derived, not stored.
     pub fn to_bytes(&self) -> Vec<u8> {
         let kem_bytes = self.kem.as_bytes();
         let mut out = Vec::with_capacity(CLASSICAL_SEED_LEN + kem_bytes.len());
@@ -167,11 +212,14 @@ impl NodeIdentity {
             .map_err(|_| Error::Decode("invalid ML-KEM decapsulation key length".to_string()))?;
         let kem = KemDecapKey::from_bytes(&encoded);
 
-        Ok(Self {
+        let identity = Self {
             signing: SigningKey::from_bytes(&signing_seed),
             kex: KexSecret::from(kex_seed),
             kem,
-        })
+        };
+        signing_seed.zeroize();
+        kex_seed.zeroize();
+        Ok(identity)
     }
 }
 
@@ -181,33 +229,41 @@ mod tests {
 
     #[test]
     fn identity_roundtrips_through_bytes() {
-        let id = NodeIdentity::generate().expect("generate");
+        let id = NodeIdentity::generate().unwrap();
         let restored = NodeIdentity::from_bytes(&id.to_bytes()).expect("from_bytes");
         assert_eq!(id.public().id, restored.public().id);
         assert_eq!(id.to_bytes(), restored.to_bytes());
+        // The derived Ristretto routing key survives a round-trip too.
+        assert_eq!(id.sphinx_public(), restored.sphinx_public());
     }
 
     #[test]
     fn node_id_is_stable() {
-        let id = NodeIdentity::generate().expect("generate");
+        let id = NodeIdentity::generate().unwrap();
         assert_eq!(id.id(), id.public().id);
     }
 
     #[test]
     fn distinct_identities_have_distinct_ids() {
-        let a = NodeIdentity::generate().expect("generate");
-        let b = NodeIdentity::generate().expect("generate");
+        let a = NodeIdentity::generate().unwrap();
+        let b = NodeIdentity::generate().unwrap();
         assert_ne!(a.id(), b.id());
     }
 
     #[test]
     fn serialized_identity_includes_pq_key() {
-        // Classical seeds are 64 bytes; a PQ-hybrid identity is much larger.
-        let id = NodeIdentity::generate().expect("generate");
-        assert!(
-            id.to_bytes().len() > CLASSICAL_SEED_LEN + 1000,
-            "expected ML-KEM key to dominate the serialized size"
-        );
+        let id = NodeIdentity::generate().unwrap();
+        assert!(id.to_bytes().len() > CLASSICAL_SEED_LEN + 1000);
+    }
+
+    #[test]
+    fn sphinx_shared_is_symmetric() {
+        // route_a · (route_b · G) == route_b · (route_a · G)
+        let a = NodeIdentity::generate().unwrap();
+        let b = NodeIdentity::generate().unwrap();
+        let ab = a.sphinx_shared(b.sphinx_public()).unwrap();
+        let ba = b.sphinx_shared(a.sphinx_public()).unwrap();
+        assert_eq!(ab, ba);
     }
 
     #[test]

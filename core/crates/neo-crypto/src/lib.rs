@@ -10,11 +10,11 @@
 #![forbid(unsafe_code)]
 
 pub mod handshake;
-pub mod onion;
 pub mod session;
+pub mod sphinx;
 
 pub use handshake::{
     initiator_finish, initiator_message1, responder_process, HandshakeResult, Initiator,
 };
-pub use onion::{peel, wrap, OnionHop, Peeled};
-pub use session::Session;
+pub use session::{Opener, Sealer, Session};
+pub use sphinx::{create_packet, process, Processed, ReplayCache, SphinxHop, SphinxPacket};

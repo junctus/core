@@ -2,8 +2,10 @@
 
 A dispersed, post-quantum, verifiable, censorship-resistant privacy overlay — a "new kind of VPN".
 
-> **Status:** early foundation (milestone M0). Not usable yet, and **not audited** — do not rely on
-> neo for real-world safety. See [`docs/`](docs/) and the milestone plan.
+> **Status:** M0–M9 core mechanisms implemented and tested — full Sphinx, PQ-hybrid handshake,
+> information slicing, timing mixing, obfuscated transport, exit policy, a real libp2p stack, and the
+> mobile FFI. **Not audited** — do not rely on neo for real-world safety. The frontier tier
+> (M10–M13) is next. See [`docs/MILESTONES.md`](docs/MILESTONES.md).
 
 ## What makes it different
 

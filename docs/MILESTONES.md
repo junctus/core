@@ -31,17 +31,18 @@ PQ-hybrid handshake + encrypted session between two peers.
   real handshake + encrypted ping/pong over TCP (**demoed live between two processes**).
   `neo-dataplane` has the packet abstraction + in-memory link (tested) and a `tun-rs` TUN wrapper
   (compiles under the `tun` feature).
-- Deferred: bridging real OS traffic through the TUN device (needs root + two hosts); the QUIC /
-  obfuscated transport, which is M6 — M1 uses plain TCP for now.
-- Tests: handshake agreement, tamper + replay rejection, TCP handshake/ping-pong.
+- Done (data plane): `neo run --tun` bridges a real TUN device through the tunnel
+  (`neo-node::tunnel` — session seal/open + mixer); compiles under the `tun` feature, needs root to run.
+- Deferred: the QUIC / obfuscated transport (M6) — the wire is plain TCP for now.
+- Tests: handshake agreement, tamper + replay rejection, TCP handshake/ping-pong, tunnel round-trip.
 
-### M2 — Onion routing ✅
-Per-hop layered encryption + node-disjoint path selection.
-- Done: `neo-crypto::onion` — each hop peels exactly one X25519 layer and learns only the next hop;
-  `neo-routing` — fresh-per-request path selection and mutually node-disjoint multipaths for shares.
-- Deferred: full Sphinx properties (fixed-size padding, bitwise unlinkability, replay tags) and a
-  per-hop PQ KEM (the end-to-end session is already PQ via M1).
-- Tests: 3-hop peel to payload, wrong-hop rejection, path distinctness/disjointness.
+### M2 — Onion routing ✅ (full Sphinx)
+Full Sphinx over Ristretto + node-disjoint path selection.
+- Done: `neo-crypto::sphinx` — fixed-size packets, per-hop blinded shared secrets, the filler trick,
+  per-layer MACs, an onion-encrypted payload, and replay tags; `neo-routing` — fresh-per-request path
+  selection and mutually node-disjoint multipaths for shares.
+- Deferred: reaching hops behind NAT (DCUtR/relay — part of M4's libp2p work).
+- Tests: 1/3/5-hop delivery, constant packet size, tamper + replay + wrong-hop rejection, payload hiding.
 
 ### M3 — Information slicing ✅ (novel core, part 1)
 Encrypt-then-slice into k-of-n shares, with reassembly.
@@ -50,37 +51,54 @@ Encrypt-then-slice into k-of-n shares, with reassembly.
 - End-to-end: `neo-node`'s integration test runs **M3 → M2 → M3** (slice → onion over disjoint paths
   → peel at each hop → reassemble + decrypt), proving no single relay holds a complete, readable flow.
 
-### M4 — Decentralization ⬜
-Trackerless discovery + NAT traversal via libp2p (Kademlia DHT, DCUtR hole-punch, Relay v2 fallback).
-- Crates: `neo-discovery`, `neo-transport`.
+### M4 — Decentralization ✅ (real libp2p backend + in-memory DHT)
+Discovery interface, NAT-traversal strategy, an in-memory DHT, and a real libp2p stack.
+- Done: `neo-discovery` — `Discovery` trait, `LocalRegistry` (in-memory DHT for tests), and
+  `connection_ladder` (Direct → hole-punch → relay). `libp2p_backend` (feature `libp2p`) — a real
+  Swarm with **Kademlia DHT + identify** over TCP/Noise/yamux; two nodes connect in a local test.
+- Done: `Libp2pDiscovery` implements the `Discovery` trait via a background swarm task + command
+  channel — announce/lookup map to Kademlia put/get; a record announced on one node is found on
+  another via the DHT.
+- Deferred: DCUtR hole-punching and Circuit Relay v2 for reaching peers behind NAT.
+- Tests: in-memory announce/lookup/sampling/ladder; two libp2p nodes connect; cross-node DHT lookup.
 
-### M5 — Timing defense ⬜ (novel core, part 2)
-Cover traffic + per-hop Poisson timing mixing, scaled by the adaptive privacy dial.
-- Crates: `neo-mix`.
-- Done when: added latency/bandwidth is measured and cover traffic is statistically indistinguishable
-  from real traffic.
+### M5 — Timing defense ✅ (novel core, part 2)
+Cover traffic + per-packet Poisson timing mixing, scaled by the privacy dial.
+- Done: `neo-mix` — exponential per-packet delays, Poisson cover traffic, `MixParams::for_level`, and
+  an async `Mixer` over channels.
+- Done (wiring): the mixer is wired into the tunnel data plane (`neo-node::tunnel::run_tunnel`).
+- Tests: delay-mean statistics, dial → params mapping, every real packet delivered, tunnel round-trip,
+  and a **global-passive-observer simulation** (mixing decorrelates output order from input).
 
-### M6 — Unblockable ⬜
-Pluggable obfuscation ladder — QUIC → MASQUE/HTTP-3 → Snowflake-style WebRTC → (REALITY later) —
-wrapping all libp2p traffic (its wire protocol is DPI-fingerprintable); DoH rendezvous.
-- Crates: `neo-transport`, `neo-discovery`.
-- Done when: traffic reads as ordinary QUIC/HTTP-3 to an entropy/DPI classifier.
+### M6 — Unblockable ✅ (obfuscation + QUIC; MASQUE/WebRTC/REALITY deferred)
+A pluggable `Transport` with length obfuscation, plus a real QUIC transport.
+- Done: `neo-transport` — `Transport`/`Obfuscation` traits with `Plain` and `Bucketed` (length
+  quantization + random padding) over TCP; `quic` (feature) — a real **QUIC** transport via `quinn`
+  (self-signed; neo authenticates above it).
+- Deferred: MASQUE (CONNECT-UDP/HTTP-3), Snowflake-style WebRTC, and REALITY; DoH rendezvous.
+- Tests: length quantization, shared-bucket sizes, TCP round-trip, QUIC round-trip.
 
-### M7 — Diffused exit ⬜
-Fresh-per-request routing + rotating opt-in clearnet exits + exit policy (the *statistical* form of
-"no responsible exit").
-- Crates: `neo-routing`, `neo-node`.
+### M7 — Diffused exit ✅
+Fresh-per-request routing + rotating opt-in exits + exit policy (the *statistical* "no responsible exit").
+- Done: `neo-routing::exit` — `ExitPolicy` (opt-in, off by default, port rules), `ExitSelector`
+  (rotates, never an immediate repeat), `RouteRegistry` (no concurrent full-route reuse).
+- Tests: exit off by default, port enforcement, exit rotation, concurrent-route disjointness.
 
-### M8 — Mobile ⬜
-iOS (NEPacketTunnelProvider) + Android (VpnService) over `neo-ffi` (UniFFI); adaptive privacy dial.
-- Crates: `neo-ffi`; `platforms/ios`, `platforms/android`.
-- Constraints: iOS 50 MiB extension cap → minimize buffering; Android Doze throttles background;
-  batch packets across the FFI boundary; no committee/PIR on-device.
+### M8 — Mobile ✅ (FFI + UniFFI compile; native app builds deferred)
+FFI surface over the core + iOS/Android project scaffolds.
+- Done: `neo-ffi` — safe API (identity generate / node id), builds as `cdylib`/`staticlib`, and the
+  `uniffi` feature compiles the UniFFI scaffolding. Skeletons in `platforms/ios` and
+  `platforms/android`.
+- Deferred: building the actual apps (needs Xcode / Gradle / NDK), `uniffi-bindgen` binding
+  generation, and the on-device TUN packet loop.
+- Tests: FFI generate → derive-id round-trip, invalid-input handling.
 
-### M9 — Core hardening ⬜
-Threat-model doc sharpened, adversary simulations, fuzzing — a gate before wider testing.
-- Done when: local, colluding-relay, and global-passive adversaries are simulated and what each
-  learns is measured.
+### M9 — Core hardening ✅ (adversary sims, fuzzing, threat model; audit pending)
+Adversary-simulation tests, fuzzing, and an expanded threat model.
+- Done: adversary tests (colluding relays, single relay, on-path observer); a global-passive-observer
+  timing sim (M5); `fuzz/` cargo-fuzz targets for the wire parsers plus stable no-panic-on-garbage
+  tests; the "Simulated adversaries" section in `docs/THREAT_MODEL.md`.
+- Deferred: the external security + cryptography audit (the hard gate before real use).
 
 ---
 

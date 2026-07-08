@@ -8,7 +8,7 @@
 plaintext
   → encrypt (AEAD; keys PQ-hybrid)                      [neo-crypto]
   → slice into n shares, any k reconstruct              [neo-slicing]  (encrypt-then-slice)
-  → wrap each share in an onion/Sphinx packet           [neo-crypto]
+  → wrap each share in a fixed-size Sphinx packet       [neo-crypto]
   → assign each share a node-disjoint path (fresh/req)  [neo-routing]  (VRF-selected, M11)
   → per-hop timing mix + cover traffic                  [neo-mix]
   → send over the obfuscating transport                 [neo-transport]

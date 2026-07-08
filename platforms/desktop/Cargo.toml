@@ -10,9 +10,16 @@ description = "neo desktop daemon and CLI (macOS + Linux)."
 name = "neo"
 path = "src/main.rs"
 
+[features]
+default = []
+# Bridge a real TUN device in `neo run --tun` (needs root to run).
+tun = ["neo-node/tun", "neo-dataplane/tun"]
+
 [dependencies]
 neo-core.workspace = true
 neo-node.workspace = true
+neo-mix.workspace = true
+neo-dataplane.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 tokio.workspace = true

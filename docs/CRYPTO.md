@@ -19,8 +19,9 @@
 
 ## Node identity
 
-`NodeIdentity` = Ed25519 signing key + X25519 KEX key (+ ML-KEM key, being wired). `NodeId` =
-`BLAKE3("neo-node-id-v1" ‖ signing_pub ‖ kex_pub)` — self-certifying and stable.
+`NodeIdentity` = Ed25519 signing + X25519 KEX + ML-KEM-768 KEM keys, plus a Ristretto routing key
+(for Sphinx) derived from the signing seed (never stored separately). `NodeId` =
+`BLAKE3("neo-node-id-v1" ‖ signing_pub ‖ kex_pub ‖ kem_pub)` — self-certifying and stable.
 
 ## Higher-level constructions
 
@@ -32,5 +33,6 @@
 
 ## Outstanding
 
-- Wrap secret key material in `zeroize` types (scrub on drop) before any release.
+- Secret buffers (seeds, ephemerals) and session keys are zeroized on drop; a full audit of every
+  secret's lifetime still remains.
 - External cryptography audit is a hard gate before real-world use.

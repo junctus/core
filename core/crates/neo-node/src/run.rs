@@ -7,30 +7,30 @@
 
 use neo_core::{Error, NodeIdentity, Result};
 use neo_crypto::{initiator_finish, initiator_message1, responder_process, HandshakeResult};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 /// Reject absurd frame sizes early (handshake messages are a few KB).
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 
-/// Write a length-prefixed frame.
-pub async fn write_frame(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
-    stream.write_all(&(data.len() as u32).to_be_bytes()).await?;
-    stream.write_all(data).await?;
-    stream.flush().await?;
+/// Write a length-prefixed frame to any writer (a stream or a split write half).
+pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, data: &[u8]) -> Result<()> {
+    writer.write_all(&(data.len() as u32).to_be_bytes()).await?;
+    writer.write_all(data).await?;
+    writer.flush().await?;
     Ok(())
 }
 
-/// Read a length-prefixed frame.
-pub async fn read_frame(stream: &mut TcpStream) -> Result<Vec<u8>> {
+/// Read a length-prefixed frame from any reader (a stream or a split read half).
+pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
     let mut len = [0u8; 4];
-    stream.read_exact(&mut len).await?;
+    reader.read_exact(&mut len).await?;
     let n = u32::from_be_bytes(len) as usize;
     if n > MAX_FRAME {
         return Err(Error::Decode("frame exceeds maximum size".into()));
     }
     let mut buf = vec![0u8; n];
-    stream.read_exact(&mut buf).await?;
+    reader.read_exact(&mut buf).await?;
     Ok(buf)
 }
 

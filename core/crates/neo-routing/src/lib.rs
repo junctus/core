@@ -13,13 +13,18 @@
 
 use neo_core::{Error, NodeId, Result};
 
+pub mod exit;
+pub use exit::{Destination, ExitPolicy, ExitSelector, RouteRegistry};
+
 /// A known relay that can carry (a layer of) neo traffic.
 #[derive(Clone, Debug)]
 pub struct Relay {
-    /// The relay's stable node identifier (also its onion routing address).
+    /// The relay's stable node identifier (also its Sphinx routing address).
     pub id: NodeId,
-    /// The relay's X25519 public key, raw bytes (for per-hop onion key agreement).
+    /// The relay's X25519 public key, raw bytes (for classical key agreement).
     pub kex: [u8; 32],
+    /// The relay's Ristretto routing key, raw bytes (for Sphinx).
+    pub sphinx: [u8; 32],
     /// A dialable transport address (e.g. `host:port`).
     pub addr: String,
 }
@@ -103,7 +108,7 @@ fn shuffled_indices(n: usize) -> Result<Vec<usize>> {
 
 /// A random value in `0..bound`. Modulo bias is negligible for realistic relay
 /// counts; M11's VRF selection replaces this with a verifiable construction.
-fn rand_below(bound: usize) -> Result<usize> {
+pub(crate) fn rand_below(bound: usize) -> Result<usize> {
     let mut b = [0u8; 8];
     getrandom::getrandom(&mut b).map_err(|e| Error::Rng(e.to_string()))?;
     Ok((u64::from_le_bytes(b) % bound as u64) as usize)
@@ -122,6 +127,7 @@ mod tests {
                 Relay {
                     id: pubkey.id,
                     kex: *pubkey.kex.as_bytes(),
+                    sphinx: pubkey.sphinx,
                     addr: format!("10.0.0.{i}:9000"),
                 }
             })

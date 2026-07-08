@@ -1,0 +1,49 @@
+# cargo-fuzz harness for neo's wire parsers. Detached from the main workspace
+# (own `[workspace]` table) so `cargo build` ignores it. Run with nightly:
+#   cargo install cargo-fuzz
+#   cargo +nightly fuzz run sphinx_packet
+[package]
+name = "neo-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+neo-core = { path = "../core/crates/neo-core" }
+neo-crypto = { path = "../core/crates/neo-crypto" }
+neo-slicing = { path = "../core/crates/neo-slicing" }
+neo-discovery = { path = "../core/crates/neo-discovery" }
+
+[[bin]]
+name = "sphinx_packet"
+path = "fuzz_targets/sphinx_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "share"
+path = "fuzz_targets/share.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "peer_record"
+path = "fuzz_targets/peer_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "handshake"
+path = "fuzz_targets/handshake.rs"
+test = false
+doc = false
+bench = false
