@@ -17,7 +17,7 @@
 use crate::error::{Error, Result};
 use core::fmt;
 
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use ml_kem::{Encoded, EncodedSizeUser, KemCore, MlKem768};
 use x25519_dalek::{PublicKey as KexPublic, StaticSecret as KexSecret};
 
@@ -121,6 +121,19 @@ impl NodeIdentity {
     /// The node's stable identifier.
     pub fn id(&self) -> NodeId {
         self.public().id
+    }
+
+    /// Sign a message with the node's long-term Ed25519 key.
+    pub fn sign(&self, message: &[u8]) -> Signature {
+        self.signing.sign(message)
+    }
+
+    /// Static X25519 Diffie–Hellman with a peer's KEX public key.
+    ///
+    /// Returns the raw shared secret; callers must run it through a KDF before
+    /// use. This backs per-hop onion key agreement in `neo-crypto`.
+    pub fn diffie_hellman(&self, peer: &KexPublic) -> [u8; 32] {
+        self.kex.diffie_hellman(peer).to_bytes()
     }
 
     /// Serialize the secret identity for on-disk persistence.

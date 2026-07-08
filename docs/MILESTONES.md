@@ -24,22 +24,31 @@ start.
 - [x] `cargo build` / `test` / `clippy -D warnings` / `fmt` all green
 - [ ] CI (build + test + clippy + fmt on push)
 
-### M1 — MVP tunnel 🔨
-Two-peer encrypted tunnel over a TUN device (macOS ↔ Linux), single path, **PQ-hybrid Noise** over
-QUIC. *The first demoable artifact.*
-- Crates: `neo-crypto` (handshake), `neo-dataplane` (TUN I/O), `neo-node` (wiring), `neo` (`run`).
-- Done when: `ping`/`iperf` flow through the tunnel between two hosts and `tcpdump` shows only
-  encrypted QUIC; the PQ-hybrid handshake is confirmed negotiated.
+### M1 — MVP tunnel ✅ (TUN bridge needs root; QUIC deferred to M6)
+PQ-hybrid handshake + encrypted session between two peers.
+- Done: signed hybrid AKE (ephemeral X25519 + ML-KEM-768, Ed25519-authenticated) in `neo-crypto`;
+  directional ChaCha20-Poly1305 session with replay protection; `neo run --listen/--connect` doing a
+  real handshake + encrypted ping/pong over TCP (**demoed live between two processes**).
+  `neo-dataplane` has the packet abstraction + in-memory link (tested) and a `tun-rs` TUN wrapper
+  (compiles under the `tun` feature).
+- Deferred: bridging real OS traffic through the TUN device (needs root + two hosts); the QUIC /
+  obfuscated transport, which is M6 — M1 uses plain TCP for now.
+- Tests: handshake agreement, tamper + replay rejection, TCP handshake/ping-pong.
 
-### M2 — Onion routing ⬜
-3-hop circuits with per-hop layered encryption (PQ Sphinx-style packets) over a static relay list.
-- Crates: `neo-crypto`, `neo-routing`.
+### M2 — Onion routing ✅
+Per-hop layered encryption + node-disjoint path selection.
+- Done: `neo-crypto::onion` — each hop peels exactly one X25519 layer and learns only the next hop;
+  `neo-routing` — fresh-per-request path selection and mutually node-disjoint multipaths for shares.
+- Deferred: full Sphinx properties (fixed-size padding, bitwise unlinkability, replay tags) and a
+  per-hop PQ KEM (the end-to-end session is already PQ via M1).
+- Tests: 3-hop peel to payload, wrong-hop rejection, path distinctness/disjointness.
 
-### M3 — Information slicing ⬜ (novel core, part 1)
-Encrypt-then-slice into k-of-n shares across disjoint paths, with reassembly.
-- Crates: `neo-slicing`.
-- Done when: property tests prove fewer than `k` shares cannot reconstruct, and reassembly is correct
-  under loss/reorder.
+### M3 — Information slicing ✅ (novel core, part 1)
+Encrypt-then-slice into k-of-n shares, with reassembly.
+- Done: `neo-slicing` — AEAD-encrypt, Reed-Solomon k-of-n, share (de)serialization, reassemble+decrypt.
+- Tests: any-k recovery, sub-threshold failure, tamper + wrong-key rejection, empty plaintext.
+- End-to-end: `neo-node`'s integration test runs **M3 → M2 → M3** (slice → onion over disjoint paths
+  → peel at each hop → reassemble + decrypt), proving no single relay holds a complete, readable flow.
 
 ### M4 — Decentralization ⬜
 Trackerless discovery + NAT traversal via libp2p (Kademlia DHT, DCUtR hole-punch, Relay v2 fallback).

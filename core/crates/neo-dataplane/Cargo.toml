@@ -6,4 +6,13 @@ rust-version.workspace = true
 license.workspace = true
 description = "TUN device I/O and packet/flow multiplexing (macOS utun, Linux)."
 
+[features]
+# The real TUN device needs root to run, so it is off by default; the packet
+# abstraction and in-memory link build and test without it.
+default = []
+tun = ["dep:tun-rs"]
+
 [dependencies]
+neo-core.workspace = true
+tokio.workspace = true
+tun-rs = { version = "2", optional = true, features = ["async_tokio"] }

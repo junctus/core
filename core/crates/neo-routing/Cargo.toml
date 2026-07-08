@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Disjoint multipath and VRF fresh-per-request path/exit selection."
+description = "Disjoint multipath and fresh-per-request path/exit selection for neo."
 
 [dependencies]
+neo-core.workspace = true
+getrandom.workspace = true

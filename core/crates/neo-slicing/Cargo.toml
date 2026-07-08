@@ -7,3 +7,7 @@ license.workspace = true
 description = "Information slicing: k-of-n erasure/threshold coding of encrypted flows."
 
 [dependencies]
+neo-core.workspace = true
+chacha20poly1305.workspace = true
+reed-solomon-erasure.workspace = true
+getrandom.workspace = true
