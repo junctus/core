@@ -1,0 +1,9 @@
+[package]
+name = "neo-slicing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Information slicing: k-of-n erasure/threshold coding of encrypted flows."
+
+[dependencies]

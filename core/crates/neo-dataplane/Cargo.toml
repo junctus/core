@@ -1,0 +1,9 @@
+[package]
+name = "neo-dataplane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "TUN device I/O and packet/flow multiplexing (macOS utun, Linux)."
+
+[dependencies]

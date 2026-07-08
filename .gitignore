@@ -1,0 +1,18 @@
+# Rust
+/target
+**/target
+*.rs.bk
+
+# macOS
+.DS_Store
+
+# Platform build outputs
+/platforms/ios/build/
+/platforms/android/.gradle/
+/platforms/android/app/build/
+/platforms/**/jniLibs/
+*.xcframework
+
+# Local env / secrets — never commit node identities or keys
+*.key
+/.neo/

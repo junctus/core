@@ -1,0 +1,9 @@
+[package]
+name = "neo-mpc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Committee / MPC-TLS exit so no single node is a responsible exit."
+
+[dependencies]

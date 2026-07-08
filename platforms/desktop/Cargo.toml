@@ -1,0 +1,20 @@
+[package]
+name = "neo-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "neo desktop daemon and CLI (macOS + Linux)."
+
+[[bin]]
+name = "neo"
+path = "src/main.rs"
+
+[dependencies]
+neo-core.workspace = true
+neo-node.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+hex.workspace = true

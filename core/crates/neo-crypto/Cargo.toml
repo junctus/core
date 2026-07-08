@@ -1,0 +1,9 @@
+[package]
+name = "neo-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "PQ-hybrid handshake, onion layering, and Sphinx packets for neo."
+
+[dependencies]

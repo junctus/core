@@ -1,0 +1,9 @@
+[package]
+name = "neo-mix"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Cover traffic and per-hop Poisson timing mixing for neo."
+
+[dependencies]

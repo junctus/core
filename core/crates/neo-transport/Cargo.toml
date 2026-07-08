@@ -1,0 +1,9 @@
+[package]
+name = "neo-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Pluggable transport trait and DPI-resistant obfuscation for neo."
+
+[dependencies]

@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "core/crates/*",
+    "platforms/desktop",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.75"
+license = "AGPL-3.0-or-later"
+repository = "https://example.invalid/neo"
+
+[workspace.dependencies]
+# Internal engine crates
+neo-core = { path = "core/crates/neo-core" }
+neo-crypto = { path = "core/crates/neo-crypto" }
+neo-slicing = { path = "core/crates/neo-slicing" }
+neo-mix = { path = "core/crates/neo-mix" }
+neo-routing = { path = "core/crates/neo-routing" }
+neo-transport = { path = "core/crates/neo-transport" }
+neo-discovery = { path = "core/crates/neo-discovery" }
+neo-credits = { path = "core/crates/neo-credits" }
+neo-mpc = { path = "core/crates/neo-mpc" }
+neo-verify = { path = "core/crates/neo-verify" }
+neo-dataplane = { path = "core/crates/neo-dataplane" }
+neo-node = { path = "core/crates/neo-node" }
+neo-ffi = { path = "core/crates/neo-ffi" }
+
+# External
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+blake3 = "1"
+getrandom = "0.2"
+ed25519-dalek = "2"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ml-kem = "0.2"
+rand_core = { version = "0.6", features = ["getrandom"] }
+hex = "0.4"
+serde_json = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

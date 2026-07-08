@@ -1,0 +1,9 @@
+[package]
+name = "neo-verify"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Verifiable-privacy primitives: VRF, PIR, and ZK proof-of-mixing."
+
+[dependencies]
