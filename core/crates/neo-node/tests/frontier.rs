@@ -36,8 +36,18 @@ fn relays(n: usize) -> Vec<Relay> {
 fn m10_credit_is_unlinkable_and_single_use() {
     let mut issuer = Issuer::new().unwrap();
     let pk = issuer.public_key();
+    // Earn a credit via a proof-of-relay receipt, then issue against it.
+    let relay = neo_core::NodeIdentity::generate().unwrap().id();
+    let client = neo_core::NodeIdentity::generate().unwrap();
+    let receipt = neo_credits::earn::RelayReceipt::issue(
+        &client,
+        relay,
+        neo_credits::earn::BYTES_PER_CREDIT,
+        [1u8; 32],
+    );
+    issuer.record_receipt(&receipt).unwrap();
     let (blinded, secret) = request().unwrap();
-    let issued = issuer.issue(&blinded).unwrap();
+    let issued = issuer.issue(&relay, &blinded).unwrap();
     let credit = finalize(secret, issued, &pk).unwrap();
 
     assert!(issuer.redeem(&credit).is_ok(), "first spend accepted");
@@ -109,8 +119,17 @@ fn frontier_composed_request_flow() {
     // --- M10: the client earns and spends a credit to authorize the request. ---
     let mut issuer = Issuer::new().unwrap();
     let pk = issuer.public_key();
+    let relay = neo_core::NodeIdentity::generate().unwrap().id();
+    let client = neo_core::NodeIdentity::generate().unwrap();
+    let receipt = neo_credits::earn::RelayReceipt::issue(
+        &client,
+        relay,
+        neo_credits::earn::BYTES_PER_CREDIT,
+        [2u8; 32],
+    );
+    issuer.record_receipt(&receipt).unwrap();
     let (blinded, secret) = request().unwrap();
-    let credit = finalize(secret, issuer.issue(&blinded).unwrap(), &pk).unwrap();
+    let credit = finalize(secret, issuer.issue(&relay, &blinded).unwrap(), &pk).unwrap();
     issuer
         .redeem(&credit)
         .expect("paid with an unlinkable credit");

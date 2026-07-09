@@ -26,17 +26,19 @@ pub mod earn;
 
 use std::collections::HashSet;
 
-use neo_core::{Error, Result};
+use earn::{EarnLedger, RelayReceipt};
+use neo_core::{Error, NodeId, Result};
 use voprf::{
     BlindedElement, EvaluationElement, Group, Proof, Ristretto255, VoprfClient, VoprfServer,
 };
 
 const SERIAL_LEN: usize = 32;
 
-/// The credit issuer (holds the VOPRF key).
+/// The credit issuer (holds the VOPRF key and the earn ledger that gates issuance).
 pub struct Issuer {
     server: VoprfServer<Ristretto255>,
     spent: HashSet<Vec<u8>>,
+    ledger: EarnLedger,
 }
 
 impl Issuer {
@@ -47,6 +49,7 @@ impl Issuer {
         Ok(Self {
             server,
             spent: HashSet::new(),
+            ledger: EarnLedger::new(),
         })
     }
 
@@ -57,10 +60,32 @@ impl Issuer {
         IssuerPublicKey(Ristretto255::serialize_elem(self.server.get_public_key()).to_vec())
     }
 
-    /// Blind-evaluate a client's blinded credit — done once the node has earned
-    /// it. The issuer never sees the serial, and returns a DLEQ proof that the
-    /// evaluation used its committed key.
-    pub fn issue(&self, blinded: &BlindCredit) -> Result<IssuedCredit> {
+    /// Record a proof-of-relay receipt against the issuer's ledger, crediting the
+    /// earning relay. Returns the number of whole new credits earned. This is the
+    /// **only** way a relay accrues the earned balance [`issue`](Issuer::issue)
+    /// requires.
+    pub fn record_receipt(&mut self, receipt: &RelayReceipt) -> Result<u64> {
+        self.ledger.record(receipt)
+    }
+
+    /// Whole earned credits `relay` has not yet redeemed for a token.
+    pub fn earned_balance(&self, relay: &NodeId) -> u64 {
+        self.ledger.earned_balance(relay)
+    }
+
+    /// Blind-evaluate a client's blinded credit for the identified earning `relay`.
+    /// **Gated on earning:** it consumes one of the relay's earned credits (from
+    /// receipts recorded via [`record_receipt`](Issuer::record_receipt)) and fails
+    /// if the relay has none — so tokens cannot be minted without proven work.
+    ///
+    /// Issuance is *identified* (the issuer sees `relay` and can rate-limit it) but
+    /// the serial stays blinded, so spend remains unlinkable to the earning relay.
+    pub fn issue(&mut self, relay: &NodeId, blinded: &BlindCredit) -> Result<IssuedCredit> {
+        if !self.ledger.redeem_earned(relay) {
+            return Err(Error::Crypto(
+                "relay has no earned credit to issue against".into(),
+            ));
+        }
         let element = BlindedElement::<Ristretto255>::deserialize(&blinded.0)
             .map_err(|e| Error::Decode(format!("blinded element: {e}")))?;
         let evaluated = self.server.blind_evaluate(&mut rand::rngs::OsRng, &element);
@@ -155,15 +180,26 @@ pub fn finalize(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::earn::{RelayReceipt, BYTES_PER_CREDIT};
+
+    /// Earn one credit for a fresh relay on `issuer`, returning the relay id.
+    fn earn_credit(issuer: &mut Issuer, nonce: u8) -> NodeId {
+        let client = neo_core::NodeIdentity::generate().unwrap();
+        let relay = neo_core::NodeIdentity::generate().unwrap().id();
+        let receipt = RelayReceipt::issue(&client, relay, BYTES_PER_CREDIT, [nonce; 32]);
+        assert_eq!(issuer.record_receipt(&receipt).unwrap(), 1);
+        relay
+    }
 
     #[test]
     fn credit_is_unlinkable_verifiable_and_single_use() {
         let mut issuer = Issuer::new().unwrap();
         let pk = issuer.public_key();
+        let relay = earn_credit(&mut issuer, 1);
 
-        // Client blinds a random serial; issuer blind-evaluates it (earned by relaying).
+        // Client blinds a random serial; issuer blind-evaluates the earned credit.
         let (blinded, secret) = request().unwrap();
-        let issued = issuer.issue(&blinded).unwrap();
+        let issued = issuer.issue(&relay, &blinded).unwrap();
         let credit = finalize(secret, issued, &pk).unwrap();
 
         // Spend it once; a second spend is rejected.
@@ -175,11 +211,34 @@ mod tests {
     }
 
     #[test]
+    fn issuance_requires_a_proven_earned_credit() {
+        // The anti-Sybil premise: issue() mints nothing without proven earning.
+        let mut issuer = Issuer::new().unwrap();
+        let relay = neo_core::NodeIdentity::generate().unwrap().id();
+        let (blinded, _secret) = request().unwrap();
+        assert!(
+            issuer.issue(&relay, &blinded).is_err(),
+            "issuance without an earned credit must be refused"
+        );
+
+        // After earning exactly one credit, issue() works once and only once.
+        let relay = earn_credit(&mut issuer, 9);
+        let (b1, _) = request().unwrap();
+        assert!(issuer.issue(&relay, &b1).is_ok());
+        let (b2, _) = request().unwrap();
+        assert!(
+            issuer.issue(&relay, &b2).is_err(),
+            "a single earned credit issues a single token"
+        );
+    }
+
+    #[test]
     fn tampered_credit_is_rejected() {
         let mut issuer = Issuer::new().unwrap();
         let pk = issuer.public_key();
+        let relay = earn_credit(&mut issuer, 2);
         let (blinded, secret) = request().unwrap();
-        let issued = issuer.issue(&blinded).unwrap();
+        let issued = issuer.issue(&relay, &blinded).unwrap();
         let mut credit = finalize(secret, issued, &pk).unwrap();
 
         credit.token[0] ^= 0xff; // token no longer matches OPRF(serial)
@@ -192,11 +251,12 @@ mod tests {
         // published. The DLEQ proof fails, so the client rejects at finalize —
         // this is what stops key-tagging deanonymization.
         let honest = Issuer::new().unwrap();
-        let rogue = Issuer::new().unwrap();
+        let mut rogue = Issuer::new().unwrap();
         let honest_pk = honest.public_key();
+        let relay = earn_credit(&mut rogue, 3);
 
         let (blinded, secret) = request().unwrap();
-        let issued = rogue.issue(&blinded).unwrap();
+        let issued = rogue.issue(&relay, &blinded).unwrap();
         assert!(
             finalize(secret, issued, &honest_pk).is_err(),
             "a proof under the wrong key must not finalize"

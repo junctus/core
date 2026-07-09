@@ -86,10 +86,15 @@ impl RelayReceipt {
 }
 
 /// Tracks proven relayed bytes per relay and converts them into earned credits.
+///
+/// This ledger is what an [`Issuer`](crate::Issuer) consults to gate issuance: a
+/// relay may only obtain a spendable token against a credit it has *earned* here.
 #[derive(Default)]
 pub struct EarnLedger {
     /// Proven bytes not yet converted to credits, per relay.
     residual_bytes: HashMap<NodeId, u64>,
+    /// Whole earned credits not yet redeemed for a token, per relay.
+    earned: HashMap<NodeId, u64>,
     /// `(relay, client, nonce)` triples already counted — replay/double-claim guard.
     claimed: HashSet<(NodeId, [u8; 32], [u8; 32])>,
 }
@@ -102,8 +107,8 @@ impl EarnLedger {
 
     /// Verify and record a receipt. Returns the number of *whole new credits* the
     /// relay has earned as a result (0 if it hasn't crossed the next threshold),
-    /// deducting the corresponding bytes. Rejects forged or already-claimed
-    /// receipts.
+    /// crediting them to the relay's earned balance and deducting the corresponding
+    /// bytes. Rejects forged or already-claimed receipts.
     pub fn record(&mut self, receipt: &RelayReceipt) -> Result<u64> {
         receipt.verify()?;
         if receipt.bytes > MAX_RECEIPT_BYTES {
@@ -119,12 +124,33 @@ impl EarnLedger {
         *bucket = bucket.saturating_add(receipt.bytes);
         let earned = *bucket / BYTES_PER_CREDIT;
         *bucket -= earned * BYTES_PER_CREDIT;
+        if earned > 0 {
+            let bal = self.earned.entry(receipt.relay).or_insert(0);
+            *bal = bal.saturating_add(earned);
+        }
         Ok(earned)
     }
 
     /// Proven bytes credited to `relay` that haven't yet become a whole credit.
     pub fn residual(&self, relay: &NodeId) -> u64 {
         self.residual_bytes.get(relay).copied().unwrap_or(0)
+    }
+
+    /// Whole earned credits `relay` has not yet redeemed for a spendable token.
+    pub fn earned_balance(&self, relay: &NodeId) -> u64 {
+        self.earned.get(relay).copied().unwrap_or(0)
+    }
+
+    /// Consume one earned credit for `relay`, returning `true` on success. Used by
+    /// the issuer to gate a single token issuance on proven work.
+    pub fn redeem_earned(&mut self, relay: &NodeId) -> bool {
+        match self.earned.get_mut(relay) {
+            Some(bal) if *bal > 0 => {
+                *bal -= 1;
+                true
+            }
+            _ => false,
+        }
     }
 }
 
@@ -179,19 +205,20 @@ mod tests {
         // spendable token via the VOPRF issuer.
         let client = NodeIdentity::generate().unwrap();
         let relay = NodeIdentity::generate().unwrap().id();
-        let mut ledger = EarnLedger::new();
         let mut issuer = Issuer::new().unwrap();
 
-        // Prove a full credit's worth of relaying.
+        // Prove a full credit's worth of relaying — recorded on the issuer's ledger.
         let receipt = RelayReceipt::issue(&client, relay, BYTES_PER_CREDIT, nonce(7));
-        let earned = ledger.record(&receipt).unwrap();
-        assert_eq!(earned, 1, "one credit earned");
+        assert_eq!(
+            issuer.record_receipt(&receipt).unwrap(),
+            1,
+            "one credit earned"
+        );
 
-        // Gate issuance on the earned credit, then run the anonymous flow.
-        assert!(earned >= 1);
+        // Issuance is now gated on that earned credit; then run the anonymous flow.
         let pk = issuer.public_key();
         let (blinded, secret) = request().unwrap();
-        let issued = issuer.issue(&blinded).unwrap();
+        let issued = issuer.issue(&relay, &blinded).unwrap();
         let credit = finalize(secret, issued, &pk).unwrap();
         assert!(
             issuer.redeem(&credit).is_ok(),
