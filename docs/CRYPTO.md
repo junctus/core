@@ -56,6 +56,14 @@ A **3-message, key-confirmed** PQ-hybrid AKE (`neo-crypto::handshake`):
   decryption** (`neo-mpc::threshold`) where a message to the committee's joint key is decrypted by
   **client-combined, DLEQ-proved partials** via Lagrange-in-the-exponent — so **no committee node ever
   assembles the key or plaintext** (for the decrypt direction).
+- **Two-party MPC-TLS** (`neo-mpc::mpc_tls`) — the real 2PC stack, built and tested bottom-up:
+  Chou–Orlandi **oblivious transfer** + **IKNP OT extension**; a **garbled-circuit** engine (free-XOR +
+  point-and-permute + ZRE15 half-gates); **ChaCha20**, **SHA-256**, and **Poly1305** as boolean circuits
+  (each verified against its RFC/NIST KAT); a DECO-style **additively-shared ECDHE**; and — computed
+  **under 2PC into XOR-shares** — the ChaCha keystream, the SHA-256 key schedule, the Poly1305 tag, and an
+  end-to-end **ChaCha20-Poly1305 record**, so the record key, keystream, and plaintext are **never
+  assembled at any one party**. **dualex** adds a dual-execution check that catches a cheating garbler.
+  Semi-honest core; see Outstanding for the remaining hardening.
 - **Persistent circuit tunnels** (`neo-node::circuit`) — a long-lived Sphinx circuit carrying a
   bidirectional byte stream as **counter-keyed onion cells** (no keystream reuse) with a **per-cell
   end-to-end MAC**, and a real **TCP splice** at the exit — TCP-over-onion, integrity to parity with the
@@ -69,10 +77,12 @@ A **3-message, key-confirmed** PQ-hybrid AKE (`neo-crypto::handshake`):
 
 ## Outstanding
 
-- **Full MPC-TLS** for the *send* direction — computing the TLS handshake + record encryption under 2PC
-  so the committee can speak to a real upstream server without any member seeing plaintext (garbled-circuit
-  AES-GCM; TLSNotary/DECO/`mpz`) — remains research. The threshold decryption above closes the *decrypt*
-  side; a **succinct** ZK shuffle is likewise research. The current constructions are honest, tested cores.
+- **Two-party MPC-TLS** now runs the **full ChaCha20-Poly1305 AEAD and SHA-256 key schedule under 2PC**
+  (`neo-mpc::mpc_tls`), semi-honest, with OT extension and a dual-execution cheating-garbler check. The
+  remaining, well-scoped steps: **full** malicious security (authenticated garbling, to remove
+  dual-execution's ≤1-bit leak), the **EC point→bit share conversion** (DECO) that feeds the shared ECDHE
+  secret into the key-schedule circuit, and **live wiring** to a real TLS socket on the server's actual
+  curve. A **succinct** ZK shuffle is likewise research. The current constructions are honest, tested cores.
 - **Wire-level transport integration** — wiring the REALITY decoy to a genuine upstream TLS site and
   embedding the flight in a true TLS ClientHello; `Camouflage` today mimics observable shape, not full
   QUIC/DTLS protocol crypto (a real QUIC transport lives behind the `quic` feature).

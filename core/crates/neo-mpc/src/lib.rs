@@ -38,6 +38,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod mpc_tls;
 pub mod threshold;
 pub mod vss;
 

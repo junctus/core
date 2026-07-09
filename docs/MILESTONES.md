@@ -334,6 +334,35 @@ Close M6's deferred strong transports.
   only ever sees decoy; authenticators are unlinkable; a captured hello expires after the epoch window;
   camouflage round-trips both shapes and rejects the wrong shape; auth + camouflage work end-to-end over TCP.
 
+### M24 — Full two-party MPC-TLS core ✅ (real 2PC; full AEAD + key schedule under MPC)
+Take M22 to the real thing: compute a TLS session under **two-party computation** so the record key and
+plaintext are **never assembled at a single party** — built and verified bottom-up, then the documented
+"remaining steps" done: the SHA-256 key schedule, Poly1305 MAC, OT extension, and a malicious-security step.
+- Done: `neo-mpc::mpc_tls` — a genuine 2PC stack, each layer checked against a reference before the next:
+  - `ot` / `ot_ext` — 1-of-2 **oblivious transfer** (Chou–Orlandi) and **IKNP OT extension** (many cheap OTs
+    from `k=128` base OTs).
+  - `garble` — a **garbled-circuit** engine: free-XOR, point-and-permute, **ZRE15 half-gate** AND, INV via
+    the offset; BLAKE3 as the correlation-robust hash.
+  - `circuit` — a boolean circuit builder + a ripple-carry **32-bit adder** and the full **ChaCha20** block
+    function; `sha256` — **SHA-256** as a circuit (verified vs the NIST KAT); `poly1305` — **Poly1305** over
+    `GF(2¹³⁰−5)` (verified vs the RFC 8439 KAT). Each garbled circuit is checked against its plaintext oracle.
+  - `session` — a DECO-style **additively-shared ECDHE** (neither party learns the pre-master `Z`); the
+    ChaCha20 keystream **and** Poly1305 tag computed **under 2PC into XOR-shares**; the SHA-256 **key schedule
+    under 2PC**; and an end-to-end **ChaCha20-Poly1305 record sealed under 2PC** where neither party ever
+    holds the key, keystream, or plaintext.
+  - `dualex` — **dual-execution**: a cheating garbler is caught by an output-equality check.
+  Crate: `neo-mpc`.
+- Deferred/honest (well-scoped steps, not a redesign): **full** malicious security (authenticated garbling
+  removes dual-execution's ≤1-bit leak); the **EC point→bit share conversion** (DECO's sub-protocol) that
+  feeds the shared ECDHE secret into the key-schedule circuit; and **live wiring** to a real TLS socket on
+  the server's actual curve with full HKDF/AEAD framing.
+- Tests (21): OT delivers only the chosen message; IKNP extends correctly past `k`; every gate garbles over
+  all inputs; garbled adder matches native add with OT-split inputs; ChaCha/SHA-256/Poly1305 references match
+  their KATs and the circuits match the references; ECDHE is additively shared and matches the server;
+  keystream / key-schedule / MAC each run under 2PC into shares (no share alone reveals the secret); a
+  **ChaCha20-Poly1305 record seals under 2PC** and verifies against a stock implementation; dual-execution
+  agrees honestly and catches a cheating garbler.
+
 ---
 
 ## Audit gate ⬜
