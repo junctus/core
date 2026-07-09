@@ -6,7 +6,10 @@
 //! same handshake calls.
 
 use neo_core::{Error, NodeIdentity, Result};
-use neo_crypto::{initiator_finish, initiator_message1, responder_process, HandshakeResult};
+use neo_crypto::{
+    initiator_finish, initiator_message1, responder_confirm, responder_cookie, responder_process,
+    CookieKey, HandshakeResult,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -37,25 +40,41 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>>
     Ok(buf)
 }
 
-/// Dial `addr` and run the initiator side of the handshake.
+/// Dial `addr` and run the initiator side of the handshake: init → cookie
+/// challenge → cookied init → m2 → key-confirmation m3.
 pub async fn connect(addr: &str, identity: &NodeIdentity) -> Result<(TcpStream, HandshakeResult)> {
     let mut stream = TcpStream::connect(addr).await?;
-    let (state, msg1) = initiator_message1(identity)?;
-    write_frame(&mut stream, &msg1).await?;
+    let (state, init1) = initiator_message1(identity)?;
+    write_frame(&mut stream, &init1).await?;
+    // Anti-DoS cookie round-trip: echo the responder's challenge in a re-sent m1.
+    let cookie = read_frame(&mut stream).await?;
+    let init2 = state.with_cookie(&cookie);
+    write_frame(&mut stream, &init2).await?;
     let msg2 = read_frame(&mut stream).await?;
-    let result = initiator_finish(state, &msg2)?;
+    let (msg3, result) = initiator_finish(state, &msg2)?;
+    write_frame(&mut stream, &msg3).await?;
     Ok((stream, result))
 }
 
-/// Accept one connection and run the responder side of the handshake.
+/// Accept one connection and run the responder side of the handshake. A
+/// per-connection cookie is issued **before** any ML-KEM work (so a replayed or
+/// abandoned m1 costs only a MAC), and the session is returned only after the
+/// initiator's key confirmation (m3) — so a replayed/forged m1 never yields a
+/// usable session.
 pub async fn accept(
     listener: &TcpListener,
     identity: &NodeIdentity,
 ) -> Result<(TcpStream, HandshakeResult)> {
     let (mut stream, _peer_addr) = listener.accept().await?;
-    let msg1 = read_frame(&mut stream).await?;
-    let (msg2, result) = responder_process(identity, &msg1)?;
+    let cookie_key = CookieKey::generate()?;
+    let init1 = read_frame(&mut stream).await?;
+    let challenge = responder_cookie(&cookie_key, &init1)?;
+    write_frame(&mut stream, &challenge).await?;
+    let init2 = read_frame(&mut stream).await?;
+    let (msg2, pending) = responder_process(identity, &init2, &cookie_key)?;
     write_frame(&mut stream, &msg2).await?;
+    let msg3 = read_frame(&mut stream).await?;
+    let result = responder_confirm(pending, &msg3)?;
     Ok((stream, result))
 }
 

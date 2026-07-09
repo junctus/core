@@ -23,15 +23,24 @@
 
 ## Simulated adversaries (tested)
 
-These properties are asserted by tests today across `neo-node`, `neo-crypto`, and `neo-slicing`:
+Properties asserted by tests today across `neo-crypto`, `neo-slicing`, `neo-node`, `neo-discovery`,
+`neo-verify`, and `neo-mpc`:
 
 - **Colluding relays below threshold learn nothing** — fewer than `k` shares cannot reconstruct a
-  sliced flow (`colluding_relays_below_threshold_learn_nothing`).
-- **A single relay learns only the next hop** — never the payload, and it cannot peel a deeper layer
-  (`a_relay_learns_only_the_next_hop`).
-- **An on-path observer sees only ciphertext** — a sealed session frame never contains the plaintext
-  (`on_path_observer_sees_only_ciphertext`).
-- **Tampering and wrong keys are rejected** by the AEAD everywhere (slicing, session, onion peels).
+  sliced flow; a corrupt shard is detected (per-share MAC), attributed, and routed around.
+- **A single relay learns only the next hop** — never the payload; it cannot peel a deeper layer, and
+  a **tampered payload avalanches** (Lioness wide-block) so no chosen pattern can be imprinted.
+- **An on-path observer sees only ciphertext** — sealed session frames never contain plaintext; the
+  handshake is key-confirmed so a replayed m1 never establishes a session.
+- **Forged discovery data is rejected** — records are self-certifying + signed; snapshots need k-of-n
+  witnesses and cannot be rolled back; the DHT verifies inbound records.
+- **A verifiable shuffle is sound and zero-knowledge**, and a committee minority cannot open a request.
+- **Global-passive-observer timing sim** — mixing (wired into the live tunnel data plane) decorrelates
+  output order from input order.
+- **Fuzz-lite / no-panic-on-garbage** parsers, plus `fuzz/` cargo-fuzz targets for the wire formats.
 
-Still TODO for hardening: fuzz targets (cargo-fuzz) for the wire parsers; a global-passive-observer
-timing simulation once M5's mixing is wired into the live data path; and the external audit gate.
+The full adversarial internal review — including two PoC-confirmed CRITICAL Sphinx breaks (now fixed)
+and every HIGH/MEDIUM finding with its fix — is in [`SECURITY_ANALYSIS.md`](SECURITY_ANALYSIS.md).
+
+Still ahead: REALITY-grade active-probe transport defense (M6+); NAT hole-punching validated on real
+NAT (M16); and — the hard gate — the **external security + cryptography audit**.

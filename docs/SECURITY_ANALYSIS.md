@@ -7,12 +7,15 @@ discovery/seed/forwarding layer). Findings are concrete, cite `file:line`, and
 several were **PoC-confirmed** against the real code. This is an internal review,
 **not** the external audit that gates real-world use.
 
-**Status:** both CRITICAL Sphinx breaks and **most** HIGH/MEDIUM findings are now
-**fixed** with regression tests (C-1, C-2, H-1, H-2, H-3, H-5, H-6, H-7, M-1, M-2,
-M-4, M-5, M-7, M-8). The heaviest remaining items — **H-4** (key-confirmation
-flight, a 3-message redesign), **M-3** (per-share authentication, a share-format
-change), **M-6** (client snapshot anti-rollback persistence), and the full
-**wide-block non-malleable payload** — are tracked in `docs/MILESTONES.md` (M14).
+**Status:** **all** HIGH/MEDIUM findings from this review are now **fixed** with
+regression tests — the two CRITICAL Sphinx breaks (C-1, C-2), every HIGH (H-1
+through H-7), and every MEDIUM (M-1 through M-8), plus the full **wide-block
+non-malleable payload** (Lioness) closing C-1's residual tagging channel. The
+handshake gained both a **key-confirmation flight** and a **stateless retry
+cookie** (H-4): a replayed or connect-and-abandon m1 now costs only a MAC, never
+an ML-KEM encapsulation. The one thing that remains before real use is the
+**external security + cryptography audit**, which no amount of internal review
+replaces.
 
 ## Severity summary
 
@@ -22,19 +25,19 @@ change), **M-6** (client snapshot anti-rollback persistence), and the full
 | C-2 | 🔴 CRIT | sphinx | Identity/all-zero `α` → public constant shared secret → **key-free forgery** | **fixed** |
 | H-1 | 🟠 HIGH | sphinx | Replay tag recorded **before** MAC check → cache-poisoning / targeted drop | **fixed** |
 | H-2 | 🟠 HIGH | forward | Per-call `ReplayCache` → replay defense absent across connections | **fixed** |
-| H-3 | 🟠 HIGH | handshake | Only Ed25519 key authenticated, not full `NodeId` (kex/kem) → **UKS** | M14 |
-| H-4 | 🟠 HIGH | handshake | No key confirmation; m1 replay → responder DoS (ML-KEM per replay) | M14 |
-| H-5 | 🟠 HIGH | seed | `X-Forwarded-For` trusted → cooldown bypass + SSRF dial amplification | M14 |
-| H-6 | 🟠 HIGH | slicing | "reveal nothing" is **computational, not** information-theoretic (doc conflation) | **fixed (docs)** |
-| H-7 | 🟠 HIGH | routing | Seeded path selection uses only 64 of 256 seed bits → unreachable permutations (n≥21) | M14 |
+| H-3 | 🟠 HIGH | handshake | Only Ed25519 key authenticated, not full `NodeId` (kex/kem) → **UKS** | **fixed** |
+| H-4 | 🟠 HIGH | handshake | No key confirmation; m1 replay → responder DoS (ML-KEM per replay) | **fixed** |
+| H-5 | 🟠 HIGH | seed | `X-Forwarded-For` trusted → cooldown bypass + SSRF dial amplification | **fixed** |
+| H-6 | 🟠 HIGH | slicing | "reveal nothing" is **computational, not** information-theoretic (doc conflation) | **fixed** |
+| H-7 | 🟠 HIGH | routing | Seeded path selection uses only 64 of 256 seed bits → unreachable permutations (n≥21) | **fixed** |
 | M-1 | 🟡 MED | routing | Disjointness over indices not `NodeId` → duplicate relay breaks node-disjointness | **fixed** |
-| M-2 | 🟡 MED | handshake | Transcript over raw m1 bytes; 1-byte append = deterministic DoS; no trailing-byte check | M14 |
-| M-3 | 🟡 MED | slicing | Shares not individually authenticated → single relay silently forces reassembly failure | M14 |
-| M-4 | 🟡 MED | slicing | Reassembly trusts unauthenticated header fields (bind as AAD) | M14 |
-| M-5 | 🟡 MED | mix | `getrandom` failure **panics** the mixer task; per-sample syscall | M14 |
-| M-6 | 🟡 MED | discovery | Snapshot rollback/freeze: no lower bound on `created_at`; single-witness default | M14 |
-| M-7 | 🟡 MED | discovery/forward | Unbounded 16 MiB frame + 32 MiB snapshot allocations; no connection cap | M14 |
-| M-8 | 🟡 MED | routing/exit | `RouteRegistry` de-conflicts identical routes only, not shared exit nodes | M14 |
+| M-2 | 🟡 MED | handshake | Transcript over raw m1 bytes; 1-byte append = deterministic DoS; no trailing-byte check | **fixed** |
+| M-3 | 🟡 MED | slicing | Shares not individually authenticated → single relay silently forces reassembly failure | **fixed** |
+| M-4 | 🟡 MED | slicing | Reassembly trusts unauthenticated header fields (bind as AAD) | **fixed** |
+| M-5 | 🟡 MED | mix | `getrandom` failure **panics** the mixer task; per-sample syscall | **fixed** |
+| M-6 | 🟡 MED | discovery | Snapshot rollback/freeze: no lower bound on `created_at`; single-witness default | **fixed** |
+| M-7 | 🟡 MED | discovery/forward | Unbounded 16 MiB frame + 32 MiB snapshot allocations; no connection cap | **fixed** |
+| M-8 | 🟡 MED | routing/exit | `RouteRegistry` de-conflicts identical routes only, not shared exit nodes | **fixed** |
 | L/INFO | ⚪ | various | zeroization gaps, unbounded replay cache, cover-packet distinguishability, `sample_relays` bias | M14 |
 
 ## The fixed issues (with tests)

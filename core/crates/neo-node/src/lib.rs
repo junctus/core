@@ -44,8 +44,8 @@ impl Node {
 mod tests {
     use super::*;
     use neo_crypto::{
-        create_packet, initiator_finish, initiator_message1, process, responder_process, Processed,
-        ReplayCache, SphinxHop,
+        create_packet, initiator_finish, initiator_message1, process, responder_confirm,
+        responder_cookie, responder_process, CookieKey, Processed, ReplayCache, SphinxHop,
     };
     use neo_routing::{Relay, Router};
     use neo_slicing::{encrypt_and_slice, reassemble_and_decrypt, Share};
@@ -201,8 +201,12 @@ mod tests {
         let alice = NodeIdentity::generate().unwrap();
         let bob = NodeIdentity::generate().unwrap();
         let (state, m1) = initiator_message1(&alice).unwrap();
-        let (m2, bob_res) = responder_process(&bob, &m1).unwrap();
-        let alice_res = initiator_finish(state, &m2).unwrap();
+        let cookie_key = CookieKey::generate().unwrap();
+        let challenge = responder_cookie(&cookie_key, &m1).unwrap();
+        let init2 = state.with_cookie(&challenge);
+        let (m2, pending) = responder_process(&bob, &init2, &cookie_key).unwrap();
+        let (m3, alice_res) = initiator_finish(state, &m2).unwrap();
+        let bob_res = responder_confirm(pending, &m3).unwrap();
 
         let mut a = alice_res.session;
         let mut b = bob_res.session;

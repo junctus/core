@@ -47,6 +47,11 @@ fn header_aad(data_shares: u8, parity_shares: u8, cipher_len: u32) -> Vec<u8> {
     aad
 }
 
+/// Length of the per-share authentication tag.
+const SHARE_MAC_LEN: usize = 16;
+/// Fixed share header size: index + k + m + cipher_len + nonce + mac.
+const SHARE_HEADER_LEN: usize = 1 + 1 + 1 + 4 + NONCE_LEN + SHARE_MAC_LEN;
+
 /// One share of a sliced flow. Individually meaningless without `k` peers and the key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Share {
@@ -60,39 +65,76 @@ pub struct Share {
     pub cipher_len: u32,
     /// AEAD nonce (public).
     pub nonce: [u8; NONCE_LEN],
+    /// Per-share MAC (keyed by the flow key) over the header + shard. A relay
+    /// cannot corrupt its shard undetectably; a bad share is caught and treated
+    /// as an *erasure* so Reed-Solomon routes around it.
+    pub mac: [u8; SHARE_MAC_LEN],
     /// The Reed-Solomon shard bytes.
     pub shard: Vec<u8>,
 }
 
 impl Share {
-    /// Serialize this share for transport: a fixed 19-byte header + the shard.
+    /// Serialize this share for transport: a fixed header + the shard.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut v = Vec::with_capacity(19 + self.shard.len());
+        let mut v = Vec::with_capacity(SHARE_HEADER_LEN + self.shard.len());
         v.push(self.index);
         v.push(self.data_shares);
         v.push(self.parity_shares);
         v.extend_from_slice(&self.cipher_len.to_be_bytes());
         v.extend_from_slice(&self.nonce);
+        v.extend_from_slice(&self.mac);
         v.extend_from_slice(&self.shard);
         v
     }
 
     /// Parse a share from [`to_bytes`](Self::to_bytes) output.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < 19 {
+        if bytes.len() < SHARE_HEADER_LEN {
             return Err(Error::Decode("share too short".into()));
         }
         let cipher_len = u32::from_be_bytes(bytes[3..7].try_into().expect("checked length"));
         let mut nonce = [0u8; NONCE_LEN];
-        nonce.copy_from_slice(&bytes[7..19]);
+        nonce.copy_from_slice(&bytes[7..7 + NONCE_LEN]);
+        let mut mac = [0u8; SHARE_MAC_LEN];
+        mac.copy_from_slice(&bytes[7 + NONCE_LEN..SHARE_HEADER_LEN]);
         Ok(Share {
             index: bytes[0],
             data_shares: bytes[1],
             parity_shares: bytes[2],
             cipher_len,
             nonce,
-            shard: bytes[19..].to_vec(),
+            mac,
+            shard: bytes[SHARE_HEADER_LEN..].to_vec(),
         })
+    }
+
+    /// Compute this share's authentication tag under the flow `key`. Covers the
+    /// header (incl. index, so a share can't be moved to another position) and
+    /// the shard bytes.
+    fn compute_mac(&self, key: &[u8; KEY_LEN]) -> [u8; SHARE_MAC_LEN] {
+        let mac_key = blake3::derive_key("neo-slice-share-mac-v1", key);
+        let mut input = Vec::with_capacity(7 + NONCE_LEN + self.shard.len());
+        input.push(self.index);
+        input.push(self.data_shares);
+        input.push(self.parity_shares);
+        input.extend_from_slice(&self.cipher_len.to_be_bytes());
+        input.extend_from_slice(&self.nonce);
+        input.extend_from_slice(&self.shard);
+        let full = blake3::keyed_hash(&mac_key, &input);
+        let mut out = [0u8; SHARE_MAC_LEN];
+        out.copy_from_slice(&full.as_bytes()[..SHARE_MAC_LEN]);
+        out
+    }
+
+    /// Whether this share's MAC is authentic under `key` (constant-time compare).
+    fn is_authentic(&self, key: &[u8; KEY_LEN]) -> bool {
+        let expected = self.compute_mac(key);
+        // blake3 outputs are not secret here, but a CT compare is good hygiene.
+        expected
+            .iter()
+            .zip(&self.mac)
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
     }
 }
 
@@ -153,22 +195,34 @@ pub fn encrypt_and_slice(
     Ok(shards
         .into_iter()
         .enumerate()
-        .map(|(i, shard)| Share {
-            index: i as u8,
-            data_shares: data_shares as u8,
-            parity_shares: parity_shares as u8,
-            cipher_len: ciphertext.len() as u32,
-            nonce,
-            shard,
+        .map(|(i, shard)| {
+            let mut share = Share {
+                index: i as u8,
+                data_shares: data_shares as u8,
+                parity_shares: parity_shares as u8,
+                cipher_len: ciphertext.len() as u32,
+                nonce,
+                mac: [0u8; SHARE_MAC_LEN],
+                shard,
+            };
+            share.mac = share.compute_mac(key);
+            share
         })
         .collect())
 }
 
 /// Reassemble and decrypt a flow from a subset of its shares (at least `k`).
+///
+/// Each share's MAC is verified under `key`; a share that fails is dropped and
+/// treated as an **erasure**, so a single relay corrupting its shard can be
+/// routed around (given `n - k` redundancy) instead of poisoning the whole
+/// reconstruction — and the bad share is attributable by index.
 pub fn reassemble_and_decrypt(key: &[u8; KEY_LEN], shares: &[Share]) -> Result<Vec<u8>> {
-    let first = shares
+    // Keep only authentic shares. A failing MAC = a corrupt/forged shard.
+    let authentic: Vec<&Share> = shares.iter().filter(|s| s.is_authentic(key)).collect();
+    let first = authentic
         .first()
-        .ok_or_else(|| Error::Decode("no shares provided".into()))?;
+        .ok_or_else(|| Error::Decode("no authentic shares provided".into()))?;
     let k = first.data_shares as usize;
     let m = first.parity_shares as usize;
     let n = k + m;
@@ -176,17 +230,15 @@ pub fn reassemble_and_decrypt(key: &[u8; KEY_LEN], shares: &[Share]) -> Result<V
     let nonce = first.nonce;
 
     let mut slots: Vec<Option<Vec<u8>>> = vec![None; n];
-    for s in shares {
-        if s.data_shares as usize != k
-            || s.parity_shares as usize != m
-            || s.cipher_len as usize != cipher_len
-            || s.nonce != nonce
+    for s in &authentic {
+        // The MAC binds the header, so authentic shares of one flow agree; skip
+        // any (authentic-but-)mismatched share rather than failing outright.
+        if s.data_shares as usize == k
+            && s.parity_shares as usize == m
+            && s.cipher_len as usize == cipher_len
+            && s.nonce == nonce
+            && (s.index as usize) < n
         {
-            return Err(Error::Decode(
-                "shares are from different sliced flows".into(),
-            ));
-        }
-        if (s.index as usize) < n {
             slots[s.index as usize] = Some(s.shard.clone());
         }
     }
@@ -194,7 +246,7 @@ pub fn reassemble_and_decrypt(key: &[u8; KEY_LEN], shares: &[Share]) -> Result<V
     let present = slots.iter().filter(|s| s.is_some()).count();
     if present < k {
         return Err(Error::Decode(format!(
-            "need {k} shares to reconstruct, have {present}"
+            "need {k} authentic shares to reconstruct, have {present}"
         )));
     }
 
@@ -273,11 +325,34 @@ mod tests {
     }
 
     #[test]
-    fn tampered_shard_is_rejected() {
-        let msg = b"integrity is enforced by the AEAD tag";
+    fn a_tampered_shard_is_detected_and_routed_around() {
+        // 3-of-5: one corrupted shard fails its MAC, is dropped as an erasure,
+        // and Reed-Solomon reconstructs from the remaining 4 (>= 3).
+        let msg = b"a single bad relay must not break reassembly";
         let mut shares = encrypt_and_slice(&KEY, msg, 3, 2).unwrap();
         shares[0].shard[0] ^= 0xff;
+        assert_eq!(reassemble_and_decrypt(&KEY, &shares).unwrap(), msg);
+    }
+
+    #[test]
+    fn corruption_beyond_the_redundancy_fails() {
+        // Corrupt all 3 data shares of a 3-of-5 code → only 2 authentic parity
+        // shares remain (< k = 3), so reconstruction is (correctly) impossible.
+        let msg = b"beyond the redundancy, reassembly must fail";
+        let mut shares = encrypt_and_slice(&KEY, msg, 3, 2).unwrap();
+        for share in shares.iter_mut().take(3) {
+            share.shard[0] ^= 0xff;
+        }
         assert!(reassemble_and_decrypt(&KEY, &shares).is_err());
+    }
+
+    #[test]
+    fn a_share_cannot_be_moved_to_another_index() {
+        // The MAC binds the index, so relabeling a share invalidates it.
+        let shares = encrypt_and_slice(&KEY, b"index binding", 3, 2).unwrap();
+        let mut moved = shares[1].clone();
+        moved.index = 0;
+        assert!(!moved.is_authentic(&KEY));
     }
 
     #[test]

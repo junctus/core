@@ -2,13 +2,14 @@
 
 A dispersed, post-quantum, verifiable, censorship-resistant privacy overlay — a "new kind of VPN".
 
-> **Status:** M0–M9 core mechanisms implemented and tested — full Sphinx, PQ-hybrid handshake,
-> information slicing, timing mixing, obfuscated transport, exit policy, a real libp2p stack, and the
-> mobile FFI. The network now **runs end to end**: zero-config discovery finds relays
-> ([`docs/DISCOVERY.md`](docs/DISCOVERY.md)) and real onion traffic is forwarded through live
-> multi-hop circuits. The frontier tier (M10–M13) has working, tested cores
-> ([`docs/FRONTIER.md`](docs/FRONTIER.md)). **Not audited** — do not rely on neo for real-world safety.
-> See [`docs/MILESTONES.md`](docs/MILESTONES.md).
+> **Status:** the network **runs end to end** — zero-config discovery finds relays
+> ([`docs/DISCOVERY.md`](docs/DISCOVERY.md)) and real onion traffic is forwarded through live multi-hop
+> circuits with a layered return path. The core (M0–M9), the frontier tier (M10–M13: anonymous
+> credits, VRF paths, committee exit, PIR + ZK shuffle), and the hardening/expansion tier (M14–M20:
+> a full internal security review with every finding fixed, plus streaming, NAT traversal, DoH
+> bootstrap) all have working, tested implementations. **Not audited** — do not rely on neo for
+> real-world safety. See [`docs/MILESTONES.md`](docs/MILESTONES.md) for status and
+> [`docs/SECURITY_ANALYSIS.md`](docs/SECURITY_ANALYSIS.md) for the review.
 
 ## What makes it different
 
@@ -26,7 +27,7 @@ single node — or any group smaller than `k` — only ever holds a meaningless 
 - **Verifiable privacy** — PIR/oblivious discovery, VRF-unbiasable paths, ZK proof-of-mixing.
 
 There are real, honest limits (the anonymity trilemma; "no responsible exit" is fully achievable only
-inside the overlay; a young network has a small anonymity set). See `docs/ARCHITECTURE.md`.
+inside the overlay; a young network has a small anonymity set). See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Repository layout
 
@@ -35,8 +36,21 @@ core/crates/      the shared Rust engine (all platforms use this)
 platforms/desktop the macOS + Linux daemon/CLI (one cfg-gated binary)
 platforms/ios     Swift app + NEPacketTunnelProvider (consumes the core via xcframework)
 platforms/android Kotlin app + VpnService (consumes the core via cargo-ndk)
-docs/             threat model, architecture, protocol, crypto notes
+deploy/discovery/ one-command discovery-seed deployment (systemd + Caddy)
+docs/             see the index below
 ```
+
+## Docs
+
+| Doc | What |
+|-----|------|
+| [`ARCHITECTURE.md`](docs/ARCHITECTURE.md) | the design, the crate map, the request flow |
+| [`MILESTONES.md`](docs/MILESTONES.md) | roadmap and live status (M0–M20 + audit gate) |
+| [`PROTOCOL.md`](docs/PROTOCOL.md) | the per-flow wire pipeline and exit models |
+| [`CRYPTO.md`](docs/CRYPTO.md) | primitives and the constructions built on them |
+| [`DISCOVERY.md`](docs/DISCOVERY.md) | zero-config discovery, witnessed snapshots, Sybil/eclipse |
+| [`THREAT_MODEL.md`](docs/THREAT_MODEL.md) | adversaries, answers, honest limits |
+| [`SECURITY_ANALYSIS.md`](docs/SECURITY_ANALYSIS.md) | the adversarial internal review and its fixes |
 
 ## Build
 

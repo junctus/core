@@ -150,10 +150,9 @@ Adversary-simulation tests, fuzzing, and an expanded threat model.
 
 ## Frontier (research-grade; sequenced by tractability)
 
-The frontier primitives are implemented and tested; see `docs/FRONTIER.md` for the honest
-real-vs-deferred boundary of each. A capstone integration test
-(`core/crates/neo-node/tests/frontier.rs`) exercises all four together and composes them into one
-request flow. None is audited.
+The frontier primitives are implemented and tested; each entry below states its honest
+real-vs-deferred boundary. A capstone integration test (`core/crates/neo-node/tests/frontier.rs`)
+exercises M10–M13 together and composes them into one request flow. None is audited.
 
 ### M10 — Anonymous bandwidth credits ✅ (unlinkable + double-spend; earn-accounting deferred)
 Unlinkable, token-free credits: earn by relaying, spend to send — one mechanism for Sybil resistance
@@ -207,22 +206,27 @@ PIR/oblivious peer discovery + ZK proof-of-mixing, so privacy is provable rather
 
 ## Hardening & expansion
 
-### M14 — Core security hardening ✅ (14 findings fixed; 4 heaviest tracked)
+### M14 — Core security hardening ✅ (all review findings fixed; external audit remains)
 Driven by the adversarial internal review in `docs/SECURITY_ANALYSIS.md` (four parallel reviews across
-the AKE/session, Sphinx, slicing/mix/routing, and discovery/forwarding surfaces).
-- Done (with regression tests): **C-1** exit-verified Sphinx payload integrity; **C-2** reject the
-  identity `α`; **H-1** authenticate header before recording the replay tag; **H-2** relay shares one
-  lifetime `ReplayCache`; **H-3** bind the full `NodeId` (kex/kem) into the handshake + return it (UKS);
-  **H-5** stop trusting `X-Forwarded-For` (trusted-proxy allowlist + right-most hop); **H-6** slicing
-  secrecy documented as computational; **H-7** feed all 32 seed bytes into seeded path selection
-  (keyed XOF + rejection sampling); **M-1** `Router` dedup by `NodeId`; **M-2** reject trailing bytes
-  after handshake messages; **M-4** bind the slicing header as AEAD associated data; **M-5** mixer
-  degrades instead of panicking on RNG failure; **M-7** bound frame allocation (64 KiB); **M-8**
-  concurrent routes must be fully node-disjoint (no shared exit).
-- Tracked (the heaviest): **H-4** key-confirmation flight + m1 anti-replay (a 3-message redesign);
-  **M-3** per-share authentication (a share-format change); **M-6** client snapshot anti-rollback
-  persistence; full **wide-block non-malleable payload** for complete tagging resistance.
-- Done when: those four close with tests; then the external audit gate.
+the AKE/session, Sphinx, slicing/mix/routing, and discovery/forwarding surfaces). **Every** HIGH and
+MEDIUM finding is fixed with regression tests.
+- Crypto/Sphinx: **C-1** exit-verified payload integrity; **C-2** reject the identity `α`; **H-1**
+  authenticate header before recording the replay tag; the full **wide-block (Lioness) payload** so any
+  tamper avalanches the whole block (complete tagging resistance, SPRP avalanche test).
+- Handshake: **H-3** bind the full `NodeId` (all three keys) + return it (UKS); **H-4** a
+  **key-confirmation (m3) flight** — the responder establishes no session and emits no data until the
+  initiator proves it derived the key — plus a **stateless retry cookie** so a replayed or
+  connect-and-abandon m1 costs only a MAC, never an ML-KEM encapsulation; **M-2** reject trailing bytes.
+- Slicing: **H-6** secrecy documented as computational; **M-3** per-share MACs (a corrupt shard is
+  detected, attributed, and routed around as an erasure); **M-4** header bound as AEAD associated data.
+- Discovery/seed/forward: **H-2** relay shares one lifetime `ReplayCache`; **H-5** trusted-proxy
+  `X-Forwarded-For` allowlist; **M-6** client snapshot anti-rollback (persisted `created_at`
+  high-water mark); **M-7** bounded frame allocation (64 KiB).
+- Routing/mix: **H-7** full-32-byte seeded path selection (keyed XOF + rejection sampling); **M-1**
+  `Router` dedup by `NodeId`; **M-5** mixer degrades instead of panicking on RNG failure; **M-8**
+  fully node-disjoint concurrent routes.
+- Every HIGH and MEDIUM finding is now closed with tests; the one thing left before real use is the
+  **external audit gate**.
 
 ### M15 — Bidirectional streaming ✅ (request/response round-trip; persistent TCP tunnel next)
 Extend the one-shot onion delivery (M4.6) with a **return path**, giving a full round-trip.

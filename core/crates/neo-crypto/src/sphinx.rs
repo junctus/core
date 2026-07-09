@@ -224,8 +224,10 @@ pub fn create_packet_keyed(
     delta[..2].copy_from_slice(&(payload.len() as u16).to_be_bytes());
     delta[2..2 + MAC_LEN].copy_from_slice(&payload_mac);
     delta[2 + MAC_LEN..2 + MAC_LEN + payload.len()].copy_from_slice(payload);
-    for key in &pi {
-        xor(&mut delta, &keystream(key, PAYLOAD_LEN));
+    // Apply one Lioness layer per hop, innermost (exit) first, so hop 0's layer
+    // is outermost and each hop removes exactly its own on the way in.
+    for key in pi.iter().rev() {
+        lioness_encrypt(&mut delta, key);
     }
 
     let packet = SphinxPacket {
@@ -276,9 +278,9 @@ pub fn process(
     let mut new_beta = [0u8; BETA_LEN];
     new_beta.copy_from_slice(&ext[HOP_LEN..HOP_LEN + BETA_LEN]);
 
-    // Peel one payload layer.
+    // Peel one payload layer (the inverse wide-block permutation).
     let mut delta = packet.delta.clone();
-    xor(&mut delta, &keystream(&pi, PAYLOAD_LEN));
+    lioness_decrypt(&mut delta, &pi);
 
     if next == EXIT_ADDR {
         if delta.len() < 2 + MAC_LEN {
@@ -334,6 +336,60 @@ fn keystream(key: &[u8; 32], len: usize) -> Vec<u8> {
     let mut out = vec![0u8; len];
     blake3::Hasher::new_keyed(key).finalize_xof().fill(&mut out);
     out
+}
+
+/// Left-block size for the Lioness wide-block cipher (a BLAKE3 output width).
+const LIONESS_L: usize = 32;
+
+/// Four subkeys for one Lioness layer, domain-separated from the hop key.
+fn lioness_subkeys(key: &[u8; 32]) -> [[u8; 32]; 4] {
+    [
+        blake3::derive_key("neo-sphinx-lioness-k1-v1", key),
+        blake3::derive_key("neo-sphinx-lioness-k2-v1", key),
+        blake3::derive_key("neo-sphinx-lioness-k3-v1", key),
+        blake3::derive_key("neo-sphinx-lioness-k4-v1", key),
+    ]
+}
+
+fn xor32(a: &[u8], b: &[u8; 32]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = a[i] ^ b[i];
+    }
+    out
+}
+
+fn keyed32(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
+    *blake3::keyed_hash(key, data).as_bytes()
+}
+
+/// One layer of the **Lioness** wide-block cipher (Anderson–Biham) — a
+/// length-preserving strong pseudo-random permutation over the whole payload
+/// block, built from a stream cipher `S` and a keyed hash `H`. Because it is an
+/// SPRP, flipping *any* ciphertext bit randomizes the *entire* decrypted block,
+/// so a malicious relay cannot imprint a chosen, readable pattern on the payload
+/// (defeating tagging) — not merely be detected after the fact.
+fn lioness_encrypt(block: &mut [u8], key: &[u8; 32]) {
+    let [k1, k2, k3, k4] = lioness_subkeys(key);
+    let (l, r) = block.split_at_mut(LIONESS_L);
+    xor(r, &keystream(&xor32(l, &k1), r.len())); // R ^= S(L^k1)
+    let h = keyed32(&k2, r); // L ^= H(k2, R)
+    xor(l, &h);
+    xor(r, &keystream(&xor32(l, &k3), r.len())); // R ^= S(L^k3)
+    let h = keyed32(&k4, r); // L ^= H(k4, R)
+    xor(l, &h);
+}
+
+/// Inverse of [`lioness_encrypt`] — the four steps in reverse.
+fn lioness_decrypt(block: &mut [u8], key: &[u8; 32]) {
+    let [k1, k2, k3, k4] = lioness_subkeys(key);
+    let (l, r) = block.split_at_mut(LIONESS_L);
+    let h = keyed32(&k4, r);
+    xor(l, &h);
+    xor(r, &keystream(&xor32(l, &k3), r.len()));
+    let h = keyed32(&k2, r);
+    xor(l, &h);
+    xor(r, &keystream(&xor32(l, &k1), r.len()));
 }
 
 fn subkey(context: &str, secret: &[u8; 32]) -> [u8; 32] {
@@ -499,6 +555,30 @@ mod tests {
         assert!(
             process(&b, &mut cache_b, &forwarded).is_err(),
             "exit must reject a tampered payload (no silent corruption / tagging)"
+        );
+    }
+
+    #[test]
+    fn lioness_payload_is_a_wide_block_prp() {
+        // One flipped ciphertext bit must randomize most of the decrypted block
+        // (SPRP avalanche) — so a tampering relay cannot imprint a chosen,
+        // readable pattern on the payload. Round-trip correctness too.
+        let key = [3u8; 32];
+        let mut block = vec![7u8; PAYLOAD_LEN];
+        block[..8].copy_from_slice(b"original");
+        lioness_encrypt(&mut block, &key);
+
+        let mut tampered = block.clone();
+        tampered[100] ^= 0x01; // flip a single ciphertext bit
+
+        lioness_decrypt(&mut block, &key);
+        lioness_decrypt(&mut tampered, &key);
+
+        assert_eq!(&block[..8], b"original", "round-trips exactly");
+        let diff = block.iter().zip(&tampered).filter(|(a, b)| a != b).count();
+        assert!(
+            diff > PAYLOAD_LEN / 4,
+            "one flipped bit must avalanche across the block (changed {diff} bytes)"
         );
     }
 

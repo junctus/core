@@ -109,6 +109,19 @@ the baked-in constants in `platforms/desktop/src/defaults.rs`. A client refuses
 to trust a snapshot from a witness it hasn't been told about — trust is never
 implicit.
 
+## DoH rendezvous bootstrap (M18)
+
+Baking the mirror/witness list into the binary works but can't rotate without a
+rebuild, and a fixed list is easy to block. A **bootstrap record**
+(`neo-discovery::bootstrap`) decouples them: a long-lived **bootstrap key**
+(the only thing baked in) signs a small record listing the *current* mirrors and
+witnesses, published in DNS and fetched over **DNS-over-HTTPS** — so the lookup
+is encrypted, hard to censor, and the list rotates by re-signing. The record is
+rollback-protected (`created_at`) and verified against the trusted bootstrap
+keys. Operators publish one with `neo bootstrap-record`; clients resolve it with
+`neo bootstrap-resolve` (or automatically). Integrity still rides the witness
+signatures on the snapshot, so the DoH transport and the DNS are untrusted.
+
 ## Threat model summary
 
 | Attack | Defense |

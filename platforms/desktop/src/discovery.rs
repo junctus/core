@@ -101,7 +101,15 @@ pub async fn fetch_verified(cfg: &DiscoveryConfig) -> Result<SignedSnapshot> {
         match fetch_one(&client, &url).await {
             Ok(bytes) => match SignedSnapshot::from_bytes(&bytes) {
                 Ok(snapshot) => match snapshot.verify(&cfg.witnesses, cfg.threshold, now) {
+                    Ok(()) if !accepts_created_at(snapshot.snapshot.created_at, read_hwm()) => {
+                        last_err = anyhow!(
+                            "{mirror}: snapshot rolled back (created_at {} < last accepted {})",
+                            snapshot.snapshot.created_at,
+                            read_hwm()
+                        );
+                    }
                     Ok(()) => {
+                        bump_hwm(snapshot.snapshot.created_at);
                         tracing::info!(
                             mirror = %mirror,
                             relays = snapshot.relays(now).len(),
@@ -136,8 +144,11 @@ pub fn load_cached(cfg: &DiscoveryConfig) -> Option<SignedSnapshot> {
     let now = now_unix();
     snapshot.verify(&cfg.witnesses, cfg.threshold, now).ok()?;
     // Reject a snapshot that's technically valid but older than we're willing
-    // to run on without a refetch.
+    // to run on without a refetch, or that would roll back the relay set.
     if now.saturating_sub(snapshot.snapshot.created_at) > CACHE_MAX_AGE.as_secs() {
+        return None;
+    }
+    if !accepts_created_at(snapshot.snapshot.created_at, read_hwm()) {
         return None;
     }
     Some(snapshot)
@@ -182,4 +193,20 @@ pub fn pick_relay(relays: &[&PeerRecord]) -> Option<PeerRecord> {
     getrandom::getrandom(&mut b).ok()?;
     let idx = (u64::from_le_bytes(b) % relays.len() as u64) as usize;
     Some(relays[idx].clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::accepts_created_at;
+
+    #[test]
+    fn anti_rollback_accepts_newer_or_equal_rejects_older() {
+        // First ever snapshot (hwm = 0) is accepted.
+        assert!(accepts_created_at(1000, 0));
+        // A newer or equal snapshot is accepted.
+        assert!(accepts_created_at(2000, 1000));
+        assert!(accepts_created_at(1000, 1000));
+        // An older (rolled-back) snapshot is rejected.
+        assert!(!accepts_created_at(999, 1000));
+    }
 }

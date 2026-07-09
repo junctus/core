@@ -119,7 +119,10 @@ pub async fn run_tunnel(
 mod tests {
     use super::*;
     use neo_core::{NodeIdentity, PrivacyLevel};
-    use neo_crypto::{initiator_finish, initiator_message1, responder_process};
+    use neo_crypto::{
+        initiator_finish, initiator_message1, responder_confirm, responder_cookie,
+        responder_process, CookieKey,
+    };
     use std::time::Duration;
 
     #[tokio::test]
@@ -146,9 +149,13 @@ mod tests {
         // Establish interoperating sessions via the handshake.
         let alice = NodeIdentity::generate().unwrap();
         let bob = NodeIdentity::generate().unwrap();
-        let (state, m1) = initiator_message1(&alice).unwrap();
-        let (m2, bob_res) = responder_process(&bob, &m1).unwrap();
-        let alice_res = initiator_finish(state, &m2).unwrap();
+        let (state, init1) = initiator_message1(&alice).unwrap();
+        let cookie_key = CookieKey::generate().unwrap();
+        let challenge = responder_cookie(&cookie_key, &init1).unwrap();
+        let init2 = state.with_cookie(&challenge);
+        let (m2, pending) = responder_process(&bob, &init2, &cookie_key).unwrap();
+        let (m3, alice_res) = initiator_finish(state, &m2).unwrap();
+        let bob_res = responder_confirm(pending, &m3).unwrap();
         let mix = MixParams::for_level(PrivacyLevel::Off); // deterministic: no delay/cover
 
         let (a_app_out_tx, a_app_out_rx) = mpsc::channel(16);

@@ -14,7 +14,8 @@ pub mod session;
 pub mod sphinx;
 
 pub use handshake::{
-    initiator_finish, initiator_message1, responder_process, HandshakeResult, Initiator,
+    initiator_finish, initiator_message1, responder_confirm, responder_cookie, responder_process,
+    CookieKey, HandshakeResult, Initiator, PendingResponder,
 };
 pub use session::{Opener, Sealer, Session};
 pub use sphinx::{
