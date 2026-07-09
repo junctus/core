@@ -29,6 +29,9 @@
 //!
 //! [REALITY]: https://github.com/XTLS/REALITY
 
+use std::collections::HashSet;
+use std::sync::Mutex;
+
 use neo_core::{Error, Result};
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
@@ -41,10 +44,59 @@ const EPH_LEN: usize = 32;
 const HELLO_PREFIX: usize = EPH_LEN + TAG_LEN;
 /// Minimum random tail so a hello sits in a realistic ClientHello size class.
 const MIN_PAD: usize = 32;
+/// The pad length is randomized over `MIN_PAD..=MIN_PAD+PAD_JITTER` so the flight
+/// is not a fixed size on the wire.
+const PAD_JITTER: usize = 64;
+/// Seen-ephemeral cache size per epoch generation (bounds memory).
+const REPLAY_CAP: usize = 1 << 16;
+
+/// A bounded, two-generation cache of ephemerals seen within the replay window, so
+/// a captured hello cannot be replayed. Memory is capped at `~2 * REPLAY_CAP`.
+struct ReplayCache {
+    epoch: u64,
+    current: HashSet<[u8; 32]>,
+    previous: HashSet<[u8; 32]>,
+}
+
+impl ReplayCache {
+    fn new() -> Self {
+        Self {
+            epoch: 0,
+            current: HashSet::new(),
+            previous: HashSet::new(),
+        }
+    }
+
+    /// Returns `true` if `eph` was already seen within the replay window; records
+    /// it otherwise. Rotates generations as the epoch advances (keeping the
+    /// previous generation for the one-epoch skew window).
+    fn is_replay(&mut self, epoch: u64, eph: [u8; 32]) -> bool {
+        if epoch != self.epoch {
+            if epoch == self.epoch.wrapping_add(1) {
+                self.previous = std::mem::take(&mut self.current);
+            } else {
+                self.current.clear();
+                self.previous.clear();
+            }
+            self.epoch = epoch;
+        }
+        if self.current.contains(&eph) || self.previous.contains(&eph) {
+            return true;
+        }
+        if self.current.len() >= REPLAY_CAP {
+            self.previous = std::mem::take(&mut self.current);
+        }
+        self.current.insert(eph);
+        false
+    }
+}
 
 /// The server's long-term REALITY secret. Its [`public`](RealitySecret::public)
 /// half is a capability distributed to legitimate clients out of band.
-pub struct RealitySecret(StaticSecret);
+pub struct RealitySecret {
+    secret: StaticSecret,
+    seen: Mutex<ReplayCache>,
+}
 
 /// The server's REALITY public key: the pre-shared capability a client needs to
 /// author a valid, uniform-looking authenticator. Not published like a TLS cert.
@@ -68,27 +120,31 @@ impl RealitySecret {
     pub fn generate() -> Result<Self> {
         let mut sk = Zeroizing::new([0u8; 32]);
         getrandom::getrandom(sk.as_mut_slice()).map_err(|e| Error::Rng(e.to_string()))?;
-        Ok(Self(StaticSecret::from(*sk)))
+        Ok(Self {
+            secret: StaticSecret::from(*sk),
+            seen: Mutex::new(ReplayCache::new()),
+        })
     }
 
     /// The public capability clients need.
     pub fn public(&self) -> RealityKey {
-        RealityKey(PublicKey::from(&self.0).to_bytes())
+        RealityKey(PublicKey::from(&self.secret).to_bytes())
     }
 
     /// Silently classify an incoming `hello` at the server's current `epoch`.
     ///
-    /// Accepts the current and previous epoch (a small clock-skew window) so a
-    /// captured hello cannot be replayed indefinitely. Any malformed, random, or
-    /// wrong-key input classifies as [`Verdict::Decoy`] — never an error and never
-    /// a distinguishable reaction.
+    /// Accepts the current and previous epoch (a small clock-skew window). A
+    /// captured hello cannot be replayed: an authenticated ephemeral already seen
+    /// within the window is refused as [`Verdict::Decoy`]. Any malformed, random,
+    /// or wrong-key input also classifies as [`Verdict::Decoy`] — never an error and
+    /// never a distinguishable reaction.
     pub fn classify(&self, hello: &[u8], epoch: u64) -> Verdict {
         if hello.len() < HELLO_PREFIX {
             return Verdict::Decoy;
         }
         let eph: [u8; 32] = hello[..EPH_LEN].try_into().expect("checked len");
         let got = &hello[EPH_LEN..HELLO_PREFIX];
-        let shared_secret = self.0.diffie_hellman(&PublicKey::from(eph));
+        let shared_secret = self.secret.diffie_hellman(&PublicKey::from(eph));
         // Reject low-order / non-contributory ephemerals. A low-order point (e.g.
         // the identity) yields a shared secret an attacker can also predict —
         // letting a prober forge an authenticator WITHOUT the capability key. Take
@@ -101,6 +157,16 @@ impl RealitySecret {
         // Accept this epoch and the previous one (skew tolerance).
         for ep in [epoch, epoch.wrapping_sub(1)] {
             if ct_eq(&auth_tag(&shared, ep, &eph), got) {
+                // Reject a replayed hello (a captured, re-sent flight within the
+                // window) — silently, as a Decoy.
+                if self
+                    .seen
+                    .lock()
+                    .expect("reality replay cache poisoned")
+                    .is_replay(epoch, eph)
+                {
+                    return Verdict::Decoy;
+                }
                 return Verdict::Authenticated {
                     session_seed: session_seed(&shared, &eph),
                 };
@@ -140,7 +206,13 @@ impl RealityKey {
         let tag = auth_tag(&shared, epoch, &eph_pub);
         let seed = session_seed(&shared, &eph_pub);
 
-        let mut pad = vec![0u8; MIN_PAD];
+        // Randomize the pad length so the flight is not a fixed size on the wire.
+        // (Full wire indistinguishability — embedding inside a real TLS ClientHello
+        // — is M27; this only removes the constant-length tell.)
+        let mut jitter = [0u8; 1];
+        getrandom::getrandom(&mut jitter).map_err(|e| Error::Rng(e.to_string()))?;
+        let pad_len = MIN_PAD + (jitter[0] as usize % (PAD_JITTER + 1));
+        let mut pad = vec![0u8; pad_len];
         getrandom::getrandom(&mut pad).map_err(|e| Error::Rng(e.to_string()))?;
 
         let mut hello = Vec::with_capacity(HELLO_PREFIX + pad.len());
@@ -246,22 +318,47 @@ mod tests {
     }
 
     #[test]
-    fn a_captured_hello_expires_after_the_epoch_window() {
+    fn a_replayed_hello_is_rejected() {
+        // A captured hello authenticates once; re-sending it must be a silent Decoy.
         let server = RealitySecret::generate().unwrap();
         let key = server.public();
         let epoch = 500;
         let (hello, _) = key.client_hello(epoch).unwrap();
 
-        // Same epoch and one epoch later (skew window) still authenticate.
         assert!(matches!(
             server.classify(&hello, epoch),
             Verdict::Authenticated { .. }
         ));
+        assert!(
+            matches!(server.classify(&hello, epoch), Verdict::Decoy),
+            "a captured hello must not re-authenticate"
+        );
+    }
+
+    #[test]
+    fn a_hello_outside_the_epoch_window_is_decoy() {
+        // A fresh (never-seen) hello for `epoch`, classified two epochs later, is
+        // outside the skew window → Decoy, independent of the replay cache.
+        let server = RealitySecret::generate().unwrap();
+        let key = server.public();
+        let epoch = 500;
+        let (stale, _) = key.client_hello(epoch).unwrap();
+        assert!(matches!(server.classify(&stale, epoch + 2), Verdict::Decoy));
+        // A fresh hello within the window (next epoch) still authenticates.
+        let (fresh, _) = key.client_hello(epoch).unwrap();
         assert!(matches!(
-            server.classify(&hello, epoch + 1),
+            server.classify(&fresh, epoch + 1),
             Verdict::Authenticated { .. }
         ));
-        // Two epochs later it is outside the window → decoy (no indefinite replay).
-        assert!(matches!(server.classify(&hello, epoch + 2), Verdict::Decoy));
+    }
+
+    #[test]
+    fn flight_length_varies_across_connections() {
+        // The pad is jittered so the first flight is not a fixed size on the wire.
+        let key = RealitySecret::generate().unwrap().public();
+        let lens: std::collections::HashSet<usize> = (0..32)
+            .map(|_| key.client_hello(1).unwrap().0.len())
+            .collect();
+        assert!(lens.len() > 1, "flight length must vary");
     }
 }
