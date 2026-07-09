@@ -10,15 +10,18 @@
 //! are exercised by a local two-node test.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use libp2p::futures::StreamExt;
-use libp2p::kad::store::MemoryStore;
-use libp2p::kad::{GetRecordOk, QueryId, QueryResult, Quorum, Record, RecordKey};
+use libp2p::kad::store::{MemoryStore, RecordStore};
+use libp2p::kad::{GetRecordOk, InboundRequest, QueryId, QueryResult, Quorum, Record, RecordKey};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{identify, kad, noise, tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBuilder};
+use libp2p::{
+    identify, kad, noise, tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
+};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{Discovery, PeerRecord};
+use crate::{now_unix, Discovery, NodeRole, PeerRecord};
 use neo_core::NodeId;
 // Note: we deliberately do NOT bring `neo_core::Result` into scope — the
 // `#[derive(NetworkBehaviour)]` macro generates code that uses the standard
@@ -42,7 +45,14 @@ pub struct Libp2pNode {
 
 impl Libp2pNode {
     /// Build a node with a fresh identity over TCP + Noise + yamux.
-    pub fn new() -> neo_core::Result<Self> {
+    ///
+    /// [`NodeRole::Client`] forces Kademlia **client mode**: the node issues
+    /// queries but never answers or stores them, so it stays out of other
+    /// nodes' routing tables — a client's participation is not enumerable via
+    /// the DHT. [`NodeRole::Relay`] serves the DHT, with **inbound records
+    /// filtered**: every incoming put is parsed and cryptographically verified
+    /// before it is stored (see the event loops below).
+    pub fn new(role: NodeRole) -> neo_core::Result<Self> {
         let mut swarm = SwarmBuilder::with_new_identity()
             .with_tokio()
             .with_tcp(
@@ -53,8 +63,16 @@ impl Libp2pNode {
             .map_err(|e| Error::Config(format!("libp2p tcp transport: {e}")))?
             .with_behaviour(|key| {
                 let peer_id = key.public().to_peer_id();
+                let mut cfg = kad::Config::new(StreamProtocol::new("/neo/kad/1.0.0"));
+                // Query over independent paths so one adversarial routing-table
+                // neighborhood can't eclipse a lookup (S/Kademlia-style).
+                cfg.disjoint_query_paths(true);
+                // Never auto-store inbound records: they surface as
+                // `InboundRequest::PutRecord` events and are stored only after
+                // signature + self-certification checks.
+                cfg.set_record_filtering(kad::StoreInserts::FilterBoth);
                 Behaviour {
-                    kademlia: kad::Behaviour::new(peer_id, MemoryStore::new(peer_id)),
+                    kademlia: kad::Behaviour::with_config(peer_id, MemoryStore::new(peer_id), cfg),
                     identify: identify::Behaviour::new(identify::Config::new(
                         "/neo/id/1.0.0".into(),
                         key.public(),
@@ -68,13 +86,34 @@ impl Libp2pNode {
                 cfg.with_idle_connection_timeout(std::time::Duration::from_secs(60))
             })
             .build();
-        // Serve DHT records (nodes default to client mode, which neither stores
-        // nor answers queries — fatal for a small local network).
-        swarm
-            .behaviour_mut()
-            .kademlia
-            .set_mode(Some(kad::Mode::Server));
+        let mode = match role {
+            NodeRole::Client => kad::Mode::Client,
+            NodeRole::Relay => kad::Mode::Server,
+        };
+        swarm.behaviour_mut().kademlia.set_mode(Some(mode));
         Ok(Self { swarm })
+    }
+
+    /// Verify an inbound DHT record and store it if it checks out: it must
+    /// parse as a [`PeerRecord`], be stored under exactly its own node id,
+    /// pass self-certification + signature + expiry, and not roll back a
+    /// newer sequence number already in the store.
+    fn store_verified_inbound(&mut self, record: Record) {
+        let Ok(peer) = PeerRecord::from_bytes(&record.value) else {
+            return;
+        };
+        if record.key.as_ref() != peer.id.as_bytes() || peer.verify(now_unix()).is_err() {
+            return;
+        }
+        let store = self.swarm.behaviour_mut().kademlia.store_mut();
+        if let Some(existing) = store.get(&record.key) {
+            if let Ok(existing) = PeerRecord::from_bytes(&existing.value) {
+                if existing.seq >= peer.seq {
+                    return;
+                }
+            }
+        }
+        let _ = store.put(record);
     }
 
     /// This node's libp2p peer id.
@@ -116,13 +155,20 @@ impl Libp2pNode {
         Ok(())
     }
 
-    /// Put a `(key, value)` record into the DHT.
-    pub fn put_record(&mut self, key: Vec<u8>, value: Vec<u8>) -> neo_core::Result<QueryId> {
+    /// Put a `(key, value)` record into the DHT, expiring at unix-seconds
+    /// `expires_at` so the store drops it in step with the record's own expiry.
+    pub fn put_record(
+        &mut self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        expires_at: u64,
+    ) -> neo_core::Result<QueryId> {
+        let ttl = expires_at.saturating_sub(now_unix());
         let record = Record {
             key: RecordKey::new(&key),
             value,
             publisher: None,
-            expires: None,
+            expires: Some(Instant::now() + Duration::from_secs(ttl)),
         };
         self.swarm
             .behaviour_mut()
@@ -178,18 +224,20 @@ enum Command {
 /// records.
 pub struct Libp2pDiscovery {
     peer_id: PeerId,
+    role: NodeRole,
     commands: mpsc::Sender<Command>,
 }
 
 impl Libp2pDiscovery {
     /// Spawn a libp2p node and its background event loop.
-    pub fn spawn() -> neo_core::Result<Self> {
-        let node = Libp2pNode::new()?;
+    pub fn spawn(role: NodeRole) -> neo_core::Result<Self> {
+        let node = Libp2pNode::new(role)?;
         let peer_id = node.peer_id();
         let (tx, rx) = mpsc::channel(64);
         tokio::spawn(event_loop(node, rx));
         Ok(Self {
             peer_id,
+            role,
             commands: tx,
         })
     }
@@ -237,6 +285,12 @@ async fn recv<T>(rx: oneshot::Receiver<T>) -> neo_core::Result<T> {
 
 impl Discovery for Libp2pDiscovery {
     async fn announce(&self, record: PeerRecord) -> neo_core::Result<()> {
+        if self.role == NodeRole::Client {
+            return Err(Error::Config(
+                "clients never announce — announcing would make this node enumerable".into(),
+            ));
+        }
+        record.verify(now_unix())?;
         let (tx, rx) = oneshot::channel();
         self.send(Command::Announce { record, reply: tx }).await?;
         recv(rx).await?
@@ -262,7 +316,22 @@ impl Discovery for Libp2pDiscovery {
     }
 }
 
+/// Insert into the local cache unless a same-or-newer `seq` is already held.
+fn cache_newest(cache: &mut HashMap<NodeId, PeerRecord>, record: PeerRecord) {
+    match cache.get(&record.id) {
+        Some(existing) if existing.seq >= record.seq => {}
+        _ => {
+            cache.insert(record.id, record);
+        }
+    }
+}
+
 /// The background task: owns the swarm, handles commands and DHT query results.
+///
+/// Everything that arrives from the network — lookup results and inbound store
+/// requests alike — is parsed, checked against the key it claims, and
+/// cryptographically verified before it is cached, stored, or handed to a
+/// caller. Unverifiable data is dropped as if it never arrived.
 async fn event_loop(mut node: Libp2pNode, mut commands: mpsc::Receiver<Command>) {
     let mut cache: HashMap<NodeId, PeerRecord> = HashMap::new();
     let mut pending_get: HashMap<QueryId, oneshot::Sender<neo_core::Result<Option<PeerRecord>>>> =
@@ -275,24 +344,32 @@ async fn event_loop(mut node: Libp2pNode, mut commands: mpsc::Receiver<Command>)
                 let Some(cmd) = maybe_cmd else { break };
                 match cmd {
                     Command::Announce { record, reply } => {
-                        cache.insert(record.id, record.clone());
+                        cache_newest(&mut cache, record.clone());
                         let result = node
-                            .put_record(record.id.as_bytes().to_vec(), record.to_bytes())
+                            .put_record(
+                                record.id.as_bytes().to_vec(),
+                                record.to_bytes(),
+                                record.expires_at,
+                            )
                             .map(|_| ());
                         let _ = reply.send(result);
                     }
                     Command::Lookup { id, reply } => {
-                        if let Some(record) = cache.get(&id) {
-                            let _ = reply.send(Ok(Some(record.clone())));
-                        } else {
-                            let query = node.get_record(id.as_bytes().to_vec());
-                            pending_get.insert(query, reply);
+                        match cache.get(&id) {
+                            Some(record) if !record.is_expired(now_unix()) => {
+                                let _ = reply.send(Ok(Some(record.clone())));
+                            }
+                            _ => {
+                                let query = node.get_record(id.as_bytes().to_vec());
+                                pending_get.insert(query, reply);
+                            }
                         }
                     }
                     Command::SampleRelays { n, reply } => {
+                        let now = now_unix();
                         let relays = cache
                             .values()
-                            .filter(|r| r.relay)
+                            .filter(|r| r.relay && !r.is_expired(now))
                             .take(n)
                             .cloned()
                             .collect();
@@ -317,16 +394,32 @@ async fn event_loop(mut node: Libp2pNode, mut commands: mpsc::Receiver<Command>)
                             let _ = reply.send(Ok(address));
                         }
                     }
+                    // A peer asked us to store a record (server mode, with
+                    // `StoreInserts::FilterBoth`): verify before storing.
+                    SwarmEvent::Behaviour(BehaviourEvent::Kademlia(
+                        kad::Event::InboundRequest {
+                            request: InboundRequest::PutRecord { record: Some(record), .. },
+                        },
+                    )) => {
+                        node.store_verified_inbound(record);
+                    }
                     SwarmEvent::Behaviour(BehaviourEvent::Kademlia(
                         kad::Event::OutboundQueryProgressed { id, result, .. },
                     )) => match result {
                         QueryResult::GetRecord(Ok(GetRecordOk::FoundRecord(found))) => {
-                            if let Ok(record) = PeerRecord::from_bytes(&found.record.value) {
-                                cache.insert(record.id, record.clone());
+                            let verified = PeerRecord::from_bytes(&found.record.value)
+                                .ok()
+                                .filter(|r| found.record.key.as_ref() == r.id.as_bytes())
+                                .filter(|r| r.verify(now_unix()).is_ok());
+                            if let Some(record) = verified {
+                                cache_newest(&mut cache, record.clone());
                                 if let Some(reply) = pending_get.remove(&id) {
                                     let _ = reply.send(Ok(Some(record)));
                                 }
                             }
+                            // An unverifiable result is dropped; the query keeps
+                            // progressing and ends in `FinishedWithNoAdditionalRecord`
+                            // if nothing legitimate turns up.
                         }
                         QueryResult::GetRecord(Ok(
                             GetRecordOk::FinishedWithNoAdditionalRecord { .. },
@@ -352,11 +445,24 @@ async fn event_loop(mut node: Libp2pNode, mut commands: mpsc::Receiver<Command>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use neo_core::NodeIdentity;
     use std::time::Duration;
+
+    fn signed_relay_record(identity: &NodeIdentity) -> PeerRecord {
+        PeerRecord::build_signed(
+            identity,
+            vec!["10.0.0.1:9000".into()],
+            true,
+            false,
+            now_unix() + 3600,
+            1,
+        )
+        .unwrap()
+    }
 
     #[tokio::test]
     async fn two_nodes_connect_over_libp2p() {
-        let mut a = Libp2pNode::new().unwrap();
+        let mut a = Libp2pNode::new(NodeRole::Relay).unwrap();
         let a_peer = a.peer_id();
         a.listen("/ip4/127.0.0.1/tcp/0").unwrap();
 
@@ -367,7 +473,7 @@ mod tests {
             }
         };
 
-        let mut b = Libp2pNode::new().unwrap();
+        let mut b = Libp2pNode::new(NodeRole::Relay).unwrap();
         b.add_address(a_peer, a_addr.clone());
         b.dial(a_addr).unwrap();
 
@@ -393,25 +499,16 @@ mod tests {
 
     #[tokio::test]
     async fn record_announced_on_one_node_is_found_via_the_dht() {
-        use neo_core::NodeIdentity;
-
-        let a = Libp2pDiscovery::spawn().unwrap();
+        let a = Libp2pDiscovery::spawn(NodeRole::Relay).unwrap();
         let a_addr = a.listen("/ip4/127.0.0.1/tcp/0").await.unwrap();
-        let b = Libp2pDiscovery::spawn().unwrap();
+        let b = Libp2pDiscovery::spawn(NodeRole::Relay).unwrap();
         // B dials A only (one direction avoids localhost dial churn).
         b.add_and_dial(a.peer_id(), a_addr).await.unwrap();
         // Let the connection, identify exchange, and routing tables settle.
         tokio::time::sleep(Duration::from_secs(2)).await;
 
-        let p = NodeIdentity::generate().unwrap().public();
-        let record = PeerRecord {
-            id: p.id,
-            kex: *p.kex.as_bytes(),
-            sphinx: p.sphinx,
-            addrs: vec!["10.0.0.1:9000".into()],
-            relay: true,
-            exit: false,
-        };
+        let identity = NodeIdentity::generate().unwrap();
+        let record = signed_relay_record(&identity);
         a.announce(record.clone()).await.unwrap();
 
         // Same node finds it immediately (from cache).
@@ -428,5 +525,71 @@ mod tests {
         })
         .await;
         assert_eq!(found.expect("DHT lookup timed out").id, record.id);
+    }
+
+    #[tokio::test]
+    async fn clients_stay_dark_and_forged_records_never_land() {
+        // A client role refuses to announce at all.
+        let client = Libp2pDiscovery::spawn(NodeRole::Client).unwrap();
+        let identity = NodeIdentity::generate().unwrap();
+        let record = signed_relay_record(&identity);
+        assert!(client.announce(record.clone()).await.is_err());
+
+        // A tampered record is rejected by announce-side verification too.
+        let server = Libp2pDiscovery::spawn(NodeRole::Relay).unwrap();
+        let mut forged = record;
+        forged.exit = true;
+        assert!(server.announce(forged).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn unverifiable_dht_records_are_not_returned() {
+        // Wire two server nodes together, then have B push a garbage value
+        // under a plausible key straight into the DHT layer.
+        let mut a = Libp2pNode::new(NodeRole::Relay).unwrap();
+        let a_peer = a.peer_id();
+        a.listen("/ip4/127.0.0.1/tcp/0").unwrap();
+        let a_addr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = a.next_event().await {
+                break address;
+            }
+        };
+
+        let mut b = Libp2pNode::new(NodeRole::Relay).unwrap();
+        b.add_address(a_peer, a_addr.clone());
+        b.dial(a_addr).unwrap();
+
+        let victim = NodeIdentity::generate().unwrap();
+        let key = victim.id().as_bytes().to_vec();
+        let garbage = vec![0u8; 64];
+
+        // Drive both swarms; once connected, push the forged record and keep
+        // driving so replication happens; A's inbound filter must drop it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut pushed = false;
+        while tokio::time::Instant::now() < deadline {
+            tokio::select! {
+                _ = a.next_event() => {}
+                event = b.next_event() => {
+                    if let SwarmEvent::ConnectionEstablished { peer_id, .. } = event {
+                        if peer_id == a_peer && !pushed {
+                            b.put_record(key.clone(), garbage.clone(), now_unix() + 600).unwrap();
+                            pushed = true;
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
+        }
+        assert!(pushed, "nodes never connected");
+
+        // A's store must not contain the forged record.
+        let stored = a
+            .swarm
+            .behaviour_mut()
+            .kademlia
+            .store_mut()
+            .get(&RecordKey::new(&key));
+        assert!(stored.is_none(), "forged record must not be stored");
     }
 }

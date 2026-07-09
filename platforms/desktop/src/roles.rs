@@ -1,0 +1,319 @@
+//! The discovery-driven node roles: relay and client.
+//!
+//! - [`run_relay`] is a public node: it listens, publishes a signed record to
+//!   the seeds, re-registers on a heartbeat, and **forwards onion traffic** to
+//!   the next hop (or delivers it if it is the exit).
+//! - [`run_client`] is the zero-configuration consumer: it obtains a verified
+//!   relay snapshot, picks a relay, and completes an authenticated handshake —
+//!   no peer address typed by hand.
+//! - [`run_send`] routes a one-shot message through a discovered multi-hop
+//!   onion circuit.
+//!
+//! These build on the M1 handshake (`neo_node::run`) and the onion data plane
+//! (`neo_node::forward`); discovery decides *who* to talk to.
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+use anyhow::{bail, Context, Result};
+use neo_core::{NodeId, NodeIdentity};
+use neo_discovery::{now_unix, PeerRecord};
+use neo_node::forward::{handle_onion, Hop, Outcome};
+use tokio::net::TcpListener;
+
+use crate::defaults::DiscoveryConfig;
+use crate::discovery;
+
+/// Seconds a relay's published record stays valid; it re-registers well inside
+/// this so a healthy relay never lapses out of a snapshot.
+const RELAY_RECORD_TTL: u64 = 1800;
+/// Heartbeat gap between re-registrations.
+const RELAY_HEARTBEAT: Duration = Duration::from_secs(600);
+
+/// A relay's next-hop address book: `NodeId → dialable address`, refreshed from
+/// the discovery snapshot so it can forward onions to any known relay.
+type Resolver = Arc<RwLock<HashMap<NodeId, String>>>;
+
+/// How often a relay refreshes its forwarding address book from the snapshot.
+/// Overridable via `NEO_RESOLVER_REFRESH_SECS` (useful for fast local demos).
+fn resolver_refresh() -> Duration {
+    let secs = std::env::var("NEO_RESOLVER_REFRESH_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+    Duration::from_secs(secs)
+}
+
+/// Run as a relay: listen, register with seeds, and forward onion traffic.
+pub async fn run_relay(
+    identity: NodeIdentity,
+    bind: &str,
+    announce_addr: Option<String>,
+    exit: bool,
+    cfg: DiscoveryConfig,
+) -> Result<()> {
+    let listener = TcpListener::bind(bind)
+        .await
+        .with_context(|| format!("binding relay listener on {bind}"))?;
+    let local = listener.local_addr()?;
+    println!("relay {} listening on {local}", identity.id());
+
+    // What we tell the world to dial. Prefer an explicit public address; fall
+    // back to the bound address (fine for localhost demos, wrong behind NAT —
+    // which is why we warn).
+    let advertised = announce_addr.unwrap_or_else(|| {
+        tracing::warn!(
+            "no --announce-addr given; advertising the bound address {local}. Behind NAT, \
+             set --announce-addr to your reachable public host:port."
+        );
+        local.to_string()
+    });
+
+    // Publish the first record, then keep it fresh on a heartbeat.
+    let seeds = cfg.clone();
+    let heartbeat_identity = NodeIdentity::from_bytes(&identity.to_bytes())?;
+    let advertised_hb = advertised.clone();
+    tokio::spawn(async move {
+        let mut seq = 1u64;
+        let mut ticker = tokio::time::interval(RELAY_HEARTBEAT);
+        // Consume the immediate first tick; the explicit registration below
+        // already covers t=0, so the first heartbeat should be one period out.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            match build_record(&heartbeat_identity, &advertised_hb, exit, seq) {
+                Ok(record) => {
+                    match discovery::register_with_seeds(&seeds, &record).await {
+                        Ok(0) => tracing::warn!("no seed accepted this relay's registration"),
+                        Ok(n) => tracing::info!("re-registered with {n} seed(s), seq={seq}"),
+                        Err(e) => tracing::warn!("registration error: {e}"),
+                    }
+                    seq += 1;
+                }
+                Err(e) => tracing::error!("could not build relay record: {e}"),
+            }
+        }
+    });
+
+    // Immediate first registration so the relay is discoverable right away.
+    let first = build_record(&identity, &advertised, exit, 0)?;
+    match discovery::register_with_seeds(&cfg, &first).await {
+        Ok(0) => println!("warning: no seed accepted the registration yet (will retry)"),
+        Ok(n) => println!("registered with {n} seed(s) as {advertised}"),
+        Err(e) => println!("warning: registration failed ({e}); will retry on heartbeat"),
+    }
+
+    // Keep an address book of known relays so we can forward onions to the next
+    // hop. Refreshed from the (witness-verified) snapshot in the background.
+    let resolver: Resolver = Arc::new(RwLock::new(HashMap::new()));
+    spawn_resolver_refresh(cfg.clone(), resolver.clone());
+
+    // Serve onions forever, one task per connection so a slow forward (dialing
+    // the next hop) never blocks accepting new ones.
+    let identity = Arc::new(identity);
+    println!("forwarding onions (Ctrl-C to stop)");
+    loop {
+        match neo_node::run::accept(&listener, &identity).await {
+            Ok((mut stream, mut result)) => {
+                let identity = identity.clone();
+                let resolver = resolver.clone();
+                tokio::spawn(async move {
+                    // Snapshot the address book so the borrow doesn't cross await.
+                    let addrs = resolver.read().expect("resolver lock").clone();
+                    match handle_onion(&identity, &mut stream, &mut result.session, &addrs).await {
+                        Ok(Outcome::Delivered { payload }) => {
+                            println!(
+                                "delivered {} bytes: {}",
+                                payload.len(),
+                                String::from_utf8_lossy(&payload)
+                            );
+                        }
+                        Ok(Outcome::Forwarded { next }) => {
+                            tracing::info!("forwarded onion to {next}");
+                        }
+                        Err(e) => tracing::warn!("onion handling failed: {e}"),
+                    }
+                });
+            }
+            Err(e) => tracing::warn!("accept/handshake failed: {e}"),
+        }
+    }
+}
+
+/// Background task: periodically rebuild the relay's `NodeId → addr` book from
+/// the verified snapshot so it can forward to any healthy relay.
+fn spawn_resolver_refresh(cfg: DiscoveryConfig, resolver: Resolver) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(resolver_refresh());
+        loop {
+            ticker.tick().await;
+            match discovery::obtain_snapshot(&cfg).await {
+                Ok(snapshot) => {
+                    let now = now_unix();
+                    let map: HashMap<NodeId, String> = snapshot
+                        .relays(now)
+                        .into_iter()
+                        .filter_map(|r| r.addrs.first().map(|a| (r.id, a.clone())))
+                        .collect();
+                    let count = map.len();
+                    *resolver.write().expect("resolver lock") = map;
+                    tracing::debug!("forwarding table refreshed: {count} relay(s)");
+                }
+                Err(e) => tracing::warn!("could not refresh forwarding table: {e}"),
+            }
+        }
+    });
+}
+
+fn build_record(
+    identity: &NodeIdentity,
+    advertised: &str,
+    exit: bool,
+    seq: u64,
+) -> Result<PeerRecord> {
+    PeerRecord::build_signed(
+        identity,
+        vec![advertised.to_string()],
+        true,
+        exit,
+        now_unix() + RELAY_RECORD_TTL,
+        seq,
+    )
+    .context("signing relay record")
+}
+
+/// Run as a zero-configuration client: discover a relay and handshake with it.
+pub async fn run_client(identity: NodeIdentity, cfg: DiscoveryConfig) -> Result<()> {
+    println!("this node : {} (client)", identity.id());
+    println!("discovering relays via {} mirror(s)…", cfg.mirrors.len());
+
+    let snapshot = discovery::obtain_snapshot(&cfg).await?;
+    let now = now_unix();
+    let relays = snapshot.relays(now);
+    println!(
+        "verified snapshot: {} relay(s), signed by {}/{} required witnesses",
+        relays.len(),
+        cfg.witnesses.len().min(snapshot.signatures.len()),
+        cfg.threshold
+    );
+
+    let relay = discovery::pick_relay(&relays)
+        .context("the verified snapshot contains no usable relay yet")?;
+    let addr = relay
+        .addrs
+        .first()
+        .cloned()
+        .context("chosen relay advertises no address")?;
+
+    println!("connecting to relay {} at {addr} …", relay.id);
+    let (_stream, result) = neo_node::run::connect(&addr, &identity).await?;
+    let peer = result.peer.to_bytes();
+
+    // The relay must authenticate as exactly the key the snapshot vouched for.
+    // This closes the loop: the witness attested the key, and the live handshake
+    // proves the node we reached holds it.
+    if peer != relay.signing {
+        bail!(
+            "relay authenticated as a different key than the snapshot advertised \
+             (expected {}, got {})",
+            hex::encode(relay.signing),
+            hex::encode(peer)
+        );
+    }
+    println!("handshake ok — authenticated relay {}", hex::encode(peer));
+    println!("discovery works: found and connected to a relay with zero manual configuration.");
+    Ok(())
+}
+
+/// Send a one-shot onion message through a discovered multi-hop circuit.
+///
+/// Discovers relays, builds a `hops`-relay Sphinx circuit (the last hop is the
+/// exit that receives the message), and hands the onion to the first hop. Each
+/// relay forwards a peeled layer to the next; only the exit sees the payload.
+pub async fn run_send(
+    identity: NodeIdentity,
+    cfg: DiscoveryConfig,
+    message: String,
+    hops: usize,
+) -> Result<()> {
+    if hops == 0 {
+        bail!("a circuit needs at least one hop");
+    }
+    println!("this node : {} (sender)", identity.id());
+    let snapshot = discovery::obtain_snapshot(&cfg).await?;
+    let now = now_unix();
+    let relays = snapshot.relays(now);
+    if relays.len() < hops {
+        bail!(
+            "need {hops} relays for the circuit, discovered only {}",
+            relays.len()
+        );
+    }
+
+    let circuit = pick_circuit(&relays, hops)?;
+    println!("routing through a {}-hop circuit:", circuit.len());
+    for (i, hop) in circuit.iter().enumerate() {
+        let role = if i + 1 == circuit.len() {
+            "exit"
+        } else {
+            "relay"
+        };
+        println!("  hop {} ({role}): {} @ {}", i + 1, hop.id, hop.addr);
+    }
+
+    neo_node::forward::send_onion(&identity, &circuit, message.as_bytes()).await?;
+    println!(
+        "onion handed to the first hop — each relay peels one layer and forwards; \
+         the exit delivers the message. No relay on the path can read it."
+    );
+    Ok(())
+}
+
+/// Pick `hops` distinct relays at random and turn them into a circuit.
+fn pick_circuit(relays: &[&PeerRecord], hops: usize) -> Result<Vec<Hop>> {
+    // Fisher–Yates over indices, then take the first `hops`.
+    let mut idx: Vec<usize> = (0..relays.len()).collect();
+    for i in (1..idx.len()).rev() {
+        let mut b = [0u8; 8];
+        getrandom::getrandom(&mut b).map_err(|e| anyhow::anyhow!("rng: {e}"))?;
+        let j = (u64::from_le_bytes(b) % (i as u64 + 1)) as usize;
+        idx.swap(i, j);
+    }
+    idx.into_iter()
+        .take(hops)
+        .map(|i| {
+            let r = relays[i];
+            let addr = r
+                .addrs
+                .first()
+                .cloned()
+                .context("a chosen relay advertises no address")?;
+            Ok(Hop {
+                id: r.id,
+                sphinx: r.sphinx,
+                addr,
+            })
+        })
+        .collect()
+}
+
+/// Load an identity from `path`, generating and persisting one if absent.
+/// Relays need a stable id, so unlike the ephemeral client default this writes
+/// the key back to disk.
+pub fn load_or_create_identity(path: &Path) -> Result<NodeIdentity> {
+    if path.exists() {
+        return Ok(NodeIdentity::from_bytes(&std::fs::read(path)?)?);
+    }
+    let identity = NodeIdentity::generate()?;
+    std::fs::write(path, identity.to_bytes())
+        .with_context(|| format!("writing identity to {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    println!("generated a new relay identity at {}", path.display());
+    Ok(identity)
+}

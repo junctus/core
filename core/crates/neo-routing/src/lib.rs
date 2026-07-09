@@ -94,6 +94,42 @@ impl Router {
             .map(|chunk| chunk.iter().map(|&i| self.relays[i].clone()).collect())
             .collect())
     }
+
+    /// Select a path *deterministically* from a 32-byte seed — e.g. a VRF output
+    /// (see `neo-verify`). Because the seed is verifiable and unbiasable, the
+    /// chosen path is reproducible and cannot be ground by an adversary (M11).
+    pub fn select_path_seeded(&self, seed: &[u8; 32], hops: usize) -> Result<Vec<Relay>> {
+        if hops == 0 {
+            return Err(Error::Config("a path needs at least one hop".into()));
+        }
+        if hops > self.relays.len() {
+            return Err(Error::Config(format!(
+                "need {hops} relays for a path, know only {}",
+                self.relays.len()
+            )));
+        }
+        let mut state = u64::from_le_bytes(seed[..8].try_into().expect("32-byte seed"));
+        let n = self.relays.len();
+        let mut order: Vec<usize> = (0..n).collect();
+        for i in (1..n).rev() {
+            let j = (splitmix64(&mut state) % (i as u64 + 1)) as usize;
+            order.swap(i, j);
+        }
+        Ok(order
+            .into_iter()
+            .take(hops)
+            .map(|i| self.relays[i].clone())
+            .collect())
+    }
+}
+
+/// A small deterministic PRNG (SplitMix64) for reproducible seeded selection.
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 /// A uniformly random permutation of `0..n` from OS randomness (Fisher–Yates).
@@ -162,5 +198,23 @@ mod tests {
             }
         }
         assert_eq!(seen.len(), 9);
+    }
+
+    #[test]
+    fn seeded_path_is_deterministic_and_verifiable() {
+        let router = Router::new(relays(8));
+        let seed = [7u8; 32];
+        let path_a = router.select_path_seeded(&seed, 3).unwrap();
+        let path_b = router.select_path_seeded(&seed, 3).unwrap();
+        let ids = |p: &[Relay]| p.iter().map(|r| r.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(&path_a),
+            ids(&path_b),
+            "same seed reproduces the same path"
+        );
+        assert_eq!(path_a.len(), 3);
+
+        let hops: std::collections::HashSet<_> = path_a.iter().map(|r| r.id).collect();
+        assert_eq!(hops.len(), 3, "hops are distinct");
     }
 }

@@ -6,9 +6,12 @@ demoable; the four frontier capabilities (M10–M13) are sequenced last because 
 
 **Status legend:** ✅ done · 🔨 next / in progress · ⬜ pending
 
-**Reality check:** this is a multi-quarter (realistically ~12–18 month) program. The near-term target
-is **M1** — the first version where packets actually flow through neo. Nothing here is audited; do not
-rely on neo for real-world safety until the audit gate.
+**Reality check:** this is a multi-quarter (realistically ~12–18 month) program. Real onion traffic now
+flows end to end — a message is discovered-routed through a live multi-hop circuit and delivered at an
+exit (M4.6), and all four frontier capabilities (M10–M13) have working, tested cores. What remains for
+a *safe* product is depth, not breadth: NAT traversal for home relays, the deferred transport/ZK/MPC
+constructions, and — the hard gate — an external audit. **Nothing here is audited; do not rely on neo
+for real-world safety until the audit gate.**
 
 ---
 
@@ -22,7 +25,7 @@ start.
 - [x] `neo-core`: errors, `NodeConfig` + `PrivacyLevel`, **PQ-hybrid `NodeIdentity`** (Ed25519 + X25519 + ML-KEM-768)
 - [x] `neo` CLI: `identity generate` (writes a `0600` key file)
 - [x] `cargo build` / `test` / `clippy -D warnings` / `fmt` all green
-- [ ] CI (build + test + clippy + fmt on push)
+- [x] CI (build + test + clippy + fmt on push, incl. libp2p + tun feature builds) — `.github/workflows/ci.yml`
 
 ### M1 — MVP tunnel ✅ (TUN bridge needs root; QUIC deferred to M6)
 PQ-hybrid handshake + encrypted session between two peers.
@@ -61,6 +64,49 @@ Discovery interface, NAT-traversal strategy, an in-memory DHT, and a real libp2p
   another via the DHT.
 - Deferred: DCUtR hole-punching and Circuit Relay v2 for reaching peers behind NAT.
 - Tests: in-memory announce/lookup/sampling/ladder; two libp2p nodes connect; cross-node DHT lookup.
+
+### M4.5 — Runnable discovery + Sybil resistance ✅ (seed/relay/client live; NAT + audit pending)
+The point where discovery becomes a *runnable network*: `neo run` finds relays with zero manual
+configuration, and the discovery layer is hardened against Sybil, eclipse, and enumeration. See
+`docs/DISCOVERY.md`.
+- Done (records): **self-certifying, signed `PeerRecord`** — carries the full PQ key set, id must equal
+  `blake3(keys)`, Ed25519-signed, with `expires_at` + monotonic `seq`; `verify()` on receipt. Verifiers
+  reject forged, tampered, foreign-id, expired, and replayed records (`neo-core`, `neo-discovery`).
+- Done (client plane): **witnessed snapshots** (`neo-discovery::snapshot`) — k-of-n witness-signed relay
+  sets; whole-set fetch leaks no per-relay selection (PIR-degenerate); forged records fatal, expired
+  filtered. Integrity is separated from distribution, so snapshots serve from any untrusted mirror/CDN.
+- Done (DHT hardening): client/server **role split** (clients are DHT-invisible), inbound `PUT`
+  verification (`StoreInserts::FilterBoth`), **disjoint query paths**, seq-aware caching + TTLs.
+- Done (seed): `neo-seed` — verify + **dial-back handshake attestation** (proves address ↔ key) +
+  strike-based health + witness-signed snapshot; axum service (`/snapshot`, `/healthz`, `/witness`,
+  rate-limited `/register`), serving **no user traffic**.
+- Done (CLI + ops): `neo seed`, `neo run --relay`, zero-flag `neo run` client, `neo snapshot`; baked
+  mirror/witness defaults with flag/env overrides + on-disk snapshot cache; `deploy/discovery/`
+  (systemd + Caddy + installer for **discovery.junctus.org**) and `scripts/build-release.sh`
+  (macOS + Ubuntu x86_64).
+- Deferred: reaching NAT'd relays (AutoNAT/DCUtR/Relay v2, from M4); probe-resistant transports (M6);
+  the external audit.
+- Tests: record verify/tamper/expiry/foreign-id/garbage; snapshot threshold/duplicate/tamper/forged/
+  expiry; DHT role split + unverifiable-record rejection; seed registry + dial-back (real handshake) +
+  HTTP register/snapshot; **live seed→relay→client end-to-end** discovery with zero manual config.
+
+### M4.6 — Onion data plane over the network ✅ (one-shot delivery; streaming deferred)
+Sphinx onion routing (M2) carried over real sockets between separate processes — the point where neo
+becomes an *actual multi-hop network*, not just discovery plus a 1:1 handshake.
+- Done: `neo-node::forward` — a sender builds a Sphinx circuit from discovered relays (`Hop` = id +
+  routing key + addr, all from the signed `PeerRecord`) and hands the onion to the first hop over an
+  authenticated session; each relay `process()`es one layer, resolves the next hop's address from its
+  (witness-verified) snapshot, dials it, and forwards; the terminal hop delivers. Link encryption
+  (M1 session) under onion encryption (Sphinx), so no relay learns more than its next hop and none
+  but the exit sees the payload.
+- Done (CLI): `neo run --relay` forwards onions (per-connection tasks + a background snapshot-driven
+  address book); `neo send --message --hops N` routes a message through a discovered circuit;
+  `--register-cooldown` operator knob for local multi-relay demos.
+- Deferred: a return path and bidirectional stream/TCP tunneling (this delivers a one-shot onion
+  message — the primitive those build on); NAT traversal so home relays are dialable.
+- Tests: library-level 1- and 2-hop forward+deliver over localhost sockets, relay-sees-no-payload,
+  unresolvable-next-hop errors cleanly; **live seed + 3-relay + sender e2e** — a message forwarded
+  through a real 3-hop circuit and delivered at the exit, plaintext seen by exactly one relay.
 
 ### M5 — Timing defense ✅ (novel core, part 2)
 Cover traffic + per-packet Poisson timing mixing, scaled by the privacy dial.
@@ -104,30 +150,58 @@ Adversary-simulation tests, fuzzing, and an expanded threat model.
 
 ## Frontier (research-grade; sequenced by tractability)
 
-### M10 — Anonymous bandwidth credits ⬜
+The frontier primitives are implemented and tested; see `docs/FRONTIER.md` for the honest
+real-vs-deferred boundary of each. A capstone integration test
+(`core/crates/neo-node/tests/frontier.rs`) exercises all four together and composes them into one
+request flow. None is audited.
+
+### M10 — Anonymous bandwidth credits ✅ (unlinkable + double-spend; earn-accounting deferred)
 Unlinkable, token-free credits: earn by relaying, spend to send — one mechanism for Sybil resistance
 and anti-free-riding.
 - Crates: `neo-credits`.
-- Done when: credits are verifiably unlinkable (issuer can't correlate earn ↔ spend) and double-spend
-  is caught.
+- Done: a **VOPRF** (Privacy Pass primitive) — blind a random serial, issuer blind-evaluates it
+  without seeing it, finalize a token; redeem recomputes the OPRF and a spend set rejects
+  double-spends. The issuer only ever saw a *blinded* serial, so issuance ↔ spending is unlinkable.
+- Deferred: binding issuance to *proven* relayed bandwidth (the earn-side accounting) and wire
+  transport of credits.
+- Tests: unlinkable + verifiable + single-use; tampered credit rejected.
 
-### M11 — Verifiable routing ⬜
+### M11 — Verifiable routing ✅ (VRF + unbiasable combined-seed selection)
 VRF-based unbiasable per-request path selection, so an adversary can't herd clients onto controlled
 paths.
 - Crates: `neo-verify`, `neo-routing`.
-- Done when: path selection is VRF-verifiable and cannot be biased.
+- Done: `neo-verify::vrf` (schnorrkel Ristretto VRF, prove/verify/select); `neo-verify::selection` —
+  a **commit-then-VRF** construction so *neither* the client (grinding request ids) nor the beacon
+  (choosing the VRF input) can bias the path seed, and anyone can verify it; `neo-routing`'s
+  `select_path_seeded` turns the verifiable seed into a reproducible path.
+- Tests: seed agreement client↔beacon; tampered/foreign-key/rebound-commitment proofs rejected;
+  neither party can grind; seeded path deterministic.
 
-### M12 — Committee exit ⬜ (flagship)
-A k-of-n MPC-TLS committee jointly performs each clearnet request — the *cryptographic* form of "no
-responsible exit". Opt-in for sensitive, low-bandwidth requests.
+### M12 — Committee exit ✅ (flagship; threshold trust-split real, full MPC-TLS deferred)
+A k-of-n committee jointly stands in for the exit — the *cryptographic* form of "no responsible exit".
+Opt-in for sensitive, low-bandwidth requests.
 - Crates: `neo-mpc`.
-- Done when: no single committee member can reconstruct destination + plaintext; MPC overhead is
-  measured honestly.
+- Done: the clearnet request is **threshold secret-shared** (Shamir over GF(256)); any `k-1` members —
+  even colluding — learn *nothing* (information-theoretic) about destination or payload; any `k`
+  reconstruct; a bound hash makes a corrupted/swapped share detectable. `Committee` models per-member
+  custody + threshold reconstruction, with an honest overhead (expansion ≈ members) report.
+- Deferred: full **MPC-TLS** (computing the TLS session under MPC so plaintext is never assembled at
+  one point, including the send to the real server) — a large 2PC/MPC construction. This crate is the
+  trust-splitting core it slots into.
+- Tests: threshold reconstructs, minority fails & leaks nothing (no single share reveals the
+  destination), corruption detected, degenerate configs rejected, wire round-trip.
 
-### M13 — Verifiable privacy (full) ⬜
+### M13 — Verifiable privacy (full) ✅ (PIR + oblivious discovery; ZK shuffle deferred)
 PIR/oblivious peer discovery + ZK proof-of-mixing, so privacy is provable rather than trusted.
 - Crates: `neo-verify`, `neo-discovery`, `neo-mix`.
-- Done when: discovery lookups leak nothing (PIR) and proof-of-mixing soundness holds.
+- Done: `neo-verify::pir` — 2-server information-theoretic XOR PIR (neither server learns the index);
+  `neo-verify::oblivious` — **keyword** oblivious lookup (public `H(salt‖key) mod B` bucketing + a
+  collision-free salt search) so a client fetches a relay by `NodeId` without either server learning
+  which. `neo-verify::proof_of_mixing` has a non-ZK conservation check (no packet dropped/injected).
+- Deferred: a real **ZK verifiable shuffle** (Bayer–Groth-style) that hides the permutation from the
+  verifier — a large construction; the conservation check is the audit-grade stepping stone.
+- Tests: PIR retrieves the right record without the index; oblivious fetch by key returns the record,
+  misses decode as absent, placement is collision-free and public.
 
 ---
 

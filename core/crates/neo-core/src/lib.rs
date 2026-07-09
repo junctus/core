@@ -14,7 +14,9 @@ pub mod identity;
 
 pub use config::{NodeConfig, PrivacyLevel};
 pub use error::{Error, Result};
-pub use identity::{NodeId, NodeIdentity, NodePublic};
+pub use identity::{
+    verify_signature, NodeId, NodeIdentity, NodePublic, KEM_PUBLIC_LEN, SIGNATURE_LEN,
+};
 
 /// The neo engine version (from the crate version).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

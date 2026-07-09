@@ -16,19 +16,65 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use neo_core::{Error, NodeId, Result};
+use neo_core::{Error, NodeId, NodeIdentity, Result, KEM_PUBLIC_LEN, SIGNATURE_LEN};
 
 #[cfg(feature = "libp2p")]
 pub mod libp2p_backend;
+pub mod snapshot;
+
+/// Wire-format version of a serialized [`PeerRecord`].
+const RECORD_VERSION: u8 = 2;
+/// Domain separator for record signatures.
+const RECORD_SIG_DOMAIN: &[u8] = b"neo-peer-record-sig-v2";
+/// Upper bound on advertised addresses per record.
+pub const MAX_ADDRS: usize = 8;
+/// Upper bound on a single advertised address string.
+pub const MAX_ADDR_LEN: usize = 256;
+
+/// How a node participates in discovery.
+///
+/// The split is a privacy boundary, not just a capability flag: **clients
+/// must be invisible**. A client never listens, never announces a record, and
+/// never serves DHT queries, so joining the network as a consumer adds nothing
+/// enumerable. Only relays — which are publicly dialable by design — enter the
+/// DHT in server mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeRole {
+    /// A consumer: queries only, announces nothing, serves nothing.
+    Client,
+    /// A relay/seed: dialable, announces its record, serves DHT queries.
+    Relay,
+}
+
+/// Current unix time in whole seconds (the timestamp base for records).
+pub fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 /// A discoverable peer or relay.
+///
+/// Records are **self-certifying and signed**: they carry the node's full
+/// public-key set, the id must equal `NodeId::from_keys(...)` over those keys,
+/// and the whole record is Ed25519-signed by the node it describes. Verifiers
+/// call [`verify`](Self::verify) before trusting or caching a record, so a
+/// record cannot be forged, tampered with, or published under someone else's
+/// id — an adversary can only replay a node's own signed statements, and
+/// `expires_at` + `seq` bound how long a replay stays useful.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerRecord {
-    /// Stable node identifier.
+    /// Stable node identifier (BLAKE3 over the public keys).
     pub id: NodeId,
+    /// Ed25519 verifying key — authenticates this record and the handshake.
+    pub signing: [u8; 32],
     /// X25519 public key (for classical key agreement).
     pub kex: [u8; 32],
+    /// ML-KEM-768 encapsulation key (post-quantum key agreement).
+    pub kem: Vec<u8>,
     /// Ristretto routing key (for Sphinx).
     pub sphinx: [u8; 32],
     /// Dialable transport addresses.
@@ -37,26 +83,124 @@ pub struct PeerRecord {
     pub relay: bool,
     /// Whether the peer offers clearnet exit (opt-in).
     pub exit: bool,
+    /// Unix time (seconds) after which the record is invalid.
+    pub expires_at: u64,
+    /// Monotonic per-node sequence number; higher replaces lower.
+    pub seq: u64,
+    /// Ed25519 signature by `signing` over the record body.
+    pub sig: [u8; SIGNATURE_LEN],
 }
 
 impl PeerRecord {
-    /// Serialize the record (e.g. as a DHT value).
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
+    /// Build and sign a record for `identity`.
+    pub fn build_signed(
+        identity: &NodeIdentity,
+        addrs: Vec<String>,
+        relay: bool,
+        exit: bool,
+        expires_at: u64,
+        seq: u64,
+    ) -> Result<Self> {
+        let public = identity.public();
+        let mut record = PeerRecord {
+            id: public.id,
+            signing: public.signing.to_bytes(),
+            kex: *public.kex.as_bytes(),
+            kem: public.kem_bytes(),
+            sphinx: public.sphinx,
+            addrs,
+            relay,
+            exit,
+            expires_at,
+            seq,
+            sig: [0u8; SIGNATURE_LEN],
+        };
+        record.check_limits()?;
+        record.sig = identity.sign(&record.signable_bytes()).to_bytes();
+        Ok(record)
+    }
+
+    /// Verify the record at time `now`: structural limits, key/id
+    /// self-certification, expiry, and the signature. Anything from the
+    /// network must pass this before being cached or used.
+    pub fn verify(&self, now: u64) -> Result<()> {
+        self.verify_static()?;
+        if self.expires_at <= now {
+            return Err(Error::Crypto("peer record has expired".into()));
+        }
+        Ok(())
+    }
+
+    /// The time-independent checks: structural limits, key/id
+    /// self-certification, and the signature — everything except expiry.
+    /// Snapshot verification uses this to treat a *forged* record as fatal
+    /// while merely filtering records that have aged out.
+    pub fn verify_static(&self) -> Result<()> {
+        self.check_limits()?;
+        let expected = NodeId::from_keys(&self.signing, &self.kex, &self.kem)?;
+        if expected != self.id {
+            return Err(Error::Crypto(
+                "peer record id does not match its keys".into(),
+            ));
+        }
+        neo_core::verify_signature(&self.signing, &self.signable_bytes(), &self.sig)
+    }
+
+    /// Whether the record is past its expiry at time `now`.
+    pub fn is_expired(&self, now: u64) -> bool {
+        self.expires_at <= now
+    }
+
+    fn check_limits(&self) -> Result<()> {
+        if self.kem.len() != KEM_PUBLIC_LEN {
+            return Err(Error::Decode("bad ML-KEM key length".into()));
+        }
+        if self.addrs.len() > MAX_ADDRS {
+            return Err(Error::Decode("too many addresses".into()));
+        }
+        if self.addrs.iter().any(|a| a.len() > MAX_ADDR_LEN) {
+            return Err(Error::Decode("address too long".into()));
+        }
+        Ok(())
+    }
+
+    /// The bytes covered by the record signature (domain-tagged body).
+    fn signable_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(RECORD_SIG_DOMAIN.len() + 1400);
+        out.extend_from_slice(RECORD_SIG_DOMAIN);
+        self.encode_body(&mut out);
+        out
+    }
+
+    /// Everything except the trailing signature, in wire order.
+    fn encode_body(&self, out: &mut Vec<u8>) {
+        out.push(RECORD_VERSION);
         out.extend_from_slice(self.id.as_bytes());
+        out.extend_from_slice(&self.signing);
         out.extend_from_slice(&self.kex);
+        out.extend_from_slice(&self.kem);
         out.extend_from_slice(&self.sphinx);
         out.push((self.relay as u8) | ((self.exit as u8) << 1));
+        out.extend_from_slice(&self.expires_at.to_be_bytes());
+        out.extend_from_slice(&self.seq.to_be_bytes());
         out.extend_from_slice(&(self.addrs.len() as u16).to_be_bytes());
         for addr in &self.addrs {
             out.extend_from_slice(&(addr.len() as u16).to_be_bytes());
             out.extend_from_slice(addr.as_bytes());
         }
+    }
+
+    /// Serialize the record (e.g. as a DHT value or registration body).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1500);
+        self.encode_body(&mut out);
+        out.extend_from_slice(&self.sig);
         out
     }
 
     /// Parse a record from [`to_bytes`](Self::to_bytes) output. Bounds-checked so
-    /// it never panics on arbitrary input.
+    /// it never panics on arbitrary input. Parsing does **not** verify — call
+    /// [`verify`](Self::verify) on anything untrusted.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         fn take<'a>(cur: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
             if cur.len() < n {
@@ -66,33 +210,69 @@ impl PeerRecord {
             *cur = tail;
             Ok(head)
         }
+        fn take_u16(cur: &mut &[u8]) -> Result<usize> {
+            Ok(u16::from_be_bytes(take(cur, 2)?.try_into().expect("2 bytes")) as usize)
+        }
+        fn take_u64(cur: &mut &[u8]) -> Result<u64> {
+            Ok(u64::from_be_bytes(
+                take(cur, 8)?.try_into().expect("8 bytes"),
+            ))
+        }
 
         let mut cur = bytes;
+        let version = take(&mut cur, 1)?[0];
+        if version != RECORD_VERSION {
+            return Err(Error::Decode(format!(
+                "unsupported peer record version {version}"
+            )));
+        }
         let mut id = [0u8; 32];
         id.copy_from_slice(take(&mut cur, 32)?);
+        let mut signing = [0u8; 32];
+        signing.copy_from_slice(take(&mut cur, 32)?);
         let mut kex = [0u8; 32];
         kex.copy_from_slice(take(&mut cur, 32)?);
+        let kem = take(&mut cur, KEM_PUBLIC_LEN)?.to_vec();
         let mut sphinx = [0u8; 32];
         sphinx.copy_from_slice(take(&mut cur, 32)?);
         let flags = take(&mut cur, 1)?[0];
-        let count = u16::from_be_bytes(take(&mut cur, 2)?.try_into().expect("2 bytes")) as usize;
+        let expires_at = take_u64(&mut cur)?;
+        let seq = take_u64(&mut cur)?;
+        let count = take_u16(&mut cur)?;
+        if count > MAX_ADDRS {
+            return Err(Error::Decode("too many addresses".into()));
+        }
 
-        let mut addrs = Vec::with_capacity(count.min(64));
+        let mut addrs = Vec::with_capacity(count);
         for _ in 0..count {
-            let len = u16::from_be_bytes(take(&mut cur, 2)?.try_into().expect("2 bytes")) as usize;
+            let len = take_u16(&mut cur)?;
+            if len > MAX_ADDR_LEN {
+                return Err(Error::Decode("address too long".into()));
+            }
             let raw = take(&mut cur, len)?;
             let text = std::str::from_utf8(raw)
                 .map_err(|_| Error::Decode("address is not valid UTF-8".into()))?;
             addrs.push(text.to_string());
         }
 
+        let mut sig = [0u8; SIGNATURE_LEN];
+        sig.copy_from_slice(take(&mut cur, SIGNATURE_LEN)?);
+        if !cur.is_empty() {
+            return Err(Error::Decode("trailing bytes after peer record".into()));
+        }
+
         Ok(PeerRecord {
             id: NodeId::from_bytes(id),
+            signing,
             kex,
+            kem,
             sphinx,
             addrs,
             relay: flags & 1 != 0,
             exit: flags & 2 != 0,
+            expires_at,
+            seq,
+            sig,
         })
     }
 }
@@ -162,26 +342,45 @@ impl LocalRegistry {
     }
 }
 
+impl LocalRegistry {
+    /// Verify a record and insert it, keeping the highest `seq` per node.
+    fn upsert_verified(guard: &mut HashMap<NodeId, PeerRecord>, record: PeerRecord) -> Result<()> {
+        record.verify(now_unix())?;
+        match guard.get(&record.id) {
+            Some(existing) if existing.seq >= record.seq => Ok(()),
+            _ => {
+                guard.insert(record.id, record);
+                Ok(())
+            }
+        }
+    }
+}
+
 impl Discovery for LocalRegistry {
     async fn announce(&self, record: PeerRecord) -> Result<()> {
-        self.inner
-            .lock()
-            .expect("registry lock")
-            .insert(record.id, record);
-        Ok(())
+        let mut guard = self.inner.lock().expect("registry lock");
+        Self::upsert_verified(&mut guard, record)
     }
 
     async fn lookup(&self, id: &NodeId) -> Result<Option<PeerRecord>> {
-        Ok(self.inner.lock().expect("registry lock").get(id).cloned())
+        let now = now_unix();
+        Ok(self
+            .inner
+            .lock()
+            .expect("registry lock")
+            .get(id)
+            .filter(|r| !r.is_expired(now))
+            .cloned())
     }
 
     async fn sample_relays(&self, n: usize) -> Result<Vec<PeerRecord>> {
+        let now = now_unix();
         let mut relays: Vec<PeerRecord> = self
             .inner
             .lock()
             .expect("registry lock")
             .values()
-            .filter(|r| r.relay)
+            .filter(|r| r.relay && !r.is_expired(now))
             .cloned()
             .collect();
         for i in (1..relays.len()).rev() {
@@ -194,7 +393,7 @@ impl Discovery for LocalRegistry {
     async fn bootstrap(&self, seeds: &[PeerRecord]) -> Result<()> {
         let mut guard = self.inner.lock().expect("registry lock");
         for seed in seeds {
-            guard.insert(seed.id, seed.clone());
+            Self::upsert_verified(&mut guard, seed.clone())?;
         }
         Ok(())
     }
@@ -211,20 +410,18 @@ mod tests {
     use super::*;
     use neo_core::NodeIdentity;
 
+    fn signed_record(relay: bool, exit: bool, addr: bool) -> PeerRecord {
+        let identity = NodeIdentity::generate().unwrap();
+        let addrs = if addr {
+            vec!["1.2.3.4:9000".into()]
+        } else {
+            vec![]
+        };
+        PeerRecord::build_signed(&identity, addrs, relay, exit, now_unix() + 3600, 1).unwrap()
+    }
+
     fn record(relay: bool, exit: bool, addr: bool) -> PeerRecord {
-        let p = NodeIdentity::generate().unwrap().public();
-        PeerRecord {
-            id: p.id,
-            kex: *p.kex.as_bytes(),
-            sphinx: p.sphinx,
-            addrs: if addr {
-                vec!["1.2.3.4:9000".into()]
-            } else {
-                vec![]
-            },
-            relay,
-            exit,
-        }
+        signed_record(relay, exit, addr)
     }
 
     #[test]
@@ -238,10 +435,83 @@ mod tests {
             seed = seed
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
-            let len = (seed >> 40) as usize % 160;
+            let len = (seed >> 40) as usize % 2000;
             let bytes: Vec<u8> = (0..len).map(|i| (seed >> (i % 8 * 8)) as u8).collect();
             let _ = PeerRecord::from_bytes(&bytes);
         }
+    }
+
+    #[test]
+    fn signed_records_verify() {
+        let rec = record(true, false, true);
+        assert!(rec.verify(now_unix()).is_ok());
+        // And still verify after a serialization round-trip.
+        let parsed = PeerRecord::from_bytes(&rec.to_bytes()).unwrap();
+        assert!(parsed.verify(now_unix()).is_ok());
+    }
+
+    #[test]
+    fn tampered_records_are_rejected() {
+        let now = now_unix();
+
+        // Flipping the exit flag invalidates the signature.
+        let mut rec = record(true, false, true);
+        rec.exit = true;
+        assert!(rec.verify(now).is_err());
+
+        // Swapping in a different address invalidates the signature.
+        let mut rec = record(true, false, true);
+        rec.addrs = vec!["6.6.6.6:6666".into()];
+        assert!(rec.verify(now).is_err());
+
+        // Bumping seq (a replay-forward attempt) invalidates the signature.
+        let mut rec = record(true, false, true);
+        rec.seq += 1;
+        assert!(rec.verify(now).is_err());
+    }
+
+    #[test]
+    fn records_under_a_foreign_id_are_rejected() {
+        // Keys from one identity presented under another identity's id.
+        let victim = NodeIdentity::generate().unwrap();
+        let mut rec = record(true, false, true);
+        rec.id = victim.id();
+        assert!(rec.verify(now_unix()).is_err());
+    }
+
+    #[test]
+    fn expired_records_are_rejected() {
+        let identity = NodeIdentity::generate().unwrap();
+        let stale =
+            PeerRecord::build_signed(&identity, vec!["1.2.3.4:9000".into()], true, false, 1, 1)
+                .unwrap();
+        assert!(stale.verify(now_unix()).is_err());
+        assert!(stale.is_expired(now_unix()));
+    }
+
+    #[tokio::test]
+    async fn registry_rejects_invalid_and_keeps_newest_seq() {
+        let dht = LocalRegistry::new();
+        let identity = NodeIdentity::generate().unwrap();
+        let expires = now_unix() + 3600;
+
+        let v1 =
+            PeerRecord::build_signed(&identity, vec!["1.1.1.1:1".into()], true, false, expires, 1)
+                .unwrap();
+        let v2 =
+            PeerRecord::build_signed(&identity, vec!["2.2.2.2:2".into()], true, false, expires, 2)
+                .unwrap();
+
+        // A tampered record never lands.
+        let mut forged = v1.clone();
+        forged.exit = true;
+        assert!(dht.announce(forged).await.is_err());
+        assert!(dht.is_empty());
+
+        // Newer seq replaces older; older never downgrades newer.
+        dht.announce(v2.clone()).await.unwrap();
+        dht.announce(v1).await.unwrap();
+        assert_eq!(dht.lookup(&identity.id()).await.unwrap(), Some(v2));
     }
 
     #[tokio::test]

@@ -3,6 +3,9 @@
 **/target
 *.rs.bk
 
+# Release build artifacts (scripts/build-release.sh)
+/dist/
+
 # Fuzzing artifacts
 /fuzz/corpus/
 /fuzz/artifacts/

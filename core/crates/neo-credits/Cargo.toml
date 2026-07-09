@@ -7,3 +7,7 @@ license.workspace = true
 description = "Anonymous, unlinkable bandwidth credits (Sybil resistance + incentives)."
 
 [dependencies]
+neo-core.workspace = true
+voprf.workspace = true
+rand.workspace = true
+getrandom.workspace = true

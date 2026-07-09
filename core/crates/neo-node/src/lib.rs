@@ -10,6 +10,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod forward;
 pub mod run;
 pub mod tunnel;
 

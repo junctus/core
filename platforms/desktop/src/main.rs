@@ -10,6 +10,10 @@ use clap::{Parser, Subcommand};
 use neo_core::NodeIdentity;
 use tokio::net::TcpListener;
 
+mod defaults;
+mod discovery;
+mod roles;
+
 #[derive(Parser)]
 #[command(
     name = "neo",
@@ -28,20 +32,95 @@ enum Command {
         #[command(subcommand)]
         action: IdentityAction,
     },
-    /// Run a neo node: hand-shake with a peer over TCP (M1), optionally bridging a TUN.
+    /// Run a neo node.
+    ///
+    /// With no flags, runs as a **client**: discovers relays from the seed
+    /// mirrors and connects — zero configuration. With `--relay`, runs as a
+    /// public relay that registers with the seeds. `--listen`/`--connect` still
+    /// drive the manual two-process M1 handshake for local testing.
     Run {
-        /// Listen for an incoming peer, e.g. `127.0.0.1:9000`.
+        /// Run as a public relay: register with seeds and serve handshakes.
+        #[arg(long, conflicts_with = "connect")]
+        relay: bool,
+        /// Public `host:port` to advertise to clients (relay mode; defaults to
+        /// the bound address with a warning — set this behind NAT).
+        #[arg(long)]
+        announce_addr: Option<String>,
+        /// Offer clearnet exit (relay mode, opt-in, off by default).
+        #[arg(long)]
+        exit: bool,
+        /// Listen address: the relay bind (relay mode) or manual M1 responder.
         #[arg(long, conflicts_with = "connect")]
         listen: Option<String>,
-        /// Connect to a peer at this address.
+        /// Connect to a peer at this address (manual M1 initiator).
         #[arg(long, conflicts_with = "listen")]
         connect: Option<String>,
-        /// Path to this node's identity file (an ephemeral one is used if missing).
+        /// Override discovery mirror base URLs (repeatable; else NEO_MIRRORS/baked).
+        #[arg(long = "mirror")]
+        mirrors: Vec<String>,
+        /// Override trusted witness keys, hex (repeatable; else NEO_WITNESSES/baked).
+        #[arg(long = "witness")]
+        witnesses: Vec<String>,
+        /// Required distinct witness signatures on a snapshot.
+        #[arg(long)]
+        threshold: Option<usize>,
+        /// Path to this node's identity file.
         #[arg(long, default_value = "identity.key")]
         identity: PathBuf,
         /// Bridge a TUN device through the tunnel (needs `--features tun` and root).
         #[arg(long)]
         tun: bool,
+    },
+    /// Run a discovery seed: verify, health-check, and attest relays; serve
+    /// signed snapshots over HTTP. Relays no user traffic. Put TLS in front.
+    Seed {
+        /// Plain-HTTP bind address (a reverse proxy terminates TLS).
+        #[arg(long, default_value = "127.0.0.1:8899")]
+        bind: String,
+        /// Witness identity file (its public key is what clients trust).
+        #[arg(long, default_value = "witness.key")]
+        witness: PathBuf,
+        /// Seconds between dial-back health checks of known relays.
+        #[arg(long, default_value_t = 60)]
+        health_interval: u64,
+        /// Seconds between snapshot prune + re-sign + publish.
+        #[arg(long, default_value_t = 60)]
+        snapshot_interval: u64,
+        /// Minimum seconds between registrations from one IP (0 disables;
+        /// useful for local multi-relay demos where all relays share 127.0.0.1).
+        #[arg(long, default_value_t = 30)]
+        register_cooldown: u64,
+    },
+    /// Fetch, verify, and print the current relay snapshot (diagnostics).
+    Snapshot {
+        /// Override discovery mirror base URLs (repeatable).
+        #[arg(long = "mirror")]
+        mirrors: Vec<String>,
+        /// Override trusted witness keys, hex (repeatable).
+        #[arg(long = "witness")]
+        witnesses: Vec<String>,
+        /// Required distinct witness signatures.
+        #[arg(long)]
+        threshold: Option<usize>,
+    },
+    /// Send a one-shot message through a multi-hop onion circuit of discovered
+    /// relays. Each relay peels one layer and forwards; only the exit reads it.
+    Send {
+        /// The message to deliver to the exit.
+        #[arg(long)]
+        message: String,
+        /// Relays in the circuit (the last one is the exit).
+        #[arg(long, default_value_t = 2)]
+        hops: usize,
+        /// Override discovery mirror base URLs (repeatable).
+        #[arg(long = "mirror")]
+        mirrors: Vec<String>,
+        /// Override trusted witness keys, hex (repeatable).
+        #[arg(long = "witness")]
+        witnesses: Vec<String>,
+        /// Required distinct witness signatures.
+        #[arg(long)]
+        threshold: Option<usize>,
     },
 }
 
@@ -55,6 +134,15 @@ enum IdentityAction {
         /// Overwrite the output file if it already exists.
         #[arg(long)]
         force: bool,
+    },
+    /// Show an identity's public info: node id and witness (signing) key.
+    Show {
+        /// Path to the identity file to read.
+        #[arg(long, default_value = "identity.key")]
+        identity: PathBuf,
+        /// Print only the witness key hex (for scripting).
+        #[arg(long)]
+        witness_only: bool,
     },
 }
 
@@ -70,13 +158,168 @@ async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Identity { action } => match action {
             IdentityAction::Generate { output, force } => generate_identity(&output, force)?,
+            IdentityAction::Show {
+                identity,
+                witness_only,
+            } => show_identity(&identity, witness_only)?,
         },
         Command::Run {
+            relay,
+            announce_addr,
+            exit,
             listen,
             connect,
+            mirrors,
+            witnesses,
+            threshold,
             identity,
             tun,
-        } => run(listen, connect, &identity, tun).await?,
+        } => {
+            run_command(RunArgs {
+                relay,
+                announce_addr,
+                exit,
+                listen,
+                connect,
+                mirrors,
+                witnesses,
+                threshold,
+                identity,
+                tun,
+            })
+            .await?
+        }
+        Command::Seed {
+            bind,
+            witness,
+            health_interval,
+            snapshot_interval,
+            register_cooldown,
+        } => {
+            run_seed(
+                &bind,
+                &witness,
+                health_interval,
+                snapshot_interval,
+                register_cooldown,
+            )
+            .await?
+        }
+        Command::Snapshot {
+            mirrors,
+            witnesses,
+            threshold,
+        } => show_snapshot(&mirrors, &witnesses, threshold).await?,
+        Command::Send {
+            message,
+            hops,
+            mirrors,
+            witnesses,
+            threshold,
+        } => {
+            let cfg = defaults::DiscoveryConfig::resolve(&mirrors, &witnesses, threshold)?;
+            let identity = NodeIdentity::generate()?;
+            roles::run_send(identity, cfg, message, hops).await?
+        }
+    }
+    Ok(())
+}
+
+/// Parsed arguments for `neo run`.
+struct RunArgs {
+    relay: bool,
+    announce_addr: Option<String>,
+    exit: bool,
+    listen: Option<String>,
+    connect: Option<String>,
+    mirrors: Vec<String>,
+    witnesses: Vec<String>,
+    threshold: Option<usize>,
+    identity: PathBuf,
+    tun: bool,
+}
+
+/// Dispatch `neo run` to the right role: TUN tunnel, manual M1, relay, or the
+/// zero-configuration client.
+async fn run_command(args: RunArgs) -> anyhow::Result<()> {
+    // Manual/TUN modes keep the original explicit-peer behavior.
+    if args.tun || (!args.relay && (args.listen.is_some() || args.connect.is_some())) {
+        let identity = load_or_generate_identity(&args.identity)?;
+        println!("this node : {}", identity.id());
+        if args.tun {
+            return run_tunnel_mode(args.listen, args.connect, &identity).await;
+        }
+        return run(args.listen, args.connect, &identity).await;
+    }
+
+    let cfg = defaults::DiscoveryConfig::resolve(&args.mirrors, &args.witnesses, args.threshold);
+
+    if args.relay {
+        let identity = roles::load_or_create_identity(&args.identity)?;
+        let bind = args.listen.as_deref().unwrap_or("0.0.0.0:9000");
+        let cfg = cfg?;
+        return roles::run_relay(identity, bind, args.announce_addr, args.exit, cfg).await;
+    }
+
+    // Client: an ephemeral identity keeps the client unlinkable across runs.
+    let identity = NodeIdentity::generate()?;
+    roles::run_client(identity, cfg?).await
+}
+
+async fn run_seed(
+    bind: &str,
+    witness_path: &Path,
+    health_interval: u64,
+    snapshot_interval: u64,
+    register_cooldown: u64,
+) -> anyhow::Result<()> {
+    use std::time::Duration;
+
+    use neo_seed::{Seed, SeedConfig};
+
+    let witness = roles::load_or_create_identity(witness_path)?;
+    // The dial-back prober is ephemeral: relays only care that *someone*
+    // completed the handshake as them, not who probed.
+    let prober = NodeIdentity::generate()?;
+    let config = SeedConfig {
+        bind: bind
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid --bind {bind}: {e}"))?,
+        health_interval: Duration::from_secs(health_interval.max(1)),
+        snapshot_interval: Duration::from_secs(snapshot_interval.max(1)),
+        register_cooldown: Duration::from_secs(register_cooldown),
+    };
+    let seed = Seed::new(witness, prober, config);
+    println!("seed witness key : {}", seed.witness_hex());
+    println!("bake this into BAKED_WITNESSES (or share via NEO_WITNESSES) so clients trust it");
+    println!("serving discovery on {bind} (no user traffic; put TLS in front)");
+    seed.serve().await.map_err(Into::into)
+}
+
+async fn show_snapshot(
+    mirrors: &[String],
+    witnesses: &[String],
+    threshold: Option<usize>,
+) -> anyhow::Result<()> {
+    let cfg = defaults::DiscoveryConfig::resolve(mirrors, witnesses, threshold)?;
+    let snapshot = discovery::fetch_verified(&cfg).await?;
+    let now = neo_discovery::now_unix();
+    let relays = snapshot.relays(now);
+    println!(
+        "verified snapshot — created {}s ago, expires in {}s",
+        now.saturating_sub(snapshot.snapshot.created_at),
+        snapshot.snapshot.expires_at.saturating_sub(now),
+    );
+    println!("witness signatures : {}", snapshot.signatures.len());
+    println!("relays             : {}", relays.len());
+    for relay in relays {
+        println!(
+            "  {} {}  exit={}  addrs={:?}",
+            relay.id,
+            hex::encode(&relay.signing[..8]),
+            relay.exit,
+            relay.addrs
+        );
     }
     Ok(())
 }
@@ -110,24 +353,33 @@ fn generate_identity(output: &Path, force: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Print an identity's public info. The **witness key** is the Ed25519 signing
+/// public key clients trust (what `GET /witness` and `NEO_WITNESSES` use), so a
+/// seed operator can read it straight from the key file without the service
+/// running.
+fn show_identity(path: &Path, witness_only: bool) -> anyhow::Result<()> {
+    let identity = NodeIdentity::from_bytes(&std::fs::read(path)?)?;
+    let witness = hex::encode(identity.public().signing.to_bytes());
+    if witness_only {
+        println!("{witness}");
+    } else {
+        println!("node id     : {}", identity.id());
+        println!("witness key : {witness}");
+    }
+    Ok(())
+}
+
+/// The manual, explicit-peer M1 handshake (`--listen` / `--connect`).
 async fn run(
     listen: Option<String>,
     connect: Option<String>,
-    identity_path: &Path,
-    tun: bool,
+    identity: &NodeIdentity,
 ) -> anyhow::Result<()> {
-    let identity = load_or_generate_identity(identity_path)?;
-    println!("this node : {}", identity.id());
-
-    if tun {
-        return run_tunnel_mode(listen, connect, &identity).await;
-    }
-
     match (listen, connect) {
         (Some(addr), None) => {
             let listener = TcpListener::bind(&addr).await?;
             println!("listening on {addr} — waiting for a peer …");
-            let peer = neo_node::run::ping_server(&listener, &identity).await?;
+            let peer = neo_node::run::ping_server(&listener, identity).await?;
             println!(
                 "handshake ok — authenticated peer key {}",
                 hex::encode(peer)
@@ -135,7 +387,7 @@ async fn run(
         }
         (None, Some(addr)) => {
             println!("connecting to {addr} …");
-            let peer = neo_node::run::ping_client(&addr, &identity).await?;
+            let peer = neo_node::run::ping_client(&addr, identity).await?;
             println!(
                 "handshake ok — authenticated peer key {}",
                 hex::encode(peer)

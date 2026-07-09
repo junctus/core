@@ -33,6 +33,12 @@ type KemEncapKey = <MlKem768 as KemCore>::EncapsulationKey;
 /// Length of the two classical seeds at the start of a serialized identity.
 const CLASSICAL_SEED_LEN: usize = 64;
 
+/// Serialized length of an ML-KEM-768 encapsulation (public) key.
+pub const KEM_PUBLIC_LEN: usize = 1184;
+
+/// Length of an Ed25519 signature.
+pub const SIGNATURE_LEN: usize = 64;
+
 /// A stable, self-certifying node identifier: BLAKE3 over the public keys.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId([u8; 32]);
@@ -53,14 +59,47 @@ impl NodeId {
         hex::encode(self.0)
     }
 
-    fn derive(signing: &VerifyingKey, kex: &KexPublic, kem: &KemEncapKey) -> Self {
+    /// Re-derive the identifier from raw public-key bytes.
+    ///
+    /// This is what makes discovery records **self-certifying**: a verifier
+    /// recomputes the id from the keys a record carries and rejects the record
+    /// if it does not match, so nobody can publish keys under another node's id.
+    pub fn from_keys(signing: &[u8; 32], kex: &[u8; 32], kem: &[u8]) -> Result<Self> {
+        if kem.len() != KEM_PUBLIC_LEN {
+            return Err(Error::Decode(format!(
+                "ML-KEM public key must be {KEM_PUBLIC_LEN} bytes, got {}",
+                kem.len()
+            )));
+        }
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"neo-node-id-v1");
-        hasher.update(signing.as_bytes());
-        hasher.update(kex.as_bytes());
-        hasher.update(kem.as_bytes().as_ref());
-        NodeId(*hasher.finalize().as_bytes())
+        hasher.update(signing);
+        hasher.update(kex);
+        hasher.update(kem);
+        Ok(NodeId(*hasher.finalize().as_bytes()))
     }
+
+    fn derive(signing: &VerifyingKey, kex: &KexPublic, kem: &KemEncapKey) -> Self {
+        Self::from_keys(signing.as_bytes(), kex.as_bytes(), kem.as_bytes().as_ref())
+            .expect("typed keys always have valid lengths")
+    }
+}
+
+/// Verify an Ed25519 signature made with a node's long-term signing key.
+///
+/// Uses `verify_strict`, which additionally rejects small-order / non-canonical
+/// keys and signatures — the right default for records consumed from the
+/// network.
+pub fn verify_signature(
+    signing: &[u8; 32],
+    message: &[u8],
+    signature: &[u8; SIGNATURE_LEN],
+) -> Result<()> {
+    let key = VerifyingKey::from_bytes(signing)
+        .map_err(|_| Error::Crypto("invalid Ed25519 verifying key".into()))?;
+    let sig = Signature::from_bytes(signature);
+    key.verify_strict(message, &sig)
+        .map_err(|_| Error::Crypto("signature verification failed".into()))
 }
 
 impl fmt::Display for NodeId {
@@ -89,6 +128,15 @@ pub struct NodePublic {
     pub sphinx: [u8; 32],
     /// Stable identifier derived from the public keys.
     pub id: NodeId,
+}
+
+impl NodePublic {
+    /// The ML-KEM-768 encapsulation key as raw bytes (for discovery records).
+    pub fn kem_bytes(&self) -> Vec<u8> {
+        let encoded = self.kem.as_bytes();
+        let bytes: &[u8] = encoded.as_ref();
+        bytes.to_vec()
+    }
 }
 
 /// A node's long-term secret identity. Keep this out of logs and off the wire.
@@ -270,5 +318,37 @@ mod tests {
     fn from_bytes_rejects_truncated_input() {
         assert!(NodeIdentity::from_bytes(&[0u8; 10]).is_err());
         assert!(NodeIdentity::from_bytes(&[0u8; CLASSICAL_SEED_LEN]).is_err());
+    }
+
+    #[test]
+    fn node_id_recomputes_from_raw_key_bytes() {
+        let p = NodeIdentity::generate().unwrap().public();
+        let recomputed =
+            NodeId::from_keys(&p.signing.to_bytes(), p.kex.as_bytes(), &p.kem_bytes()).unwrap();
+        assert_eq!(recomputed, p.id);
+    }
+
+    #[test]
+    fn kem_public_len_matches_real_keys() {
+        let p = NodeIdentity::generate().unwrap().public();
+        assert_eq!(p.kem_bytes().len(), KEM_PUBLIC_LEN);
+        // Wrong length must be rejected, not silently hashed.
+        assert!(NodeId::from_keys(&[0u8; 32], &[0u8; 32], &[0u8; 10]).is_err());
+    }
+
+    #[test]
+    fn signatures_verify_and_tampering_is_caught() {
+        let identity = NodeIdentity::generate().unwrap();
+        let key = identity.public().signing.to_bytes();
+        let sig = identity.sign(b"hello neo").to_bytes();
+
+        assert!(verify_signature(&key, b"hello neo", &sig).is_ok());
+        assert!(verify_signature(&key, b"hello neo!", &sig).is_err());
+        let other = NodeIdentity::generate()
+            .unwrap()
+            .public()
+            .signing
+            .to_bytes();
+        assert!(verify_signature(&other, b"hello neo", &sig).is_err());
     }
 }

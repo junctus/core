@@ -1,0 +1,37 @@
+[Unit]
+Description=neo discovery seed (witness + snapshot service)
+Documentation=https://github.com/  (neo docs/DISCOVERY.md)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=neo-seed
+Group=neo-seed
+# Binds plain HTTP on localhost; Caddy terminates TLS in front of it. The
+# witness key persists here so the seed keeps a stable identity across restarts
+# (clients trust that key).
+ExecStart=/usr/local/bin/neo seed --bind 127.0.0.1:8899 --witness /var/lib/neo-seed/witness.key
+Restart=always
+RestartSec=3
+
+# This service handles only public, signed metadata — never user traffic — so
+# it can run tightly sandboxed.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ReadWritePaths=/var/lib/neo-seed
+# Log identity generation and health at info level.
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

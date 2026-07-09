@@ -1,0 +1,19 @@
+[package]
+name = "neo-seed"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Witnessed discovery seed for neo: verifies, health-checks, and attests relay records; serves signed snapshots over HTTP. Relays no user traffic."
+
+[dependencies]
+neo-core.workspace = true
+neo-discovery.workspace = true
+neo-node.workspace = true
+tokio.workspace = true
+axum.workspace = true
+tracing.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+reqwest.workspace = true

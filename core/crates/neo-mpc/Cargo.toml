@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Committee / MPC-TLS exit so no single node is a responsible exit."
+description = "Committee exit: threshold secret-sharing of the clearnet request."
 
 [dependencies]
+neo-core.workspace = true
+sharks.workspace = true
+blake3.workspace = true

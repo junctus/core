@@ -7,3 +7,8 @@ license.workspace = true
 description = "Verifiable-privacy primitives: VRF, PIR, and ZK proof-of-mixing."
 
 [dependencies]
+neo-core.workspace = true
+schnorrkel.workspace = true
+rand_core.workspace = true
+getrandom.workspace = true
+blake3.workspace = true

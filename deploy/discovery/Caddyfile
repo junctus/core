@@ -1,0 +1,29 @@
+# Caddy config for the neo discovery seed at discovery.junctus.org.
+#
+# Caddy fetches and renews a Let's Encrypt certificate automatically, terminates
+# TLS, and reverse-proxies to the local seed service. The seed itself only ever
+# binds 127.0.0.1:8899.
+#
+# The snapshot is witness-signed, so this proxy (and any CDN in front of it) is
+# untrusted for integrity — it cannot forge or alter a snapshot a client will
+# accept. It only needs to be available.
+
+discovery.junctus.org {
+	encode zstd gzip
+
+	# The signed snapshot clients fetch. It changes on the seed's timer, so a
+	# short shared cache is fine and takes load off the origin.
+	@snapshot path /snapshot
+	header @snapshot Cache-Control "public, max-age=30"
+
+	reverse_proxy 127.0.0.1:8899 {
+		# Preserve the client IP so the seed's per-IP registration cooldown
+		# sees real addresses rather than 127.0.0.1.
+		header_up X-Forwarded-For {remote_host}
+	}
+
+	log {
+		output file /var/log/caddy/discovery.junctus.org.log
+		format json
+	}
+}

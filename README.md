@@ -4,8 +4,11 @@ A dispersed, post-quantum, verifiable, censorship-resistant privacy overlay — 
 
 > **Status:** M0–M9 core mechanisms implemented and tested — full Sphinx, PQ-hybrid handshake,
 > information slicing, timing mixing, obfuscated transport, exit policy, a real libp2p stack, and the
-> mobile FFI. **Not audited** — do not rely on neo for real-world safety. The frontier tier
-> (M10–M13) is next. See [`docs/MILESTONES.md`](docs/MILESTONES.md).
+> mobile FFI. The network now **runs end to end**: zero-config discovery finds relays
+> ([`docs/DISCOVERY.md`](docs/DISCOVERY.md)) and real onion traffic is forwarded through live
+> multi-hop circuits. The frontier tier (M10–M13) has working, tested cores
+> ([`docs/FRONTIER.md`](docs/FRONTIER.md)). **Not audited** — do not rely on neo for real-world safety.
+> See [`docs/MILESTONES.md`](docs/MILESTONES.md).
 
 ## What makes it different
 
@@ -42,6 +45,30 @@ cargo build
 cargo test
 cargo run -p neo-cli -- identity generate
 ```
+
+## Run the network
+
+`neo` finds the network with zero configuration — the only thing a client needs baked in (or via
+`NEO_MIRRORS`/`NEO_WITNESSES`) is a discovery seed to bootstrap from. Deploy a seed at your own domain
+with [`deploy/discovery/`](deploy/discovery/) (one command), or run the whole thing locally:
+
+```sh
+# 1. A discovery seed (finds peers, serves no user traffic).
+neo seed --witness witness.key
+export NEO_MIRRORS="http://127.0.0.1:8899"
+export NEO_WITNESSES="$(neo identity show --identity witness.key --witness-only)"
+
+# 2. A few relays that register with the seed and forward onion traffic.
+neo run --relay --listen 127.0.0.1:9001 --announce-addr 127.0.0.1:9001 --identity r1.key
+neo run --relay --listen 127.0.0.1:9002 --announce-addr 127.0.0.1:9002 --identity r2.key
+
+# 3. Inspect what the seed attests, or route a message through a discovered circuit.
+neo snapshot
+neo send --message "no relay on this path can read me" --hops 2
+```
+
+Each relay peels one Sphinx layer and forwards to the next; only the exit sees the payload.
+`neo run` with no flags is a zero-config client that discovers and connects to a relay.
 
 ## License
 
