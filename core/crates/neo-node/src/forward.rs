@@ -100,7 +100,11 @@ pub async fn send_onion(identity: &NodeIdentity, circuit: &[Hop], payload: &[u8]
     let (packet_bytes, first_addr) = build_onion(circuit, payload)?;
     let (mut stream, mut result) = connect(&first_addr, identity).await?;
     // Declare the connection mode, then hand over the onion.
-    write_frame(&mut stream, &result.session.seal(&[crate::run::FRAME_MESSAGE])?).await?;
+    write_frame(
+        &mut stream,
+        &result.session.seal(&[crate::run::FRAME_MESSAGE])?,
+    )
+    .await?;
     let frame = result.session.seal(&packet_bytes)?;
     write_frame(&mut stream, &frame).await?;
     Ok(())
@@ -189,7 +193,11 @@ async fn forward_packet(
 ) -> Result<()> {
     let (mut stream, mut result) = connect(next_addr, identity).await?;
     // Propagate the message mode to the next hop, then the peeled packet.
-    write_frame(&mut stream, &result.session.seal(&[crate::run::FRAME_MESSAGE])?).await?;
+    write_frame(
+        &mut stream,
+        &result.session.seal(&[crate::run::FRAME_MESSAGE])?,
+    )
+    .await?;
     let frame = result.session.seal(&packet.to_bytes())?;
     write_frame(&mut stream, &frame).await?;
     Ok(())

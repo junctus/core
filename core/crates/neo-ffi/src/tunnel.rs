@@ -136,7 +136,10 @@ impl NeoTunnelSession {
         });
         let write_task = rt.spawn(async move {
             while let Some(frame) = wire_out_rx.recv().await {
-                if neo_node::run::write_frame(&mut writer, &frame).await.is_err() {
+                if neo_node::run::write_frame(&mut writer, &frame)
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -186,17 +189,16 @@ impl NeoTunnelSession {
         runtime().block_on(async {
             // Block up to the timeout for the first packet, then greedily drain
             // whatever else is already queued (up to max) into the same batch.
-            match tokio::time::timeout(Duration::from_millis(timeout_ms as u64), rx.recv()).await {
-                Ok(Some(first)) => {
-                    out.push(first);
-                    while out.len() < max {
-                        match rx.try_recv() {
-                            Ok(packet) => out.push(packet),
-                            Err(_) => break,
-                        }
+            if let Ok(Some(first)) =
+                tokio::time::timeout(Duration::from_millis(timeout_ms as u64), rx.recv()).await
+            {
+                out.push(first);
+                while out.len() < max {
+                    match rx.try_recv() {
+                        Ok(packet) => out.push(packet),
+                        Err(_) => break,
                     }
                 }
-                _ => {}
             }
         });
         out
@@ -291,7 +293,10 @@ mod tests {
             });
             tokio::spawn(async move {
                 while let Some(frame) = wire_out_rx.recv().await {
-                    if neo_node::run::write_frame(&mut writer, &frame).await.is_err() {
+                    if neo_node::run::write_frame(&mut writer, &frame)
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }

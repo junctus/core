@@ -234,17 +234,14 @@ impl NeoTunnelStackSession {
         let mut rx = self.from_stack.lock().expect("from_stack lock poisoned");
         runtime().block_on(async {
             let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
-            match tokio::time::timeout_at(deadline.into(), rx.recv()).await {
-                Ok(Some(first)) => {
-                    out.push(first);
-                    while out.len() < max {
-                        match rx.try_recv() {
-                            Ok(packet) => out.push(packet),
-                            Err(_) => break,
-                        }
+            if let Ok(Some(first)) = tokio::time::timeout_at(deadline.into(), rx.recv()).await {
+                out.push(first);
+                while out.len() < max {
+                    match rx.try_recv() {
+                        Ok(packet) => out.push(packet),
+                        Err(_) => break,
                     }
                 }
-                _ => {}
             }
         });
         out
@@ -352,7 +349,10 @@ mod tests {
 
         // No exit-capable relay → no flow can egress → dropped.
         let no_exit: Vec<PeerRecord> = (0..3).map(|i| make_relay(9300 + i)).collect();
-        assert!(pick_circuit(&no_exit, 2).is_empty(), "no exit → flow dropped");
+        assert!(
+            pick_circuit(&no_exit, 2).is_empty(),
+            "no exit → flow dropped"
+        );
 
         // Too many hops or zero → dropped.
         assert!(pick_circuit(&relays, 9).is_empty());
@@ -408,13 +408,17 @@ mod tests {
         let trusted = witness.public().signing.to_bytes();
 
         // Trusted witness at threshold 1 → the two relays come back.
-        let relays = fetch_relays(&[mirror.clone()], &[trusted], 1)
+        let relays = fetch_relays(std::slice::from_ref(&mirror), &[trusted], 1)
             .await
             .expect("verified snapshot yields relays");
         assert_eq!(relays.len(), 2);
 
         // A snapshot signed by an untrusted witness is rejected.
-        let stranger = NodeIdentity::generate().unwrap().public().signing.to_bytes();
+        let stranger = NodeIdentity::generate()
+            .unwrap()
+            .public()
+            .signing
+            .to_bytes();
         assert!(
             fetch_relays(&[mirror], &[stranger], 1).await.is_err(),
             "a snapshot with no trusted signature must be rejected"

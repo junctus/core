@@ -608,9 +608,7 @@ mod tests {
             let (mut pr, mut pw) = prev.into_split();
             let (mut pw_sealer, mut pr_opener) = prev_res.session.split();
 
-            let _mode = pr_opener
-                .open(&read_frame(&mut pr).await.unwrap())
-                .unwrap();
+            let _mode = pr_opener.open(&read_frame(&mut pr).await.unwrap()).unwrap();
             let setup = read_frame(&mut pr).await.unwrap();
             let packet = SphinxPacket::from_bytes(&pr_opener.open(&setup).unwrap()).unwrap();
             let secret = identity.sphinx_shared(packet.alpha()).unwrap();
@@ -624,9 +622,12 @@ mod tests {
             let (next, next_res) = connect(&exit_dst, &identity).await.unwrap();
             let (mut ns_sealer, mut ns_opener) = next_res.session.split();
             let (mut nr, mut nw) = next.into_split();
-            write_frame(&mut nw, &ns_sealer.seal(&[crate::run::FRAME_CIRCUIT]).unwrap())
-                .await
-                .unwrap();
+            write_frame(
+                &mut nw,
+                &ns_sealer.seal(&[crate::run::FRAME_CIRCUIT]).unwrap(),
+            )
+            .await
+            .unwrap();
             write_frame(&mut nw, &ns_sealer.seal(&packet.to_bytes()).unwrap())
                 .await
                 .unwrap();
@@ -690,9 +691,7 @@ mod tests {
             let (prev, prev_res) = accept(&listener, &identity).await.unwrap();
             let (mut pr, mut pw) = prev.into_split();
             let (mut pw_sealer, mut pr_opener) = prev_res.session.split();
-            let _mode = pr_opener
-                .open(&read_frame(&mut pr).await.unwrap())
-                .unwrap();
+            let _mode = pr_opener.open(&read_frame(&mut pr).await.unwrap()).unwrap();
             let setup = read_frame(&mut pr).await.unwrap();
             let packet = SphinxPacket::from_bytes(&pr_opener.open(&setup).unwrap()).unwrap();
             let secret = identity.sphinx_shared(packet.alpha()).unwrap();
@@ -705,9 +704,12 @@ mod tests {
             let (next, next_res) = connect(&exit_dst, &identity).await.unwrap();
             let (mut ns_sealer, mut ns_opener) = next_res.session.split();
             let (mut nr, mut nw) = next.into_split();
-            write_frame(&mut nw, &ns_sealer.seal(&[crate::run::FRAME_CIRCUIT]).unwrap())
-                .await
-                .unwrap();
+            write_frame(
+                &mut nw,
+                &ns_sealer.seal(&[crate::run::FRAME_CIRCUIT]).unwrap(),
+            )
+            .await
+            .unwrap();
             write_frame(&mut nw, &ns_sealer.seal(&packet.to_bytes()).unwrap())
                 .await
                 .unwrap();

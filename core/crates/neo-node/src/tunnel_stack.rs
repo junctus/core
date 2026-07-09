@@ -222,7 +222,8 @@ mod tests {
             }
         }
         fn poll(&mut self) {
-            self.iface.poll(instant(), &mut self.device, &mut self.sockets);
+            self.iface
+                .poll(instant(), &mut self.device, &mut self.sockets);
         }
         fn socket(&mut self) -> &mut tcp::Socket<'static> {
             self.sockets.get_mut::<tcp::Socket>(self.handle)

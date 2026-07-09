@@ -518,7 +518,10 @@ mod tests {
         let mut conn = conn;
 
         // client → circuit: the client sends bytes; they surface on conn.read().
-        client.socket().send_slice(b"hello from the client").unwrap();
+        client
+            .socket()
+            .send_slice(b"hello from the client")
+            .unwrap();
         let got = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 client.poll();
