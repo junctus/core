@@ -14,17 +14,19 @@
 //! reads the client IP from `X-Forwarded-For` for per-IP registration
 //! cooldowns.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
+use axum::body::Body;
+use axum::extract::{ConnectInfo, DefaultBodyLimit, RawQuery, State};
 use axum::http::{header, HeaderMap, StatusCode};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use neo_core::{NodeId, NodeIdentity};
+use neo_discovery::snapshot::{manifest_digest, SignedSnapshot, Snapshot, SnapshotDelta};
 use neo_discovery::PeerRecord;
 
 use crate::health::dial_back;
@@ -32,6 +34,54 @@ use crate::registry::Registry;
 
 /// Maximum accepted `POST /register` body (a record is ~1.4 KB).
 const MAX_REGISTER_BODY: usize = 8 * 1024;
+/// How many recent **distinct** relay sets the seed remembers so it can answer
+/// `GET /snapshot/diff` with a delta. A client whose base set is older than this
+/// (or otherwise unrecognized) is served a full snapshot instead.
+const MAX_DIFF_HISTORY: usize = 64;
+
+/// A remembered relay set for diffing: its [`manifest_digest`] and the `(id, seq)`
+/// pairs it contained.
+type RelaySetManifest = ([u8; 32], Vec<(NodeId, u64)>);
+
+/// The seed's cached published snapshot plus the state needed to serve diffs.
+struct SnapshotCache {
+    /// The current signed snapshot (relays are full records from the registry).
+    signed: SignedSnapshot,
+    /// The current snapshot pre-serialized (compact) for cheap `GET /snapshot`.
+    bytes: Vec<u8>,
+    /// [`manifest_digest`] of the current relay set — a client sends this back
+    /// as its base when it already holds the current set.
+    digest: [u8; 32],
+    /// Recent distinct relay sets (their `(id, seq)` manifests), newest last, so
+    /// a diff can be computed against a client's older base. Bounded by
+    /// [`MAX_DIFF_HISTORY`]; unknown bases fall back to a full snapshot.
+    history: VecDeque<RelaySetManifest>,
+}
+
+impl SnapshotCache {
+    /// A placeholder replaced immediately by the first `resign_snapshot`.
+    fn empty() -> Self {
+        SnapshotCache {
+            signed: SignedSnapshot {
+                snapshot: Snapshot {
+                    created_at: 0,
+                    expires_at: 0,
+                    relays: vec![],
+                },
+                signatures: vec![],
+            },
+            bytes: Vec::new(),
+            digest: [0u8; 32],
+            history: VecDeque::new(),
+        }
+    }
+}
+
+/// Whether a `/snapshot/diff` response is an incremental delta or a full snapshot.
+enum DiffKind {
+    Delta,
+    Full,
+}
 
 /// Tunables for the seed service.
 #[derive(Clone, Debug)]
@@ -79,8 +129,8 @@ struct AppState {
     witness: NodeIdentity,
     /// Dials relays back to prove reachability + key possession.
     prober: NodeIdentity,
-    /// The latest signed snapshot, pre-serialized for cheap serving.
-    snapshot_bytes: RwLock<Vec<u8>>,
+    /// The latest signed snapshot plus diff state.
+    snapshot: RwLock<SnapshotCache>,
     /// Last registration time per source IP (rate limiting).
     cooldowns: Mutex<HashMap<IpAddr, Instant>>,
     /// Last registration time per relay **key** — bounds a single identity's
@@ -101,7 +151,89 @@ impl AppState {
             .lock()
             .expect("registry")
             .sign_snapshot(&self.witness);
-        *self.snapshot_bytes.write().expect("snapshot") = signed.to_bytes();
+        let bytes = signed.to_bytes();
+        let digest = manifest_digest(&signed.snapshot.relays);
+        let manifest: Vec<(NodeId, u64)> = signed
+            .snapshot
+            .relays
+            .iter()
+            .map(|r| (r.id, r.seq))
+            .collect();
+
+        let mut cache = self.snapshot.write().expect("snapshot");
+        // Record this set in history for diffs, deduping consecutive identical
+        // sets (a re-sign with no churn just refreshes timestamps) and capping
+        // the ring so it can't grow without bound.
+        if cache.history.back().map(|(d, _)| *d) != Some(digest) {
+            cache.history.push_back((digest, manifest));
+            while cache.history.len() > MAX_DIFF_HISTORY {
+                cache.history.pop_front();
+            }
+        }
+        cache.signed = signed;
+        cache.bytes = bytes;
+        cache.digest = digest;
+    }
+
+    /// Compute the `GET /snapshot/diff` response for a client whose base set has
+    /// the given fingerprint. Returns the body and whether it is a delta or a
+    /// full snapshot. A delta is emitted when the base is the current set (a
+    /// tiny timestamp/signature refresh) or a remembered older set; otherwise a
+    /// full snapshot is returned. The client verifies whatever it gets, so an
+    /// unnecessary full response is never a correctness problem.
+    fn snapshot_diff(&self, base: Option<[u8; 32]>) -> (Vec<u8>, DiffKind) {
+        let cache = self.snapshot.read().expect("snapshot");
+        let Some(base) = base else {
+            return (cache.bytes.clone(), DiffKind::Full);
+        };
+        if base == cache.digest {
+            // The client already holds the current set: send an empty-change
+            // delta that just carries the fresh timestamps and signatures.
+            let delta = SnapshotDelta {
+                created_at: cache.signed.snapshot.created_at,
+                expires_at: cache.signed.snapshot.expires_at,
+                upserts: vec![],
+                removed: vec![],
+                signatures: cache.signed.signatures.clone(),
+            };
+            return (delta.to_bytes(), DiffKind::Delta);
+        }
+        if let Some((_, base_ids)) = cache.history.iter().find(|(d, _)| *d == base) {
+            return (
+                build_delta(&cache.signed, base_ids).to_bytes(),
+                DiffKind::Delta,
+            );
+        }
+        (cache.bytes.clone(), DiffKind::Full)
+    }
+}
+
+/// Build a delta that turns the client's `base` relay set into `current`'s.
+/// Upserts every current record that is new or has a higher seq than the base;
+/// removes every base id no longer present. The client applies this and verifies
+/// the reconstructed body against the witness signatures, so a wrong delta is
+/// caught, not trusted.
+fn build_delta(current: &SignedSnapshot, base_ids: &[(NodeId, u64)]) -> SnapshotDelta {
+    let base_seq: HashMap<NodeId, u64> = base_ids.iter().copied().collect();
+    let current_ids: HashSet<NodeId> = current.snapshot.relays.iter().map(|r| r.id).collect();
+    let upserts = current
+        .snapshot
+        .relays
+        .iter()
+        .filter(|r| base_seq.get(&r.id).map(|&s| s < r.seq).unwrap_or(true))
+        .cloned()
+        .collect();
+    let removed = base_ids
+        .iter()
+        .map(|(id, _)| *id)
+        .filter(|id| !current_ids.contains(id))
+        .collect();
+    SnapshotDelta {
+        created_at: current.snapshot.created_at,
+        expires_at: current.snapshot.expires_at,
+        upserts,
+        removed,
+        signatures: current.signatures.clone(),
     }
 }
 
@@ -118,7 +250,7 @@ impl Seed {
             registry: Mutex::new(Registry::new()),
             witness,
             prober,
-            snapshot_bytes: RwLock::new(Vec::new()),
+            snapshot: RwLock::new(SnapshotCache::empty()),
             cooldowns: Mutex::new(HashMap::new()),
             key_cooldowns: Mutex::new(HashMap::new()),
             cooldown: config.register_cooldown,
@@ -159,6 +291,7 @@ impl Seed {
 fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/snapshot", get(get_snapshot))
+        .route("/snapshot/diff", get(get_snapshot_diff))
         .route("/healthz", get(get_healthz))
         .route("/witness", get(get_witness))
         .route("/register", post(post_register))
@@ -167,8 +300,42 @@ fn router(state: Arc<AppState>) -> Router {
 }
 
 async fn get_snapshot(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let bytes = state.snapshot_bytes.read().expect("snapshot").clone();
+    let bytes = state.snapshot.read().expect("snapshot").bytes.clone();
     ([(header::CONTENT_TYPE, "application/octet-stream")], bytes)
+}
+
+/// `GET /snapshot/diff?base=<hex32>` — a client that already holds a snapshot
+/// sends the [`manifest_digest`] of its relay set as `base` and gets back either
+/// a small [`SnapshotDelta`] (header `X-Neo-Diff: delta`) or, when the base is
+/// unrecognized, a full [`SignedSnapshot`] (`X-Neo-Diff: full`). The body's own
+/// framing is unambiguous, but the header lets the client route without sniffing.
+async fn get_snapshot_diff(
+    State(state): State<Arc<AppState>>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let base = query.as_deref().and_then(base_param).and_then(parse_hex32);
+    let (bytes, kind) = state.snapshot_diff(base);
+    let diff_header = match kind {
+        DiffKind::Delta => "delta",
+        DiffKind::Full => "full",
+    };
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header("x-neo-diff", diff_header)
+        .body(Body::from(bytes))
+        .expect("valid response")
+}
+
+/// Extract the `base=` value from a raw query string, if present.
+fn base_param(query: &str) -> Option<&str> {
+    query.split('&').find_map(|kv| kv.strip_prefix("base="))
+}
+
+/// Parse a 32-byte hex fingerprint; `None` on any malformation (→ full snapshot).
+fn parse_hex32(s: &str) -> Option<[u8; 32]> {
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(s.trim(), &mut out).ok()?;
+    Some(out)
 }
 
 async fn get_healthz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -325,14 +492,13 @@ fn spawn_snapshot_loop(state: Arc<AppState>, interval: Duration) {
 mod tests {
     use super::*;
     use neo_discovery::now_unix;
-    use neo_discovery::snapshot::SignedSnapshot;
 
     fn test_state() -> Arc<AppState> {
         let state = Arc::new(AppState {
             registry: Mutex::new(Registry::new()),
             witness: NodeIdentity::generate().unwrap(),
             prober: NodeIdentity::generate().unwrap(),
-            snapshot_bytes: RwLock::new(Vec::new()),
+            snapshot: RwLock::new(SnapshotCache::empty()),
             cooldowns: Mutex::new(HashMap::new()),
             key_cooldowns: Mutex::new(HashMap::new()),
             cooldown: Duration::from_secs(30),
@@ -432,6 +598,79 @@ mod tests {
             .unwrap();
         let signed = SignedSnapshot::from_bytes(&bytes).unwrap();
         signed.verify(&[witness], 1, now_unix()).unwrap();
+    }
+
+    #[test]
+    fn snapshot_diff_serves_deltas_and_falls_back_to_full() {
+        let state = test_state();
+        let trusted = [state.witness.public().signing.to_bytes()];
+        let now = now_unix();
+        let mk = |id: &NodeIdentity, seq| {
+            PeerRecord::build_signed(
+                id,
+                vec!["127.0.0.1:9000".into()],
+                true,
+                false,
+                now + 3600,
+                seq,
+            )
+            .unwrap()
+        };
+
+        // Publish a base snapshot of two healthy relays.
+        let a = NodeIdentity::generate().unwrap();
+        let b = NodeIdentity::generate().unwrap();
+        {
+            let mut reg = state.registry.lock().unwrap();
+            reg.admit(mk(&a, 1)).unwrap();
+            reg.admit(mk(&b, 1)).unwrap();
+            reg.record_health(&a.id(), true);
+            reg.record_health(&b.id(), true);
+        }
+        state.resign_snapshot();
+
+        // The client holds the parsed (compact) base set and its fingerprint.
+        let base_bytes = state.snapshot.read().unwrap().bytes.clone();
+        let base = SignedSnapshot::from_bytes(&base_bytes).unwrap();
+        base.verify(&trusted, 1, now).unwrap();
+        let base_relays = base.snapshot.relays.clone();
+        let base_digest = manifest_digest(&base_relays);
+
+        // base == current → an empty-change refresh delta that still verifies.
+        let (bytes, kind) = state.snapshot_diff(Some(base_digest));
+        assert!(matches!(kind, DiffKind::Delta));
+        let delta = SnapshotDelta::from_bytes(&bytes).unwrap();
+        assert!(delta.upserts.is_empty() && delta.removed.is_empty());
+        delta.apply(&base_relays).verify(&trusted, 1, now).unwrap();
+
+        // Churn: evict a, add c, republish.
+        let c = NodeIdentity::generate().unwrap();
+        {
+            let mut reg = state.registry.lock().unwrap();
+            reg.admit(mk(&c, 1)).unwrap();
+            reg.record_health(&c.id(), true);
+            for _ in 0..crate::registry::MAX_STRIKES {
+                reg.record_health(&a.id(), false);
+            }
+        }
+        state.resign_snapshot();
+
+        // A client on the OLD base gets a delta that reconstructs the NEW set,
+        // and the reconstruction verifies against the witness.
+        let (bytes, kind) = state.snapshot_diff(Some(base_digest));
+        assert!(matches!(kind, DiffKind::Delta));
+        let delta = SnapshotDelta::from_bytes(&bytes).unwrap();
+        let reconstructed = delta.apply(&base_relays);
+        reconstructed.verify(&trusted, 1, now).unwrap();
+        let ids: HashSet<NodeId> = reconstructed.snapshot.relays.iter().map(|r| r.id).collect();
+        assert!(ids.contains(&b.id()));
+        assert!(ids.contains(&c.id()));
+        assert!(!ids.contains(&a.id()));
+
+        // An unrecognized base falls back to a full snapshot.
+        let (bytes, kind) = state.snapshot_diff(Some([0x77; 32]));
+        assert!(matches!(kind, DiffKind::Full));
+        SignedSnapshot::from_bytes(&bytes).unwrap();
     }
 
     #[tokio::test]

@@ -62,7 +62,10 @@ impl Registry {
     ///
     /// Returns `true` if the record was stored (new or newer).
     pub fn admit(&mut self, record: PeerRecord) -> Result<bool> {
-        record.verify(now_unix())?;
+        // Registration requires the full record (with its ML-KEM key): the seed
+        // keeps full records so it can both serve the DHT and derive the compact
+        // snapshot form. A compact record here would carry no key to attest.
+        record.verify_full(now_unix())?;
         if !record.relay {
             return Err(neo_core::Error::Config(
                 "only relay-capable records may register with a seed".into(),
@@ -137,14 +140,21 @@ impl Registry {
         self.entries.retain(|_, e| !e.record.is_expired(now));
     }
 
-    /// The healthy, unexpired relay records this seed will attest to.
+    /// The healthy, unexpired relay records this seed will attest to, in
+    /// **canonical ascending-id order**. The order is deterministic (not
+    /// HashMap iteration order) so a snapshot re-signs to byte-identical bodies
+    /// across restarts, and so a client reconstructing a set from a diff and the
+    /// seed that signed it agree on the exact bytes the witnesses signed.
     pub fn attestable(&self) -> Vec<PeerRecord> {
         let now = now_unix();
-        self.entries
+        let mut relays: Vec<PeerRecord> = self
+            .entries
             .values()
             .filter(|e| e.healthy && !e.record.is_expired(now))
             .map(|e| e.record.clone())
-            .collect()
+            .collect();
+        relays.sort_unstable_by(|a, b| a.id.as_bytes().cmp(b.id.as_bytes()));
+        relays
     }
 
     /// Build a snapshot of the attestable relays and sign it as `witness`.
