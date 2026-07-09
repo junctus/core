@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use neo_core::{Error, NodeIdentity, Result};
+use neo_core::{Error, NodeId, NodeIdentity, Result};
 use neo_crypto::{
     initiator_finish, initiator_message1, responder_confirm, responder_cookie, responder_process,
     CookieKey, HandshakeResult,
@@ -71,6 +71,29 @@ pub async fn connect(addr: &str, identity: &NodeIdentity) -> Result<(TcpStream, 
     let msg2 = read_frame(&mut stream).await?;
     let (msg3, result) = initiator_finish(state, &msg2)?;
     write_frame(&mut stream, &msg3).await?;
+    Ok((stream, result))
+}
+
+/// Like [`connect`], but require the peer to authenticate as the `expected`
+/// [`NodeId`] — the identity the caller trusted from the witness-signed snapshot
+/// (a chosen relay, or a Sphinx-peeled next hop). The handshake re-derives the
+/// peer's NodeId in-band from all three of its long-term keys, so this rejects a
+/// transport MITM (or a stale/hijacked address) **before any frame is sent**, and
+/// enforces a compact record's key commitment at dial time. Every dial that
+/// targets a snapshot-selected identity should use this, not bare [`connect`], so
+/// the check can't be forgotten.
+pub async fn connect_verified(
+    addr: &str,
+    identity: &NodeIdentity,
+    expected: &NodeId,
+) -> Result<(TcpStream, HandshakeResult)> {
+    let (stream, result) = connect(addr, identity).await?;
+    if &result.peer_id != expected {
+        return Err(Error::Crypto(format!(
+            "peer at {addr} authenticated as {} but the snapshot expected {expected}",
+            result.peer_id
+        )));
+    }
     Ok((stream, result))
 }
 

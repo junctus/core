@@ -36,7 +36,7 @@ use neo_crypto::{create_packet_keyed, process, Processed, ReplayCache, Session, 
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::forward::{Hop, NextHop};
-use crate::run::{connect, read_frame, write_frame};
+use crate::run::{connect_verified, read_frame, write_frame};
 
 /// Length of the end-to-end return-path integrity tag.
 const RETURN_MAC_LEN: usize = 16;
@@ -93,7 +93,8 @@ pub async fn request_response(
         .collect();
     let (packet, secrets) = create_packet_keyed(&hops, request)?;
 
-    let (mut stream, mut result) = connect(&circuit[0].addr, identity).await?;
+    let (mut stream, mut result) =
+        connect_verified(&circuit[0].addr, identity, &circuit[0].id).await?;
     let framed = result.session.seal(&packet.to_bytes())?;
     write_frame(&mut stream, &framed).await?;
 
@@ -173,7 +174,8 @@ where
             let addr = resolver
                 .addr_of(&next_id)
                 .ok_or_else(|| Error::Config(format!("no address for next hop {next_id}")))?;
-            let (mut next_stream, mut next_result) = connect(&addr, identity).await?;
+            let (mut next_stream, mut next_result) =
+                connect_verified(&addr, identity, &next_id).await?;
             let framed = next_result.session.seal(&packet.to_bytes())?;
             write_frame(&mut next_stream, &framed).await?;
             let sealed = read_frame(&mut next_stream).await?;
@@ -194,7 +196,7 @@ pub type Resolver = HashMap<NodeId, String>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::run::accept;
+    use crate::run::{accept, connect};
     use std::sync::Arc;
     use tokio::net::TcpListener;
     use tokio::task::JoinHandle;

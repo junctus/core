@@ -29,7 +29,7 @@ use neo_crypto::{
 };
 use tokio::io::AsyncRead;
 
-use crate::run::{connect, read_frame, write_frame};
+use crate::run::{connect_verified, read_frame, write_frame};
 
 /// One hop in a circuit: who to route through and how to reach the first one.
 #[derive(Clone, Debug)]
@@ -98,7 +98,12 @@ pub fn build_onion(circuit: &[Hop], payload: &[u8]) -> Result<(Vec<u8>, String)>
 /// (this is a one-shot, no return path — see the module docs).
 pub async fn send_onion(identity: &NodeIdentity, circuit: &[Hop], payload: &[u8]) -> Result<()> {
     let (packet_bytes, first_addr) = build_onion(circuit, payload)?;
-    let (mut stream, mut result) = connect(&first_addr, identity).await?;
+    // build_onion already rejected an empty circuit, so a first hop exists. Dial
+    // it verifying it authenticates as the id the snapshot vouched for — so a MITM
+    // at the attested address can't even open the transport session (and a compact
+    // record's key commitment is checked here against live keys).
+    let first_id = circuit[0].id;
+    let (mut stream, mut result) = connect_verified(&first_addr, identity, &first_id).await?;
     // Declare the connection mode, then hand over the onion.
     write_frame(
         &mut stream,
@@ -142,7 +147,7 @@ where
             let addr = resolver
                 .addr_of(&next_id)
                 .ok_or_else(|| Error::Config(format!("no address known for next hop {next_id}")))?;
-            forward_packet(identity, &addr, &packet).await?;
+            forward_packet(identity, &addr, &next_id, &packet).await?;
             Ok(Outcome::Forwarded { next: next_id })
         }
     }
@@ -179,19 +184,22 @@ where
             let addr = resolver
                 .addr_of(&next_id)
                 .ok_or_else(|| Error::Config(format!("no address known for next hop {next_id}")))?;
-            forward_packet(identity, &addr, &packet).await?;
+            forward_packet(identity, &addr, &next_id, &packet).await?;
             Ok(Outcome::Forwarded { next: next_id })
         }
     }
 }
 
-/// Dial the next hop, establish a session, and hand off the peeled packet.
+/// Dial the next hop, establish a session, and hand off the peeled packet. The The
+/// next hop must authenticate as `next_id` — the id Sphinx peeled from the packet
+/// — so a relay never forwards to a MITM sitting on the next hop's address.
 async fn forward_packet(
     identity: &NodeIdentity,
     next_addr: &str,
+    next_id: &NodeId,
     packet: &SphinxPacket,
 ) -> Result<()> {
-    let (mut stream, mut result) = connect(next_addr, identity).await?;
+    let (mut stream, mut result) = connect_verified(next_addr, identity, next_id).await?;
     // Propagate the message mode to the next hop, then the peeled packet.
     write_frame(
         &mut stream,

@@ -253,23 +253,14 @@ pub async fn run_client(identity: NodeIdentity, cfg: DiscoveryConfig) -> Result<
         .context("chosen relay advertises no address")?;
 
     println!("connecting to relay {} at {addr} …", relay.id);
-    let (_stream, result) = neo_node::run::connect(&addr, &identity).await?;
-
-    // The relay must authenticate as exactly the identity the snapshot vouched
-    // for. We check the full NodeId — recomputed in-band from all three of the
-    // relay's long-term keys, including the ML-KEM key that a compact snapshot
-    // record omits — against the witness-trusted `id`. This is what makes compact
-    // records safe: the key commitment the snapshot could not carry is verified
-    // here against live key material, with no extra round trip. It also subsumes
-    // the signing-key check, since `id` is a BLAKE3 commitment to the signing key.
-    if result.peer_id != relay.id {
-        bail!(
-            "relay authenticated as a different identity than the snapshot advertised \
-             (expected {}, got {})",
-            relay.id.to_hex(),
-            result.peer_id.to_hex()
-        );
-    }
+    // connect_verified requires the relay to authenticate as exactly the identity
+    // the snapshot vouched for: it checks the full NodeId, recomputed in-band from
+    // all three of the relay's long-term keys (including the ML-KEM key a compact
+    // record omits), against the witness-trusted `id`. That is what makes compact
+    // records safe — the key commitment the snapshot could not carry is verified
+    // here against live keys, with no extra round trip — and it subsumes a
+    // signing-key check, since `id` is a BLAKE3 commitment to the signing key.
+    let (_stream, _result) = neo_node::run::connect_verified(&addr, &identity, &relay.id).await?;
     println!("handshake ok — authenticated relay {}", relay.id.to_hex());
     println!("discovery works: found and connected to a relay with zero manual configuration.");
     Ok(())

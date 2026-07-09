@@ -46,7 +46,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 
 use crate::forward::{Hop, NextHop};
-use crate::run::{connect, read_frame, write_frame};
+use crate::run::{connect_verified, read_frame, write_frame};
 
 /// Per-cell end-to-end MAC length.
 const CELL_MAC_LEN: usize = 16;
@@ -184,7 +184,7 @@ pub async fn open_circuit(
     // payload; create_packet_keyed hands us the per-hop secrets.
     let (packet, secrets) = create_packet_keyed(&hops, target.as_bytes())?;
 
-    let (stream, result) = connect(&circuit[0].addr, identity).await?;
+    let (stream, result) = connect_verified(&circuit[0].addr, identity, &circuit[0].id).await?;
     let (mut sealer, opener) = result.session.split();
     let (r, mut w) = stream.into_split();
     // Declare the circuit mode, then send the setup packet.
@@ -243,7 +243,7 @@ pub async fn serve_circuit<R: NextHop>(
             let addr = resolver
                 .addr_of(&next_id)
                 .ok_or_else(|| Error::Config(format!("no address for next hop {next_id}")))?;
-            let (next_stream, next_result) = connect(&addr, identity).await?;
+            let (next_stream, next_result) = connect_verified(&addr, identity, &next_id).await?;
             let (mut ns_sealer, ns_opener) = next_result.session.split();
             let (nr, mut nw) = next_stream.into_split();
             // Propagate the circuit mode, then forward the setup packet on.
@@ -445,7 +445,7 @@ async fn exit_splice(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::run::accept;
+    use crate::run::{accept, connect};
     use std::collections::HashMap;
     use std::time::Duration;
     use tokio::net::TcpListener;
