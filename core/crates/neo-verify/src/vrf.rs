@@ -60,15 +60,10 @@ pub fn verify(public: &[u8; 32], seed: &[u8], proof: &VrfProof) -> Option<[u8; 3
     Some(inout.make_bytes::<[u8; 32]>(OUTPUT_LABEL))
 }
 
-/// Map a VRF output to an index in `0..n` (for choosing a relay/exit).
-pub fn selection_index(output: &[u8; 32], n: usize) -> usize {
-    if n == 0 {
-        return 0;
-    }
-    let mut head = [0u8; 8];
-    head.copy_from_slice(&output[..8]);
-    (u64::from_le_bytes(head) % n as u64) as usize
-}
+// (Removed `selection_index`: it had modulo bias and used only 64 of the 256
+// output bits, and nothing used it — live selection derives a path seed via
+// `neo_verify::selection` and `Router::select_path_seeded`, which uses full-width
+// rejection sampling.)
 
 #[cfg(test)]
 mod tests {
@@ -103,13 +98,5 @@ mod tests {
         let mut tampered = proof.clone();
         tampered.proof[0] ^= 0xff;
         assert!(verify(&public, b"seed-a", &tampered).is_none());
-    }
-
-    #[test]
-    fn selection_index_is_in_range() {
-        let kp = VrfKeypair::generate();
-        let (_, output) = kp.prove(b"x");
-        assert!(selection_index(&output, 7) < 7);
-        assert_eq!(selection_index(&output, 0), 0);
     }
 }

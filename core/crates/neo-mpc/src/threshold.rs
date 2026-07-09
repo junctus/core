@@ -144,6 +144,14 @@ pub fn combine(
     ct: &Ciphertext,
     partials: &[Partial],
 ) -> Result<Vec<u8>> {
+    // The quorum size is fixed by the committed polynomial: a degree-(k-1)
+    // polynomial has k commitments and threshold k. Reject a caller-supplied
+    // threshold that disagrees, so it can't be decoupled from the commitment.
+    if threshold != commitments.0.len() {
+        return Err(Error::Crypto(
+            "threshold must equal the committed polynomial degree + 1".into(),
+        ));
+    }
     // Each partial is verified against `ct` (which re-checks R), so an invalid R
     // simply makes every partial fail verification below — no separate check here.
     let mut valid: Vec<&Partial> = Vec::new();

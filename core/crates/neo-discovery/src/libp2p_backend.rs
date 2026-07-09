@@ -395,12 +395,24 @@ async fn event_loop(mut node: Libp2pNode, mut commands: mpsc::Receiver<Command>)
                     }
                     Command::SampleRelays { n, reply } => {
                         let now = now_unix();
-                        let relays = cache
+                        let mut relays: Vec<_> = cache
                             .values()
                             .filter(|r| r.relay && !r.is_expired(now))
-                            .take(n)
                             .cloned()
                             .collect();
+                        // Random partial Fisher-Yates so the sample isn't biased by
+                        // HashMap iteration order (which a Sybil could exploit to
+                        // over-represent its relays). Matches LocalRegistry's shuffle.
+                        let take = n.min(relays.len());
+                        for i in 0..take {
+                            let mut b = [0u8; 8];
+                            if getrandom::getrandom(&mut b).is_ok() {
+                                let span = relays.len() - i;
+                                let j = i + (u64::from_le_bytes(b) as usize) % span;
+                                relays.swap(i, j);
+                            }
+                        }
+                        relays.truncate(take);
                         let _ = reply.send(relays);
                     }
                     Command::Listen { addr, reply } => match node.listen(&addr) {
