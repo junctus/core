@@ -33,6 +33,14 @@ impl ObliviousDirectory {
     /// a salt so every key lands in its own bucket. Records may vary in length
     /// (they are length-framed and padded to the largest).
     pub fn build(entries: &[(Vec<u8>, Vec<u8>)]) -> Result<Self> {
+        // A zero-length record would encode as an all-zero length prefix — the same
+        // sentinel try_place() uses for an *empty* bucket — so a second entry could
+        // silently collide into it, breaking the perfect-hashing invariant. Refuse.
+        if entries.iter().any(|(_, r)| r.is_empty()) {
+            return Err(Error::Config(
+                "oblivious directory records must be non-empty".into(),
+            ));
+        }
         let max_record = entries.iter().map(|(_, r)| r.len()).max().unwrap_or(0);
         if max_record > u16::MAX as usize {
             return Err(Error::Config("oblivious record too large".into()));
@@ -163,6 +171,14 @@ mod tests {
                 (key, record)
             })
             .collect()
+    }
+
+    #[test]
+    fn empty_records_are_rejected_to_preserve_perfect_hashing() {
+        // A zero-length record aliases the empty-bucket sentinel, so it must be
+        // refused rather than allowed to cause a silent collision.
+        let bad = vec![(vec![1u8; 32], Vec::new()), (vec![2u8; 32], vec![9])];
+        assert!(ObliviousDirectory::build(&bad).is_err());
     }
 
     #[test]
