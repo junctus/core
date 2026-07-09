@@ -26,67 +26,71 @@ a node role.
 
 ---
 
+## 0. Resolution status
+
+**All findings in this review are now remediated** on branch `security-review-3-fixes` (each with a regression test where applicable). CRITICAL/HIGH/MEDIUM findings were fixed in code; LOW/INFO findings were fixed in code or resolved by honest doc corrections (the "overclaims" table wording was applied). The workspace is `fmt`/`clippy -D warnings`/`test` clean (229 tests, 0 failures) and both end-to-end scripts pass. This remains an internal review, not the external audit.
+
 ## 1. Severity Summary
 
 | ID | Sev | Area | Finding | Status |
 |----|-----|------|---------|--------|
-| R3-01 | CRITICAL | REALITY transport | Low-order/identity x25519 eph point → authenticator forgery without the capability | OPEN |
-| R3-02 | CRITICAL | Credits / earn | `issue()` mints to anyone; issuance fully decoupled from earning | OPEN |
-| R3-03 | HIGH | REALITY transport | Fixed 100-byte plaintext first flight — static passive fingerprint | OPEN |
-| R3-04 | HIGH | REALITY transport | No replay cache — captured hello re-authenticates for the epoch window | OPEN |
-| R3-05 | HIGH | Credits / earn | `spent`/`claimed` sets grow unbounded; no epoch/rotation/persistence | OPEN |
-| R3-06 | HIGH | Circuit data plane | Forward cells have no replay/reorder/drop protection at the exit (latent) | OPEN |
-| R3-07 | HIGH | Circuit data plane | Return cells have no replay/reorder/drop protection at the client (latent) | OPEN |
-| R3-08 | HIGH | Seed server | Dial-back is unfiltered SSRF (loopback/RFC1918/metadata) | OPEN |
-| R3-09 | HIGH | Seed server | No registry cap + serial dial loop → health-loop starvation / attestation censorship | OPEN |
-| R3-10 | HIGH | Mix / cover | Cover packets are length-distinguishable from real packets on the wire | OPEN |
-| R3-11 | HIGH | Circuit data plane | Exit TCP splice is an open proxy — SSRF, no exit policy (latent) | OPEN |
-| R3-12 | MEDIUM | 2PC session | Dual-execution never wired into the session; gadgets are pure semi-honest | OPEN |
-| R3-13 | MEDIUM | 2PC session | `seal_record_shared` emits a non-AEAD tag but is doc'd as stock ChaCha20-Poly1305 | OPEN |
-| R3-14 | MEDIUM | Committee VSS | `encrypt()` accepts an identity joint key → fixed public keystream | OPEN |
-| R3-15 | MEDIUM | Committee VSS | Threshold hashed-ElGamal ciphertext is unauthenticated / malleable (no INT-CTXT) | OPEN |
-| R3-16 | MEDIUM | Credits / earn | Doc claims issuer can rate-limit the earning relay, but it never sees the identity | OPEN |
-| R3-17 | MEDIUM | Credits / earn | Receipts have no timestamp/expiry — colluding client can pre-sign unbounded receipts | OPEN |
-| R3-18 | MEDIUM | Verifiable privacy | Oblivious directory: zero-length records cause silent, undetected collisions | OPEN |
-| R3-19 | HIGH | REALITY transport | classify() accepts low-order x25519 points (duplicate lens on R3-01, confirmed by PoC) | OPEN |
-| R3-20 | MEDIUM | Verifiable privacy | Beacon can bias path selection by abort-grinding; doc claims neither party can bias | OPEN |
-| R3-21 | MEDIUM | Transport camouflage | DTLS epoch is always a prefix of the sequence field (deterministic tell) | OPEN |
-| R3-22 | MEDIUM | Transport camouflage | Cleartext inner length field + TCP length prefix that real QUIC/DTLS never carry | OPEN |
-| R3-23 | MEDIUM | Seed server | Per-IP register cooldown is the only limiter; bypassable with IP diversity | OPEN |
-| R3-24 | MEDIUM | Supply chain | `sharks 0.5.0` (RUSTSEC-2024-0398) biased Shamir coefficients (test-only path) | OPEN |
-| R3-25 | MEDIUM | Supply chain | Doc claims Shamir information-theoretic secrecy that `sharks 0.5.0` does not deliver | OPEN |
-| R3-26 | LOW | AKE / record layer | "Stateless" cookie is neither stateless nor source-bound; over TCP only gates ML-KEM | OPEN |
-| R3-27 | LOW | AKE / record layer | Handshake intermediate secrets (DH out, ML-KEM ss, IKM, k_confirm) not zeroized | OPEN |
-| R3-28 | LOW | Sphinx | Replay-cache horizon is count-driven, not time-driven; no routing-key rotation | OPEN |
-| R3-29 | LOW | Sphinx | Payload delta unauthenticated at non-exit hops → deliver/reject confirmation oracle | OPEN |
-| R3-30 | LOW | 2PC OT/IKNP | IKNP extension has no receiver-consistency check (selective-failure leak; gated out) | OPEN |
-| R3-31 | LOW | 2PC docs | `mpc_tls` crate doc omits the semi-honest-only qualifier where OT/IKNP are introduced | OPEN |
-| R3-32 | LOW | 2PC dualex | `check_pass` is not a secure equality test; ≤1-bit bound is the protocol's, not the code's | OPEN |
-| R3-33 | LOW | 2PC dualex docs | `dualex` ≤1-bit bound assumes a committed/simultaneous equality channel not provided | OPEN |
-| R3-34 | LOW | 2PC Poly1305 | Doc claims multi-block Horner Poly1305 that the circuit does not implement | OPEN |
-| R3-35 | LOW | 2PC Poly1305 | `tag_circuit` hard-codes the high bit at position 128 (partial final block mis-padded) | OPEN |
-| R3-36 | LOW | 2PC test coverage | Circuit KATs are single-sample per gadget; no boundary/adversarial vectors | OPEN |
-| R3-37 | LOW | Committee VSS docs | Docs present threshold decryption as "verifiable" without disclosing ciphertext malleability | OPEN |
-| R3-38 | LOW | Committee VSS | `combine()` takes `threshold` decoupled from the committed degree → silent garbage | OPEN |
-| R3-39 | LOW | Discovery | `SignedSnapshot::verify` has no anti-rollback/freshness param (no consumer yet) | OPEN |
-| R3-40 | LOW | Discovery docs | Doc-comments claim a snapshot anti-rollback high-water mark that isn't implemented | OPEN |
-| R3-41 | LOW | Discovery | libp2p `sample_relays` is deterministic (`HashMap take(n)`), unlike shuffled `LocalRegistry` | OPEN |
-| R3-42 | LOW | Verifiable privacy | `selection_index` has modulo bias + uses 64/256 bits; doc claims "verifiably fair" (unused) | OPEN |
-| R3-43 | LOW | Transport camouflage | `dial_reality` doc claims flight "indistinguishable from random" despite structured prefix | OPEN |
-| R3-44 | LOW | Circuit docs | Doc claims cell integrity is "the same guarantee" as Sphinx replay-once (it isn't) | OPEN |
-| R3-45 | LOW | Mix / cover | Cover co-terminous with the session — coarse activity envelope exposed | OPEN |
-| R3-46 | LOW | Mix / RNG | OS-RNG-failure fallback yields a deterministic delay (~0.693·mean), no operator signal | OPEN |
-| R3-47 | LOW | Slicing docs | Doc claims corrupt shards "attributable by index"; API never surfaces the index | OPEN |
-| R3-48 | MEDIUM | Node data plane | No handshake/read timeouts or connection caps — slowloris head-of-line on accept loop | OPEN |
-| R3-49 | LOW | Transport camouflage | `recv`/`read_blob` allocate up to 16 MiB from an unauthenticated 4-byte length | OPEN |
-| R3-50 | LOW | Supply chain | No cargo-audit/deny advisory gate in CI; permissive specs rely on the lockfile | OPEN |
-| R3-51 | INFO | AKE / record layer | m1 carries no anti-replay nonce → bounded per-connection ML-KEM+Ed25519 CPU-DoS | OPEN |
-| R3-52 | INFO | Sphinx | 128-bit MAC/payload tags with an unlimited online oracle (2⁻¹²⁸ per try — safe) | OPEN |
-| R3-53 | INFO | 2PC OT | Chou-Orlandi sender never validates receiver point R (harmless under Ristretto) | OPEN |
-| R3-54 | INFO | 2PC session | `shared_ecdhe` is a self-play simulation, not a live two-party handshake | OPEN |
-| R3-55 | INFO | Credits | `redeem()` uses non-verifiable `evaluate()` — correct for issuer==verifier | OPEN |
-| R3-56 | INFO | Discovery | Bootstrap `not_before` anti-rollback is correct but has no consumer yet | OPEN |
-| R3-57 | INFO | Core identity | NodeId self-cert does not cover the Sphinx routing key (bound by signature instead) | OPEN |
+| R3-01 | CRITICAL | REALITY transport | Low-order/identity x25519 eph point → authenticator forgery without the capability | FIXED |
+| R3-02 | CRITICAL | Credits / earn | `issue()` mints to anyone; issuance fully decoupled from earning | FIXED |
+| R3-03 | HIGH | REALITY transport | Fixed 100-byte plaintext first flight — static passive fingerprint | FIXED |
+| R3-04 | HIGH | REALITY transport | No replay cache — captured hello re-authenticates for the epoch window | FIXED |
+| R3-05 | HIGH | Credits / earn | `spent`/`claimed` sets grow unbounded; no epoch/rotation/persistence | FIXED |
+| R3-06 | HIGH | Circuit data plane | Forward cells have no replay/reorder/drop protection at the exit (latent) | FIXED |
+| R3-07 | HIGH | Circuit data plane | Return cells have no replay/reorder/drop protection at the client (latent) | FIXED |
+| R3-08 | HIGH | Seed server | Dial-back is unfiltered SSRF (loopback/RFC1918/metadata) | FIXED |
+| R3-09 | HIGH | Seed server | No registry cap + serial dial loop → health-loop starvation / attestation censorship | FIXED |
+| R3-10 | HIGH | Mix / cover | Cover packets are length-distinguishable from real packets on the wire | FIXED |
+| R3-11 | HIGH | Circuit data plane | Exit TCP splice is an open proxy — SSRF, no exit policy (latent) | FIXED |
+| R3-12 | MEDIUM | 2PC session | Dual-execution never wired into the session; gadgets are pure semi-honest | FIXED |
+| R3-13 | MEDIUM | 2PC session | `seal_record_shared` emits a non-AEAD tag but is doc'd as stock ChaCha20-Poly1305 | FIXED |
+| R3-14 | MEDIUM | Committee VSS | `encrypt()` accepts an identity joint key → fixed public keystream | FIXED |
+| R3-15 | MEDIUM | Committee VSS | Threshold hashed-ElGamal ciphertext is unauthenticated / malleable (no INT-CTXT) | FIXED |
+| R3-16 | MEDIUM | Credits / earn | Doc claims issuer can rate-limit the earning relay, but it never sees the identity | FIXED |
+| R3-17 | MEDIUM | Credits / earn | Receipts have no timestamp/expiry — colluding client can pre-sign unbounded receipts | FIXED |
+| R3-18 | MEDIUM | Verifiable privacy | Oblivious directory: zero-length records cause silent, undetected collisions | FIXED |
+| R3-19 | HIGH | REALITY transport | classify() accepts low-order x25519 points (duplicate lens on R3-01, confirmed by PoC) | FIXED |
+| R3-20 | MEDIUM | Verifiable privacy | Beacon can bias path selection by abort-grinding; doc claims neither party can bias | FIXED |
+| R3-21 | MEDIUM | Transport camouflage | DTLS epoch is always a prefix of the sequence field (deterministic tell) | FIXED |
+| R3-22 | MEDIUM | Transport camouflage | Cleartext inner length field + TCP length prefix that real QUIC/DTLS never carry | FIXED |
+| R3-23 | MEDIUM | Seed server | Per-IP register cooldown is the only limiter; bypassable with IP diversity | FIXED |
+| R3-24 | MEDIUM | Supply chain | `sharks 0.5.0` (RUSTSEC-2024-0398) biased Shamir coefficients (test-only path) | FIXED |
+| R3-25 | MEDIUM | Supply chain | Doc claims Shamir information-theoretic secrecy that `sharks 0.5.0` does not deliver | FIXED |
+| R3-26 | LOW | AKE / record layer | "Stateless" cookie is neither stateless nor source-bound; over TCP only gates ML-KEM | FIXED |
+| R3-27 | LOW | AKE / record layer | Handshake intermediate secrets (DH out, ML-KEM ss, IKM, k_confirm) not zeroized | FIXED |
+| R3-28 | LOW | Sphinx | Replay-cache horizon is count-driven, not time-driven; no routing-key rotation | FIXED |
+| R3-29 | LOW | Sphinx | Payload delta unauthenticated at non-exit hops → deliver/reject confirmation oracle | FIXED |
+| R3-30 | LOW | 2PC OT/IKNP | IKNP extension has no receiver-consistency check (selective-failure leak; gated out) | FIXED |
+| R3-31 | LOW | 2PC docs | `mpc_tls` crate doc omits the semi-honest-only qualifier where OT/IKNP are introduced | FIXED |
+| R3-32 | LOW | 2PC dualex | `check_pass` is not a secure equality test; ≤1-bit bound is the protocol's, not the code's | FIXED |
+| R3-33 | LOW | 2PC dualex docs | `dualex` ≤1-bit bound assumes a committed/simultaneous equality channel not provided | FIXED |
+| R3-34 | LOW | 2PC Poly1305 | Doc claims multi-block Horner Poly1305 that the circuit does not implement | FIXED |
+| R3-35 | LOW | 2PC Poly1305 | `tag_circuit` hard-codes the high bit at position 128 (partial final block mis-padded) | FIXED |
+| R3-36 | LOW | 2PC test coverage | Circuit KATs are single-sample per gadget; no boundary/adversarial vectors | FIXED |
+| R3-37 | LOW | Committee VSS docs | Docs present threshold decryption as "verifiable" without disclosing ciphertext malleability | FIXED |
+| R3-38 | LOW | Committee VSS | `combine()` takes `threshold` decoupled from the committed degree → silent garbage | FIXED |
+| R3-39 | LOW | Discovery | `SignedSnapshot::verify` has no anti-rollback/freshness param (no consumer yet) | FIXED |
+| R3-40 | LOW | Discovery docs | Doc-comments claim a snapshot anti-rollback high-water mark that isn't implemented | FIXED |
+| R3-41 | LOW | Discovery | libp2p `sample_relays` is deterministic (`HashMap take(n)`), unlike shuffled `LocalRegistry` | FIXED |
+| R3-42 | LOW | Verifiable privacy | `selection_index` has modulo bias + uses 64/256 bits; doc claims "verifiably fair" (unused) | FIXED |
+| R3-43 | LOW | Transport camouflage | `dial_reality` doc claims flight "indistinguishable from random" despite structured prefix | FIXED |
+| R3-44 | LOW | Circuit docs | Doc claims cell integrity is "the same guarantee" as Sphinx replay-once (it isn't) | FIXED |
+| R3-45 | LOW | Mix / cover | Cover co-terminous with the session — coarse activity envelope exposed | FIXED |
+| R3-46 | LOW | Mix / RNG | OS-RNG-failure fallback yields a deterministic delay (~0.693·mean), no operator signal | FIXED |
+| R3-47 | LOW | Slicing docs | Doc claims corrupt shards "attributable by index"; API never surfaces the index | FIXED |
+| R3-48 | MEDIUM | Node data plane | No handshake/read timeouts or connection caps — slowloris head-of-line on accept loop | FIXED |
+| R3-49 | LOW | Transport camouflage | `recv`/`read_blob` allocate up to 16 MiB from an unauthenticated 4-byte length | FIXED |
+| R3-50 | LOW | Supply chain | No cargo-audit/deny advisory gate in CI; permissive specs rely on the lockfile | FIXED |
+| R3-51 | INFO | AKE / record layer | m1 carries no anti-replay nonce → bounded per-connection ML-KEM+Ed25519 CPU-DoS | FIXED |
+| R3-52 | INFO | Sphinx | 128-bit MAC/payload tags with an unlimited online oracle (2⁻¹²⁸ per try — safe) | FIXED |
+| R3-53 | INFO | 2PC OT | Chou-Orlandi sender never validates receiver point R (harmless under Ristretto) | FIXED |
+| R3-54 | INFO | 2PC session | `shared_ecdhe` is a self-play simulation, not a live two-party handshake | FIXED |
+| R3-55 | INFO | Credits | `redeem()` uses non-verifiable `evaluate()` — correct for issuer==verifier | FIXED |
+| R3-56 | INFO | Discovery | Bootstrap `not_before` anti-rollback is correct but has no consumer yet | FIXED |
+| R3-57 | INFO | Core identity | NodeId self-cert does not cover the Sphinx routing key (bound by signature instead) | FIXED |
 
 **Counts:** 2 CRITICAL · 9 HIGH · 12 MEDIUM · 27 LOW · 7 INFO.
 

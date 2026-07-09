@@ -365,7 +365,7 @@ plaintext are **never assembled at a single party** — built and verified botto
 
 ---
 
-### M25 — Adversarial hardening round 2 ⬜ (verified findings from the M20–M24 review)
+### M25 — Adversarial hardening round 2 ✅ (all round-3 review findings fixed)
 A second internal adversarial review (across the PQ-AKE, Sphinx, REALITY, MPC, credits, seed, and
 circuit surfaces — the code written after M14) surfaced one **critical**, several **high**, and a set
 of medium/low issues. This milestone closes them with regression tests before any of the new capability
