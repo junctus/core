@@ -25,10 +25,20 @@ pub mod bootstrap;
 pub mod libp2p_backend;
 pub mod snapshot;
 
-/// Wire-format version of a serialized [`PeerRecord`].
-const RECORD_VERSION: u8 = 2;
-/// Domain separator for record signatures.
-const RECORD_SIG_DOMAIN: &[u8] = b"neo-peer-record-sig-v2";
+/// Wire-format version of a **full** serialized [`PeerRecord`] — carries the
+/// 1184-byte ML-KEM key. Used for DHT values and seed registration.
+const RECORD_VERSION_FULL: u8 = 3;
+/// Wire-format version of a **compact** [`PeerRecord`] — omits the ML-KEM key
+/// (~85% of a record). The record `id` is `BLAKE3(signing, kex, kem)`, so it
+/// already commits to the omitted key; a dialing client recovers the real key
+/// from the relay's handshake message and checks `id` against it. Compact
+/// records are for witness-signed snapshots, never the DHT (no immediate
+/// handshake follows a DHT lookup to re-derive the key).
+const RECORD_VERSION_COMPACT: u8 = 4;
+/// Domain separator for record signatures. The signed body commits to `id`
+/// (which commits to the keys) but **not** the raw ML-KEM bytes, so one
+/// signature is valid for both the full and compact encodings.
+const RECORD_SIG_DOMAIN: &[u8] = b"neo-peer-record-sig-v3";
 /// Upper bound on advertised addresses per record.
 pub const MAX_ADDRS: usize = 8;
 /// Upper bound on a single advertised address string.
@@ -66,6 +76,18 @@ pub fn now_unix() -> u64 {
 /// record cannot be forged, tampered with, or published under someone else's
 /// id — an adversary can only replay a node's own signed statements, and
 /// `expires_at` + `seq` bound how long a replay stays useful.
+///
+/// A record has two wire encodings. The **full** form ([`to_bytes`](Self::to_bytes))
+/// carries the 1184-byte ML-KEM key and fully self-certifies. The **compact**
+/// form ([`to_compact_bytes`](Self::to_compact_bytes)) omits that key — ~85% of
+/// a record — for witness-signed snapshots, which a client downloads in bulk.
+/// The signature covers `id` (a BLAKE3 commitment to the keys) rather than the
+/// raw key, so it is valid for both forms and a seed can emit the compact form
+/// from a node's full record without the node re-signing. The dropped key is
+/// not lost: the relay sends it in its handshake, and the client checks the
+/// re-derived NodeId against the `id` it trusted from the snapshot — so a
+/// compact record's key commitment is verified at *dial* time rather than at
+/// *parse* time. Compact records are snapshot-only; the DHT uses the full form.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerRecord {
     /// Stable node identifier (BLAKE3 over the public keys).
@@ -132,17 +154,39 @@ impl PeerRecord {
         Ok(())
     }
 
+    /// Like [`verify`](Self::verify) but additionally requires the **full** form.
+    /// Compact records (no ML-KEM key) are snapshot-only: a client re-derives and
+    /// checks their key commitment during the handshake that immediately follows
+    /// dialing. The DHT and seed registration have no such following handshake,
+    /// so they must reject compact records and keep the self-certifying full form.
+    pub fn verify_full(&self, now: u64) -> Result<()> {
+        if self.is_compact() {
+            return Err(Error::Decode(
+                "compact records are snapshot-only and not valid here".into(),
+            ));
+        }
+        self.verify(now)
+    }
+
     /// The time-independent checks: structural limits, key/id
     /// self-certification, and the signature — everything except expiry.
     /// Snapshot verification uses this to treat a *forged* record as fatal
     /// while merely filtering records that have aged out.
     pub fn verify_static(&self) -> Result<()> {
         self.check_limits()?;
-        let expected = NodeId::from_keys(&self.signing, &self.kex, &self.kem)?;
-        if expected != self.id {
-            return Err(Error::Crypto(
-                "peer record id does not match its keys".into(),
-            ));
+        // A full record self-certifies: id must equal BLAKE3 over its keys. A
+        // compact record carries no kem, so this commitment cannot be checked
+        // here; it is enforced when a client dials the relay and re-derives the
+        // NodeId from the ML-KEM key the handshake supplies (see module docs).
+        // The signature below still binds `id` (and thus the committed key),
+        // signing/kex/sphinx, addrs, expiry and seq to the node's signing key.
+        if !self.is_compact() {
+            let expected = NodeId::from_keys(&self.signing, &self.kex, &self.kem)?;
+            if expected != self.id {
+                return Err(Error::Crypto(
+                    "peer record id does not match its keys".into(),
+                ));
+            }
         }
         neo_core::verify_signature(&self.signing, &self.signable_bytes(), &self.sig)
     }
@@ -152,8 +196,16 @@ impl PeerRecord {
         self.expires_at <= now
     }
 
+    /// Whether this record is the compact form (no ML-KEM key). A compact record
+    /// carries an empty `kem`; a full record's `kem` is exactly [`KEM_PUBLIC_LEN`].
+    pub fn is_compact(&self) -> bool {
+        self.kem.is_empty()
+    }
+
     fn check_limits(&self) -> Result<()> {
-        if self.kem.len() != KEM_PUBLIC_LEN {
+        // A full record must carry a well-formed ML-KEM key; a compact record
+        // carries none (empty), and its key is validated at handshake time.
+        if !self.kem.is_empty() && self.kem.len() != KEM_PUBLIC_LEN {
             return Err(Error::Decode("bad ML-KEM key length".into()));
         }
         if self.addrs.len() > MAX_ADDRS {
@@ -165,21 +217,23 @@ impl PeerRecord {
         Ok(())
     }
 
-    /// The bytes covered by the record signature (domain-tagged body).
+    /// The bytes covered by the record signature: a domain tag, then `id`, the
+    /// signing/kex/sphinx keys, and the record metadata — but **not** the raw
+    /// ML-KEM key (which `id` commits to) and **not** the wire version byte. That
+    /// omission is what lets one signature cover both the full and compact forms.
     fn signable_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(RECORD_SIG_DOMAIN.len() + 1400);
+        let mut out = Vec::with_capacity(RECORD_SIG_DOMAIN.len() + 256);
         out.extend_from_slice(RECORD_SIG_DOMAIN);
-        self.encode_body(&mut out);
-        out
-    }
-
-    /// Everything except the trailing signature, in wire order.
-    fn encode_body(&self, out: &mut Vec<u8>) {
-        out.push(RECORD_VERSION);
         out.extend_from_slice(self.id.as_bytes());
         out.extend_from_slice(&self.signing);
         out.extend_from_slice(&self.kex);
-        out.extend_from_slice(&self.kem);
+        self.encode_tail(&mut out);
+        out
+    }
+
+    /// The wire fields from `sphinx` onward — identical across the full and
+    /// compact encodings and the signed body, so it is factored out.
+    fn encode_tail(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.sphinx);
         out.push((self.relay as u8) | ((self.exit as u8) << 1));
         out.extend_from_slice(&self.expires_at.to_be_bytes());
@@ -191,10 +245,32 @@ impl PeerRecord {
         }
     }
 
-    /// Serialize the record (e.g. as a DHT value or registration body).
+    /// Serialize the **full** record — carries the ML-KEM key. Use for DHT values
+    /// and seed registration, where no handshake immediately follows to supply
+    /// the key. See [`to_compact_bytes`](Self::to_compact_bytes) for snapshots.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(1500);
-        self.encode_body(&mut out);
+        out.push(RECORD_VERSION_FULL);
+        out.extend_from_slice(self.id.as_bytes());
+        out.extend_from_slice(&self.signing);
+        out.extend_from_slice(&self.kex);
+        out.extend_from_slice(&self.kem);
+        self.encode_tail(&mut out);
+        out.extend_from_slice(&self.sig);
+        out
+    }
+
+    /// Serialize the **compact** record — omits the ML-KEM key (~85% smaller).
+    /// The signature is byte-for-byte the one on the full record (it never
+    /// covered the raw key), so a holder of the full record — e.g. a seed
+    /// building a snapshot — can emit this form without the node re-signing.
+    pub fn to_compact_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(256);
+        out.push(RECORD_VERSION_COMPACT);
+        out.extend_from_slice(self.id.as_bytes());
+        out.extend_from_slice(&self.signing);
+        out.extend_from_slice(&self.kex);
+        self.encode_tail(&mut out);
         out.extend_from_slice(&self.sig);
         out
     }
@@ -222,18 +298,27 @@ impl PeerRecord {
 
         let mut cur = bytes;
         let version = take(&mut cur, 1)?[0];
-        if version != RECORD_VERSION {
-            return Err(Error::Decode(format!(
-                "unsupported peer record version {version}"
-            )));
-        }
+        let compact = match version {
+            RECORD_VERSION_FULL => false,
+            RECORD_VERSION_COMPACT => true,
+            other => {
+                return Err(Error::Decode(format!(
+                    "unsupported peer record version {other}"
+                )))
+            }
+        };
         let mut id = [0u8; 32];
         id.copy_from_slice(take(&mut cur, 32)?);
         let mut signing = [0u8; 32];
         signing.copy_from_slice(take(&mut cur, 32)?);
         let mut kex = [0u8; 32];
         kex.copy_from_slice(take(&mut cur, 32)?);
-        let kem = take(&mut cur, KEM_PUBLIC_LEN)?.to_vec();
+        // The compact form omits the ML-KEM key entirely; leave it empty.
+        let kem = if compact {
+            Vec::new()
+        } else {
+            take(&mut cur, KEM_PUBLIC_LEN)?.to_vec()
+        };
         let mut sphinx = [0u8; 32];
         sphinx.copy_from_slice(take(&mut cur, 32)?);
         let flags = take(&mut cur, 1)?[0];
@@ -381,7 +466,7 @@ impl LocalRegistry {
 impl LocalRegistry {
     /// Verify a record and insert it, keeping the highest `seq` per node.
     fn upsert_verified(guard: &mut HashMap<NodeId, PeerRecord>, record: PeerRecord) -> Result<()> {
-        record.verify(now_unix())?;
+        record.verify_full(now_unix())?;
         match guard.get(&record.id) {
             Some(existing) if existing.seq >= record.seq => Ok(()),
             _ => {
@@ -513,6 +598,75 @@ mod tests {
         let mut rec = record(true, false, true);
         rec.id = victim.id();
         assert!(rec.verify(now_unix()).is_err());
+    }
+
+    #[test]
+    fn compact_record_roundtrips_and_verifies() {
+        // A compact record parses back with no kem and still verifies: the
+        // signature covers `id` (which commits to the key), not the raw key.
+        let full = record(true, false, true);
+        let compact = PeerRecord::from_bytes(&full.to_compact_bytes()).unwrap();
+        assert!(compact.is_compact());
+        assert!(compact.kem.is_empty());
+        assert!(compact.verify(now_unix()).is_ok());
+        // Everything except the dropped kem survives the round trip.
+        assert_eq!(compact.id, full.id);
+        assert_eq!(compact.signing, full.signing);
+        assert_eq!(compact.kex, full.kex);
+        assert_eq!(compact.sphinx, full.sphinx);
+        assert_eq!(compact.addrs, full.addrs);
+        assert_eq!(compact.seq, full.seq);
+    }
+
+    #[test]
+    fn full_and_compact_share_one_signature() {
+        // The point of signing over `id` and not the raw kem: a holder of the
+        // full record (a seed) emits the compact form with no re-signing.
+        let full = record(true, false, true);
+        let compact = PeerRecord::from_bytes(&full.to_compact_bytes()).unwrap();
+        assert_eq!(full.sig, compact.sig, "one signature covers both forms");
+        assert!(full.verify(now_unix()).is_ok());
+        assert!(compact.verify(now_unix()).is_ok());
+    }
+
+    #[test]
+    fn compact_record_is_far_smaller() {
+        let full = record(true, false, true);
+        let f = full.to_bytes().len();
+        let c = full.to_compact_bytes().len();
+        // Exactly the ML-KEM key (1184 bytes) is dropped; the result is well
+        // under half the full size.
+        assert_eq!(f - c, KEM_PUBLIC_LEN);
+        assert!(c * 3 < f, "compact should be far smaller (~85% off)");
+    }
+
+    #[test]
+    fn tampered_compact_records_are_rejected() {
+        let now = now_unix();
+        // Tampering the id breaks the signature (id is in the signed body), so a
+        // compact record still cannot be re-pointed at another identity.
+        let mut rec =
+            PeerRecord::from_bytes(&record(true, false, true).to_compact_bytes()).unwrap();
+        rec.id = NodeId::from_bytes([0x55; 32]);
+        assert!(rec.verify(now).is_err());
+        // Tampering an address likewise.
+        let mut rec =
+            PeerRecord::from_bytes(&record(true, false, true).to_compact_bytes()).unwrap();
+        rec.addrs = vec!["6.6.6.6:6666".into()];
+        assert!(rec.verify(now).is_err());
+    }
+
+    #[test]
+    fn version_byte_distinguishes_full_from_compact() {
+        let full = record(true, false, true);
+        assert_eq!(full.to_bytes()[0], RECORD_VERSION_FULL);
+        assert_eq!(full.to_compact_bytes()[0], RECORD_VERSION_COMPACT);
+        assert!(!PeerRecord::from_bytes(&full.to_bytes())
+            .unwrap()
+            .is_compact());
+        assert!(PeerRecord::from_bytes(&full.to_compact_bytes())
+            .unwrap()
+            .is_compact());
     }
 
     #[test]

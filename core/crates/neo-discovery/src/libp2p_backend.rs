@@ -119,7 +119,7 @@ impl Libp2pNode {
         let Ok(peer) = PeerRecord::from_bytes(&record.value) else {
             return;
         };
-        if record.key.as_ref() != peer.id.as_bytes() || peer.verify(now_unix()).is_err() {
+        if record.key.as_ref() != peer.id.as_bytes() || peer.verify_full(now_unix()).is_err() {
             return;
         }
         let store = self.swarm.behaviour_mut().kademlia.store_mut();
@@ -318,7 +318,7 @@ impl Discovery for Libp2pDiscovery {
                 "clients never announce — announcing would make this node enumerable".into(),
             ));
         }
-        record.verify(now_unix())?;
+        record.verify_full(now_unix())?;
         let (tx, rx) = oneshot::channel();
         self.send(Command::Announce { record, reply: tx }).await?;
         recv(rx).await?
@@ -450,7 +450,7 @@ async fn event_loop(mut node: Libp2pNode, mut commands: mpsc::Receiver<Command>)
                             let verified = PeerRecord::from_bytes(&found.record.value)
                                 .ok()
                                 .filter(|r| found.record.key.as_ref() == r.id.as_bytes())
-                                .filter(|r| r.verify(now_unix()).is_ok());
+                                .filter(|r| r.verify_full(now_unix()).is_ok());
                             if let Some(record) = verified {
                                 cache_newest(&mut cache, record.clone());
                                 if let Some(reply) = pending_get.remove(&id) {
