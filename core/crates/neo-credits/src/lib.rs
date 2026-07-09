@@ -35,29 +35,53 @@ use voprf::{
 const SERIAL_LEN: usize = 32;
 
 /// The credit issuer (holds the VOPRF key and the earn ledger that gates issuance).
+///
+/// The double-spend set is **key-epoch-scoped**: rotating the key ([`rotate_key`])
+/// retires the old key for one grace epoch (so outstanding credits still redeem)
+/// and drops the epoch before it, bounding the spent set to ~2 epochs of serials
+/// rather than growing forever. Operators rotate on a schedule (e.g. daily).
+///
+/// **Boundary:** the spent set is in-memory; persisting it across restarts (so a
+/// redeploy cannot re-enable replay of the current epoch's serials) is M32.
 pub struct Issuer {
-    server: VoprfServer<Ristretto255>,
-    spent: HashSet<Vec<u8>>,
+    current: VoprfServer<Ristretto255>,
+    /// Retained one epoch for a redeem grace window after rotation.
+    previous: Option<VoprfServer<Ristretto255>>,
+    spent_current: HashSet<Vec<u8>>,
+    spent_previous: HashSet<Vec<u8>>,
     ledger: EarnLedger,
 }
 
 impl Issuer {
     /// Generate a fresh issuer key.
     pub fn new() -> Result<Self> {
-        let server = VoprfServer::<Ristretto255>::new(&mut rand::rngs::OsRng)
+        let current = VoprfServer::<Ristretto255>::new(&mut rand::rngs::OsRng)
             .map_err(|e| Error::Crypto(format!("credit keygen: {e}")))?;
         Ok(Self {
-            server,
-            spent: HashSet::new(),
+            current,
+            previous: None,
+            spent_current: HashSet::new(),
+            spent_previous: HashSet::new(),
             ledger: EarnLedger::new(),
         })
     }
 
-    /// The issuer's public key. Clients need it to verify that a blind evaluation
-    /// was performed under the issuer's committed key (the DLEQ proof binds to it),
-    /// so it should be published/pinned out of band, not fetched per-issuance.
+    /// The issuer's current public key. Clients need it to verify that a blind
+    /// evaluation was performed under the issuer's committed key (the DLEQ proof
+    /// binds to it), so it should be published/pinned out of band.
     pub fn public_key(&self) -> IssuerPublicKey {
-        IssuerPublicKey(Ristretto255::serialize_elem(self.server.get_public_key()).to_vec())
+        IssuerPublicKey(Ristretto255::serialize_elem(self.current.get_public_key()).to_vec())
+    }
+
+    /// Rotate the issuer key. The old key is kept for **one** grace epoch so
+    /// already-issued credits still redeem; the epoch before it is dropped, which
+    /// retires (and frees) its spent set. Publish the new [`public_key`] to clients.
+    pub fn rotate_key(&mut self) -> Result<()> {
+        let fresh = VoprfServer::<Ristretto255>::new(&mut rand::rngs::OsRng)
+            .map_err(|e| Error::Crypto(format!("credit keygen: {e}")))?;
+        self.previous = Some(std::mem::replace(&mut self.current, fresh));
+        self.spent_previous = std::mem::take(&mut self.spent_current);
+        Ok(())
     }
 
     /// Record a proof-of-relay receipt against the issuer's ledger, crediting the
@@ -88,28 +112,47 @@ impl Issuer {
         }
         let element = BlindedElement::<Ristretto255>::deserialize(&blinded.0)
             .map_err(|e| Error::Decode(format!("blinded element: {e}")))?;
-        let evaluated = self.server.blind_evaluate(&mut rand::rngs::OsRng, &element);
+        let evaluated = self
+            .current
+            .blind_evaluate(&mut rand::rngs::OsRng, &element);
         Ok(IssuedCredit {
             element: evaluated.message.serialize().to_vec(),
             proof: evaluated.proof.serialize().to_vec(),
         })
     }
 
-    /// Redeem a credit: recompute the OPRF over its serial, check the token, and
-    /// reject double-spends.
+    /// Redeem a credit: recompute the OPRF over its serial under the current key
+    /// (or the previous key during the post-rotation grace window), check the
+    /// token, and reject double-spends within that key's epoch.
     pub fn redeem(&mut self, credit: &Credit) -> Result<()> {
-        let expected = self
-            .server
-            .evaluate(&credit.serial)
-            .map_err(|e| Error::Crypto(format!("evaluate: {e}")))?;
-        if expected.as_slice() != credit.token.as_slice() {
-            return Err(Error::Crypto("invalid credit".into()));
+        // Current key.
+        if token_matches(&self.current, credit) {
+            return if self.spent_current.insert(credit.serial.clone()) {
+                Ok(())
+            } else {
+                Err(Error::Crypto("credit already spent".into()))
+            };
         }
-        if !self.spent.insert(credit.serial.clone()) {
-            return Err(Error::Crypto("credit already spent".into()));
+        // Previous key (grace window after a rotation).
+        if let Some(prev) = &self.previous {
+            if token_matches(prev, credit) {
+                return if self.spent_previous.insert(credit.serial.clone()) {
+                    Ok(())
+                } else {
+                    Err(Error::Crypto("credit already spent".into()))
+                };
+            }
         }
-        Ok(())
+        Err(Error::Crypto("invalid credit".into()))
     }
+}
+
+/// Whether `credit`'s token is the OPRF of its serial under `server`'s key.
+fn token_matches(server: &VoprfServer<Ristretto255>, credit: &Credit) -> bool {
+    server
+        .evaluate(&credit.serial)
+        .map(|expected| expected.as_slice() == credit.token.as_slice())
+        .unwrap_or(false)
 }
 
 /// The issuer's committed public key, needed to verify blind evaluations.
@@ -229,6 +272,34 @@ mod tests {
         assert!(
             issuer.issue(&relay, &b2).is_err(),
             "a single earned credit issues a single token"
+        );
+    }
+
+    #[test]
+    fn key_rotation_keeps_a_grace_window_then_retires_old_credits() {
+        let mut issuer = Issuer::new().unwrap();
+        let pk = issuer.public_key();
+        let relay = earn_credit(&mut issuer, 20);
+        let (blinded, secret) = request().unwrap();
+        let credit = finalize(secret, issuer.issue(&relay, &blinded).unwrap(), &pk).unwrap();
+
+        // One rotation: the credit still redeems via the previous-key grace window.
+        issuer.rotate_key().unwrap();
+        assert!(
+            issuer.redeem(&credit).is_ok(),
+            "grace window redeems an outstanding credit"
+        );
+
+        // A credit issued under the now-current key, two rotations later, is retired.
+        let relay2 = earn_credit(&mut issuer, 21);
+        let pk2 = issuer.public_key();
+        let (b2, s2) = request().unwrap();
+        let old = finalize(s2, issuer.issue(&relay2, &b2).unwrap(), &pk2).unwrap();
+        issuer.rotate_key().unwrap();
+        issuer.rotate_key().unwrap();
+        assert!(
+            issuer.redeem(&old).is_err(),
+            "a credit two rotations old no longer redeems"
         );
     }
 
