@@ -21,8 +21,11 @@
 //! per direction the keystream never repeats (no XOR reuse). The endpoint body is
 //! `[mac][payload]` with a **per-cell end-to-end MAC** keyed by the exit's secret,
 //! so any middle relay that mauls a cell is detected at the endpoint, never
-//! delivered — the same integrity guarantee the forward Sphinx payload and the
-//! one-shot return path already have.
+//! delivered. Each endpoint also enforces a **strict per-direction sequence
+//! number** (`seq` starts at 0 and must increase by exactly one), so a relay that
+//! duplicates, reorders, or drops a cell — re-injecting captured bytes into the
+//! target/return stream — is rejected rather than delivered. Together these give
+//! the stream tamper-, replay-, and reorder-detection end to end.
 //!
 //! Forward (client → exit) layers are applied outermost-first so hop 0 peels
 //! first; return (exit → client) layers are added hop-by-hop and the client peels
@@ -105,6 +108,9 @@ pub struct CircuitStream {
     r: OwnedReadHalf,
     opener: Opener,
     secrets: Vec<[u8; 32]>,
+    /// The next return-cell sequence number expected — enforces in-order,
+    /// no-duplicate, no-drop delivery so a relay cannot replay/reorder the stream.
+    next_seq: u64,
 }
 
 impl CircuitSink {
@@ -138,6 +144,12 @@ impl CircuitStream {
             return Err(Error::Decode("short circuit cell".into()));
         }
         let seq = u64::from_be_bytes(cell[..SEQ_LEN].try_into().expect("8 bytes"));
+        // Enforce strict in-order delivery: a duplicated or reordered cell (a relay
+        // re-injecting captured bytes) has the wrong seq and is rejected.
+        if seq != self.next_seq {
+            return Err(Error::Crypto("return cell out of sequence".into()));
+        }
+        self.next_seq += 1;
         let mut body = cell[SEQ_LEN..].to_vec();
         for secret in &self.secrets {
             xor_cell(&mut body, &ret_key(secret), seq);
@@ -185,7 +197,12 @@ pub async fn open_circuit(
             secrets: secrets.clone(),
             seq: 0,
         },
-        CircuitStream { r, opener, secrets },
+        CircuitStream {
+            r,
+            opener,
+            secrets,
+            next_seq: 0,
+        },
     ))
 }
 
@@ -326,6 +343,7 @@ async fn exit_splice(
 
     // client → target: peel the exit's forward layer, verify the e2e MAC, write.
     let to_target = async {
+        let mut next_seq = 0u64;
         loop {
             let Ok(framed) = read_frame(&mut pr).await else {
                 break;
@@ -335,6 +353,12 @@ async fn exit_splice(
                 return Err(Error::Decode("short forward cell".into()));
             }
             let seq = u64::from_be_bytes(cell[..SEQ_LEN].try_into().expect("8 bytes"));
+            // Strict in-order delivery: a relay that duplicates/reorders a forward
+            // cell (re-injecting captured bytes into the target stream) is rejected.
+            if seq != next_seq {
+                return Err(Error::Crypto("forward cell out of sequence".into()));
+            }
+            next_seq += 1;
             let mut body = cell[SEQ_LEN..].to_vec();
             xor_cell(&mut body, &fk, seq);
             let (mac, payload) = body.split_at(CELL_MAC_LEN);
@@ -588,5 +612,93 @@ mod tests {
             .await
             .expect("recv in time");
         assert!(res.is_err(), "client must reject a mauled return cell");
+    }
+
+    #[tokio::test]
+    async fn a_replayed_return_cell_is_rejected() {
+        let echo_addr = spawn_echo().await;
+        let exit = NodeIdentity::generate().unwrap();
+        let relay = NodeIdentity::generate().unwrap();
+        let client = NodeIdentity::generate().unwrap();
+        let (exit_addr, _exit) = spawn_serve(exit.to_bytes(), HashMap::new()).await;
+
+        // A malicious middle relay that honestly forwards, but re-injects the first
+        // return cell a second time under a fresh link counter.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = listener.local_addr().unwrap().to_string();
+        let relay_bytes = relay.to_bytes();
+        let exit_dst = exit_addr.clone();
+        tokio::spawn(async move {
+            let identity = NodeIdentity::from_bytes(&relay_bytes).unwrap();
+            let (prev, prev_res) = accept(&listener, &identity).await.unwrap();
+            let (mut pr, mut pw) = prev.into_split();
+            let (mut pw_sealer, mut pr_opener) = prev_res.session.split();
+            let setup = read_frame(&mut pr).await.unwrap();
+            let packet = SphinxPacket::from_bytes(&pr_opener.open(&setup).unwrap()).unwrap();
+            let secret = identity.sphinx_shared(packet.alpha()).unwrap();
+            let mut cache = ReplayCache::new();
+            let Processed::Forward { packet, .. } =
+                process(&identity, &mut cache, &packet).unwrap()
+            else {
+                panic!("relay should forward");
+            };
+            let (next, next_res) = connect(&exit_dst, &identity).await.unwrap();
+            let (mut ns_sealer, mut ns_opener) = next_res.session.split();
+            let (mut nr, mut nw) = next.into_split();
+            write_frame(&mut nw, &ns_sealer.seal(&packet.to_bytes()).unwrap())
+                .await
+                .unwrap();
+            let fk = fwd_key(&secret);
+            let rk = ret_key(&secret);
+            let forward = async move {
+                while let Ok(f) = read_frame(&mut pr).await {
+                    let c = pr_opener.open(&f).unwrap();
+                    let out = ns_sealer.seal(&relay_layer(&c, &fk).unwrap()).unwrap();
+                    if write_frame(&mut nw, &out).await.is_err() {
+                        break;
+                    }
+                }
+            };
+            let ret = async move {
+                let mut first = true;
+                while let Ok(f) = read_frame(&mut nr).await {
+                    let c = ns_opener.open(&f).unwrap();
+                    let r = relay_layer(&c, &rk).unwrap();
+                    if write_frame(&mut pw, &pw_sealer.seal(&r).unwrap())
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    if first {
+                        first = false; // replay the very first return cell
+                        if write_frame(&mut pw, &pw_sealer.seal(&r).unwrap())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            };
+            tokio::join!(forward, ret);
+        });
+
+        let circuit = vec![hop_of(&relay, &relay_addr), hop_of(&exit, &exit_addr)];
+        let (mut sink, mut stream) = open_circuit(&client, &circuit, &echo_addr).await.unwrap();
+        sink.send(b"echo me once").await.unwrap();
+
+        // The genuine first cell (seq 0) is delivered; the duplicate is rejected.
+        assert!(tokio::time::timeout(Duration::from_secs(5), stream.recv())
+            .await
+            .expect("recv in time")
+            .is_ok());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), stream.recv())
+                .await
+                .expect("recv in time")
+                .is_err(),
+            "a replayed return cell must be rejected (out of sequence)"
+        );
     }
 }
