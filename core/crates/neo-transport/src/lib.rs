@@ -17,12 +17,17 @@
 //! routed to a **decoy** path — so probing cannot tell a neo bridge from an
 //! ordinary server.
 //!
-//! **Honest boundary.** `Camouflage` mimics the observable *shape* of QUIC/DTLS,
-//! not the full protocol crypto (a real QUIC transport lives behind the `quic`
-//! feature). The REALITY integration implements the authenticator and the silent
-//! authenticate/decoy split; wiring the decoy to a genuine upstream TLS site and
-//! embedding the flight inside a real TLS ClientHello are the remaining
-//! integration steps. Rendezvous uses DoH, not domain fronting (which is dead).
+//! **Honest boundary.** `Camouflage` mimics the observable header *shape* of
+//! QUIC/DTLS, not the full protocol. It runs over TCP with a length-prefixed
+//! framing and carries a cleartext inner length field — neither of which real
+//! (UDP) QUIC/DTLS has — so it defeats a shallow shape classifier, **not** a deep
+//! protocol-aware DPI engine; it also does not reproduce true monotonic
+//! epoch/sequence fields. A protocol-faithful transport is the `quic` feature and
+//! future work. Likewise the REALITY integration implements the authenticator and
+//! the silent authenticate/decoy split; wiring the decoy to a genuine upstream TLS
+//! site and embedding the flight inside a real TLS ClientHello (so the first flight
+//! is truly indistinguishable on the wire, not merely high-entropy) are the
+//! remaining integration steps. Rendezvous uses DoH, not domain fronting (dead).
 
 #![forbid(unsafe_code)]
 
@@ -34,7 +39,11 @@ use neo_crypto::{RealityKey, RealitySecret, Verdict};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-const MAX_RECORD: usize = 16 * 1024 * 1024;
+/// Maximum single record/first-flight this transport will allocate for from an
+/// unauthenticated 4-byte length prefix. neo protocol records are small (Sphinx
+/// packets ~2 KiB, session records smaller), so this is a generous cap that keeps
+/// the pre-auth memory-DoS surface small — 1 MiB, not the old 16 MiB.
+const MAX_RECORD: usize = 1024 * 1024;
 
 /// A reversible transformation applied to each record before it hits the wire.
 pub trait Obfuscation: Clone + Send + Sync + 'static {
@@ -121,18 +130,20 @@ impl Shape {
     }
 
     fn write_header(self, out: &mut Vec<u8>) -> Result<()> {
-        let mut rnd = [0u8; 8];
+        // Independent randomness for every field so no field is a deterministic
+        // function (or prefix) of another.
+        let mut rnd = [0u8; 16];
         getrandom::getrandom(&mut rnd).map_err(|e| Error::Rng(e.to_string()))?;
         match self {
             Shape::QuicMasque => {
                 // Short header: MSB 0 (not long-header), fixed bit 1, rest varied.
                 out.push(0x40 | (rnd[0] & 0x3f));
-                out.extend_from_slice(&rnd); // 8-byte pseudo connection id
+                out.extend_from_slice(&rnd[..8]); // 8-byte pseudo connection id
             }
             Shape::WebRtcDtls => {
                 out.extend_from_slice(&[0x17, 0xfe, 0xfd]); // application_data, DTLS 1.2
-                out.extend_from_slice(&rnd[..2]); // epoch
-                out.extend_from_slice(&rnd[..6]); // sequence number
+                out.extend_from_slice(&rnd[8..10]); // epoch (independent bytes)
+                out.extend_from_slice(&rnd[10..16]); // sequence number (independent bytes)
             }
         }
         Ok(())
@@ -229,8 +240,10 @@ impl<O: Obfuscation> Transport<O> {
 
     /// Dial a peer and open with a **REALITY authenticated first flight**: prove
     /// possession of the pre-shared `key` for `epoch`, then return the connection
-    /// and the shared `session_seed` the server independently derived. To a censor
-    /// the flight is indistinguishable from random.
+    /// and the shared `session_seed` the server independently derived. The
+    /// authenticator *bytes* are indistinguishable from random to a censor, but the
+    /// flight is sent behind a cleartext length prefix (not yet inside a real TLS
+    /// ClientHello), so full wire indistinguishability is the M27 integration step.
     pub async fn dial_reality(
         &self,
         addr: &str,
