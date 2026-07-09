@@ -50,6 +50,10 @@ pub fn receiver_choose(s: &RistrettoPoint, choice: bool) -> Result<ReceiverChoic
 
 /// Sender step 2: encrypt both messages to the receiver's `R`. The receiver can
 /// only recover the one matching its choice bit.
+///
+/// `R` is a `RistrettoPoint`, whose group is prime-order, so there is no
+/// small-subgroup / cofactor validation to perform (any decoded Ristretto point is
+/// safe) — the concern that applies to raw Edwards/Montgomery points does not here.
 pub fn sender_send(
     setup: &SenderSetup,
     r: &RistrettoPoint,
