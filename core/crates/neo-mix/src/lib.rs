@@ -6,7 +6,11 @@
 //!   exponentially-distributed delay, so a mix node's output timing is
 //!   decorrelated from its input (the sum of Poisson streams is Poisson).
 //! - **Cover traffic** — decoy packets are emitted at Poisson intervals so the
-//!   real traffic rate and pattern are hidden.
+//!   real traffic rate and pattern are hidden *while the mixer runs*. Honest
+//!   limit: cover is co-terminous with an active session (none before the tunnel
+//!   is up or after it tears down), so the coarse *activity envelope* — that a
+//!   session exists at all, and roughly when — is still observable; hiding that
+//!   needs always-on cover independent of session lifetime.
 //!
 //! [`Mixer`] applies both to a stream of packets. There is no off-the-shelf Rust
 //! crate for this; it is built here from the OS CSPRNG and tokio timers.

@@ -29,8 +29,11 @@ pub const MAX_SNAPSHOT_RELAYS: usize = 4096;
 /// Upper bound on witness signatures on one snapshot.
 pub const MAX_WITNESSES: usize = 64;
 /// Maximum seconds a snapshot's `created_at` may run ahead of the verifier's
-/// clock. Caps the anti-rollback high-water mark so a far-future timestamp
-/// can't be accepted and permanently freeze a client.
+/// clock. This is the forward-looking guard that makes the anti-rollback
+/// high-water mark in [`SignedSnapshot::verify_fresh`] safe: a far-future
+/// `created_at` can't be accepted and then permanently freeze out later
+/// legitimate snapshots. (A client persists the high-water mark and passes it to
+/// `verify_fresh`; that caller wiring is the remaining integration step.)
 const MAX_FUTURE_SKEW: u64 = 300;
 
 /// The relay set at a moment in time, as observed by the signing witnesses.

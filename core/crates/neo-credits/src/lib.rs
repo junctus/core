@@ -124,6 +124,11 @@ impl Issuer {
     /// Redeem a credit: recompute the OPRF over its serial under the current key
     /// (or the previous key during the post-rotation grace window), check the
     /// token, and reject double-spends within that key's epoch.
+    ///
+    /// This uses the issuer's own (non-verifiable) `evaluate`, so it is sound only
+    /// when the issuer *is* the verifier (as here). It is not a third-party-
+    /// verifiable spend proof — that would require the VOPRF verification path with
+    /// a DLEQ proof, as issuance already uses.
     pub fn redeem(&mut self, credit: &Credit) -> Result<()> {
         // Current key.
         if token_matches(&self.current, credit) {

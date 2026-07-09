@@ -216,7 +216,9 @@ pub fn encrypt_and_slice(
 /// Each share's MAC is verified under `key`; a share that fails is dropped and
 /// treated as an **erasure**, so a single relay corrupting its shard can be
 /// routed around (given `n - k` redundancy) instead of poisoning the whole
-/// reconstruction — and the bad share is attributable by index.
+/// reconstruction. (A corrupt shard is *detected* by its MAC and dropped; this
+/// function does not currently surface *which* index failed to the caller — no
+/// per-index attribution is exposed.)
 pub fn reassemble_and_decrypt(key: &[u8; KEY_LEN], shares: &[Share]) -> Result<Vec<u8>> {
     // Keep only authentic shares. A failing MAC = a corrupt/forged shard.
     let authentic: Vec<&Share> = shares.iter().filter(|s| s.is_authentic(key)).collect();

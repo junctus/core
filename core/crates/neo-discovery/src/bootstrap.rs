@@ -60,6 +60,11 @@ impl BootstrapRecord {
     /// Verify the record against a set of trusted bootstrap keys at time `now`.
     /// The signing key must be trusted and the signature valid; `not_before`
     /// (a previously-seen `created_at`) rejects rollback to an older record.
+    ///
+    /// The `not_before` anti-rollback is a correct primitive, but realizing DoH
+    /// rendezvous rollback protection requires a *caller* that persists the last
+    /// accepted `created_at` and passes it here — that client wiring is the
+    /// remaining integration step (pass `0` on the first run).
     pub fn verify(&self, trusted_keys: &[[u8; 32]], not_before: u64) -> Result<()> {
         self.check_limits()?;
         if !trusted_keys.contains(&self.bootstrap_key) {
