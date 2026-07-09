@@ -23,7 +23,12 @@
 //! The **key-confirmation (m3)** flight means the responder never treats the
 //! session as live — or emits application data — until it has proof the
 //! initiator derived the same key and is live, so a replayed or forged m1 can
-//! never establish a confirmed session.
+//! never establish a confirmed *session*. Note this is about session
+//! establishment, not replay prevention: m1 carries no anti-replay nonce, so a
+//! replayed m1 (after the attacker completes the cheap cookie round-trip) still
+//! costs the responder one ML-KEM encapsulation + Ed25519 signature before it is
+//! rejected at m3 — a bounded per-connection CPU cost, mitigated (not eliminated)
+//! by the cookie and the accept-loop concurrency cap.
 //!
 //! Not a formally analyzed Noise pattern — it is a straightforward signed hybrid
 //! KEX and must be reviewed/audited before real use (see `docs/CRYPTO.md`).
@@ -43,13 +48,20 @@ use crate::session::Session;
 const DOMAIN: &[u8] = b"neo-handshake-v1";
 const COOKIE_DOMAIN: &[u8] = b"neo-handshake-cookie-v1";
 
-/// A responder's ephemeral secret for stateless anti-DoS cookies.
+/// A responder's ephemeral secret for anti-DoS retry cookies.
 ///
-/// Generated fresh **per accepted connection**, so it needs no rotation and no
-/// cross-connection state — it only has to survive the single cookie
-/// round-trip. The cookie is a cheap MAC the responder issues *before* doing any
-/// ML-KEM work; the initiator must echo it in a re-sent m1. A replayed or
-/// connect-and-abandon m1 therefore costs only a MAC, never a KEM encapsulation.
+/// Generated fresh **per accepted connection**, so it keeps no cross-connection
+/// lookup table (verification is recomputed) — it only has to survive the single
+/// cookie round-trip. The cookie is a cheap MAC the responder issues *before*
+/// doing any ML-KEM work; the initiator must echo it in a re-sent m1, so a
+/// replayed or connect-and-abandon m1 costs only a MAC, never a KEM encapsulation.
+///
+/// **Scope, stated honestly.** The cookie is *not* source-address-bound and the
+/// responder still holds a socket + per-connection state across the round-trip, so
+/// over TCP it provides **no** anti-spoofing / amplification guarantee — it only
+/// gates ML-KEM work behind an already-established connection. (For a future UDP
+/// transport the cookie must bind the source address and use a rotating global
+/// secret to be genuinely stateless.)
 pub struct CookieKey([u8; 32]);
 
 impl CookieKey {

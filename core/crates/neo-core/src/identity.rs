@@ -40,7 +40,10 @@ pub const KEM_PUBLIC_LEN: usize = 1184;
 /// Length of an Ed25519 signature.
 pub const SIGNATURE_LEN: usize = 64;
 
-/// A stable, self-certifying node identifier: BLAKE3 over the public keys.
+/// A stable, self-certifying node identifier: BLAKE3 over the **signing, KEX, and
+/// KEM** public keys. (The Ristretto routing/Sphinx key is *not* in the id hash —
+/// it is derived deterministically from the signing seed and authenticated by the
+/// record signature, not self-certified by the id.)
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId([u8; 32]);
 
