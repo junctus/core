@@ -21,8 +21,9 @@ use anyhow::{bail, Context, Result};
 use neo_core::{NodeId, NodeIdentity};
 use neo_crypto::ReplayCache;
 use neo_discovery::{now_unix, PeerRecord};
-use neo_node::forward::{handle_onion_shared, Hop, Outcome};
-use tokio::net::TcpListener;
+use neo_node::circuit::ExitPolicy;
+use neo_node::forward::{Hop, Outcome};
+use neo_node::serve::{serve_connection, Served};
 
 use crate::defaults::DiscoveryConfig;
 use crate::discovery;
@@ -55,7 +56,7 @@ pub async fn run_relay(
     exit: bool,
     cfg: DiscoveryConfig,
 ) -> Result<()> {
-    let listener = TcpListener::bind(bind)
+    let listener = neo_node::netif::listen_scoped(bind)
         .await
         .with_context(|| format!("binding relay listener on {bind}"))?;
     let local = listener.local_addr()?;
@@ -122,7 +123,20 @@ pub async fn run_relay(
     // concurrent in-flight handshakes so a connection flood can't exhaust the host.
     let identity = Arc::new(identity);
     let handshakes = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
-    println!("forwarding onions (Ctrl-C to stop)");
+    // Production exit policy: never splice to non-public targets, and only offer
+    // clearnet exit at all when this relay was started with `--exit`.
+    let policy = ExitPolicy {
+        allow_loopback: false,
+        offer_exit: exit,
+    };
+    println!(
+        "serving onions and circuits{} (Ctrl-C to stop)",
+        if exit {
+            " — clearnet exit enabled"
+        } else {
+            ""
+        }
+    );
     loop {
         let (stream, _peer) = match listener.accept().await {
             Ok(x) => x,
@@ -141,30 +155,30 @@ pub async fn run_relay(
         let replay = replay.clone();
         tokio::spawn(async move {
             let _permit = permit; // released when the connection finishes
-            let (mut stream, mut result) =
-                match neo_node::run::responder_handshake(stream, &identity).await {
-                    Ok(x) => x,
-                    Err(e) => {
-                        tracing::warn!("handshake failed: {e}");
-                        return;
-                    }
-                };
+            let (stream, result) = match neo_node::run::responder_handshake(stream, &identity).await
+            {
+                Ok(x) => x,
+                Err(e) => {
+                    tracing::warn!("handshake failed: {e}");
+                    return;
+                }
+            };
             // Snapshot the address book so the borrow doesn't cross await.
             let addrs = resolver.read().expect("resolver lock").clone();
-            match handle_onion_shared(&identity, &mut stream, &mut result.session, &addrs, &replay)
-                .await
+            match serve_connection(&identity, stream, result.session, &addrs, &replay, policy).await
             {
-                Ok(Outcome::Delivered { payload }) => {
+                Ok(Served::Message(Outcome::Delivered { payload })) => {
                     println!(
                         "delivered {} bytes: {}",
                         payload.len(),
                         String::from_utf8_lossy(&payload)
                     );
                 }
-                Ok(Outcome::Forwarded { next }) => {
+                Ok(Served::Message(Outcome::Forwarded { next })) => {
                     tracing::info!("forwarded onion to {next}");
                 }
-                Err(e) => tracing::warn!("onion handling failed: {e}"),
+                Ok(Served::Circuit) => tracing::info!("circuit connection closed"),
+                Err(e) => tracing::warn!("connection handling failed: {e}"),
             }
         });
     }

@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use neo_core::NodeIdentity;
 use tokio::net::TcpListener;
@@ -50,6 +51,11 @@ enum Command {
         /// Offer clearnet exit (relay mode, opt-in, off by default).
         #[arg(long)]
         exit: bool,
+        /// Pin this node's own sockets to a network interface (name like `en0`
+        /// or a numeric index), so a default-route VPN on the host doesn't
+        /// capture the relay's forwarding/exit traffic. Loopback stays unscoped.
+        #[arg(long)]
+        net_interface: Option<String>,
         /// Listen address: the relay bind (relay mode) or manual M1 responder.
         #[arg(long, conflicts_with = "connect")]
         listen: Option<String>,
@@ -109,6 +115,10 @@ enum Command {
         #[arg(long)]
         threshold: Option<usize>,
     },
+    /// Print the baked-in (or env-resolved) discovery defaults as JSON: the
+    /// mirrors, trusted witness keys, and threshold a client uses with no
+    /// overrides. Lets a GUI prefill its fields and show exactly what it trusts.
+    Defaults,
     /// Send a one-shot message through a multi-hop onion circuit of discovered
     /// relays. Each relay peels one layer and forwards; only the exit reads it.
     Send {
@@ -198,6 +208,7 @@ async fn main() -> anyhow::Result<()> {
             relay,
             announce_addr,
             exit,
+            net_interface,
             listen,
             connect,
             mirrors,
@@ -210,6 +221,7 @@ async fn main() -> anyhow::Result<()> {
                 relay,
                 announce_addr,
                 exit,
+                net_interface,
                 listen,
                 connect,
                 mirrors,
@@ -243,6 +255,7 @@ async fn main() -> anyhow::Result<()> {
             witnesses,
             threshold,
         } => show_snapshot(&mirrors, &witnesses, threshold).await?,
+        Command::Defaults => print_defaults()?,
         Command::Send {
             message,
             hops,
@@ -265,6 +278,21 @@ async fn main() -> anyhow::Result<()> {
             keys,
         } => bootstrap_resolve(&resolver, &name, &keys).await?,
     }
+    Ok(())
+}
+
+/// Print the resolved discovery defaults (baked constants, overridable by
+/// `NEO_MIRRORS`/`NEO_WITNESSES`) as JSON, so a GUI can prefill and display the
+/// mirrors and trusted witness keys it will use — no trust-on-first-use needed.
+fn print_defaults() -> anyhow::Result<()> {
+    let cfg = defaults::DiscoveryConfig::resolve(&[], &[], None)?;
+    let witnesses: Vec<String> = cfg.witnesses.iter().map(hex::encode).collect();
+    let value = serde_json::json!({
+        "mirrors": cfg.mirrors,
+        "witnesses": witnesses,
+        "threshold": cfg.threshold,
+    });
+    println!("{}", serde_json::to_string(&value)?);
     Ok(())
 }
 
@@ -322,6 +350,7 @@ struct RunArgs {
     relay: bool,
     announce_addr: Option<String>,
     exit: bool,
+    net_interface: Option<String>,
     listen: Option<String>,
     connect: Option<String>,
     mirrors: Vec<String>,
@@ -329,6 +358,25 @@ struct RunArgs {
     threshold: Option<usize>,
     identity: PathBuf,
     tun: bool,
+}
+
+/// Resolve a `--net-interface` value (an interface name like `en0`, or a numeric
+/// index) to an interface index for socket scoping.
+fn resolve_interface_index(spec: &str) -> anyhow::Result<u32> {
+    if let Ok(index) = spec.parse::<u32>() {
+        if index == 0 {
+            anyhow::bail!("interface index must be non-zero");
+        }
+        return Ok(index);
+    }
+    let name =
+        std::ffi::CString::new(spec).with_context(|| format!("invalid interface name {spec:?}"))?;
+    // if_nametoindex returns 0 for an unknown interface; any nonzero is the index.
+    let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+    if index == 0 {
+        anyhow::bail!("no network interface named {spec:?}");
+    }
+    Ok(index)
 }
 
 /// Dispatch `neo run` to the right role: TUN tunnel, manual M1, relay, or the
@@ -347,6 +395,11 @@ async fn run_command(args: RunArgs) -> anyhow::Result<()> {
     let cfg = defaults::DiscoveryConfig::resolve(&args.mirrors, &args.witnesses, args.threshold);
 
     if args.relay {
+        if let Some(spec) = args.net_interface.as_deref() {
+            let index = resolve_interface_index(spec)?;
+            neo_node::netif::set_bound_interface(index);
+            println!("scoping relay sockets to interface {spec} (index {index})");
+        }
         let identity = roles::load_or_create_identity(&args.identity)?;
         let bind = args.listen.as_deref().unwrap_or("0.0.0.0:9000");
         let cfg = cfg?;

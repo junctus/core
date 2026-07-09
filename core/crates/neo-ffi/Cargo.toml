@@ -17,4 +17,17 @@ uniffi = ["dep:uniffi"]
 
 [dependencies]
 neo-core.workspace = true
+neo-crypto.workspace = true
+neo-node.workspace = true
+neo-mix.workspace = true
+neo-netstack.workspace = true
+neo-discovery.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+reqwest.workspace = true
+getrandom.workspace = true
+hex.workspace = true
 uniffi = { version = "0.29", optional = true }
+
+[dev-dependencies]
+neo-dataplane.workspace = true

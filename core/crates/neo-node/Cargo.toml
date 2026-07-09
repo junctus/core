@@ -18,12 +18,16 @@ neo-slicing.workspace = true
 neo-routing.workspace = true
 neo-mix.workspace = true
 neo-dataplane.workspace = true
+neo-netstack.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 blake3.workspace = true
+socket2.workspace = true
 
 [dev-dependencies]
 # Frontier crates, used only by the M10–M13 capstone integration test.
 neo-credits.workspace = true
 neo-verify.workspace = true
 neo-mpc.workspace = true
+# A smoltcp client that dials through the netstack in the tunnel-stack test.
+smoltcp.workspace = true

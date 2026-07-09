@@ -186,8 +186,10 @@ pub async fn open_circuit(
 
     let (stream, result) = connect(&circuit[0].addr, identity).await?;
     let (mut sealer, opener) = result.session.split();
-    let setup = sealer.seal(&packet.to_bytes())?;
     let (r, mut w) = stream.into_split();
+    // Declare the circuit mode, then send the setup packet.
+    write_frame(&mut w, &sealer.seal(&[crate::run::FRAME_CIRCUIT])?).await?;
+    let setup = sealer.seal(&packet.to_bytes())?;
     write_frame(&mut w, &setup).await?;
 
     Ok((
@@ -244,7 +246,8 @@ pub async fn serve_circuit<R: NextHop>(
             let (next_stream, next_result) = connect(&addr, identity).await?;
             let (mut ns_sealer, ns_opener) = next_result.session.split();
             let (nr, mut nw) = next_stream.into_split();
-            // Forward the setup packet on to the next hop.
+            // Propagate the circuit mode, then forward the setup packet on.
+            write_frame(&mut nw, &ns_sealer.seal(&[crate::run::FRAME_CIRCUIT])?).await?;
             let fwd_setup = ns_sealer.seal(&packet.to_bytes())?;
             write_frame(&mut nw, &fwd_setup).await?;
             relay_pump(
@@ -253,6 +256,13 @@ pub async fn serve_circuit<R: NextHop>(
             .await
         }
         Processed::Deliver { payload } => {
+            // Only a node that opted into exit may splice to the clearnet; a plain
+            // relay that finds itself the terminal hop refuses rather than proxy.
+            if !policy.offer_exit {
+                return Err(Error::Config(
+                    "this node is the circuit exit but does not offer clearnet exit".into(),
+                ));
+            }
             let target = String::from_utf8(payload)
                 .map_err(|_| Error::Decode("circuit target not valid utf-8".into()))?;
             exit_splice(secret, &target, pr, pr_opener, pw, pw_sealer, policy).await
@@ -269,6 +279,10 @@ pub async fn serve_circuit<R: NextHop>(
 pub struct ExitPolicy {
     /// Permit loopback splice targets (local dev/test only).
     pub allow_loopback: bool,
+    /// Whether this node offers clearnet exit at all. When false, the node
+    /// refuses to splice even if a circuit terminates at it (defence in depth:
+    /// only exit-flagged relays should be picked as an exit in the first place).
+    pub offer_exit: bool,
 }
 
 /// A middle relay: strip one forward layer toward the exit, add one return layer
@@ -355,7 +369,7 @@ async fn exit_splice(
     }
     let tcp = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        TcpStream::connect(target),
+        crate::netif::connect_scoped(target),
     )
     .await
     .map_err(|_| Error::Config("exit target connect timed out".into()))??;
@@ -456,7 +470,8 @@ mod tests {
             let identity = NodeIdentity::from_bytes(&id_bytes).unwrap();
             let (stream, result) = accept(&listener, &identity).await.unwrap();
             let replay = Mutex::new(ReplayCache::new());
-            serve_circuit(
+            // Go through the real relay dispatch so the mode frame is consumed.
+            crate::serve::serve_connection(
                 &identity,
                 stream,
                 result.session,
@@ -464,9 +479,11 @@ mod tests {
                 &replay,
                 ExitPolicy {
                     allow_loopback: true,
+                    offer_exit: true,
                 },
             )
             .await
+            .map(|_| ())
         });
         (addr, handle)
     }
@@ -591,6 +608,9 @@ mod tests {
             let (mut pr, mut pw) = prev.into_split();
             let (mut pw_sealer, mut pr_opener) = prev_res.session.split();
 
+            let _mode = pr_opener
+                .open(&read_frame(&mut pr).await.unwrap())
+                .unwrap();
             let setup = read_frame(&mut pr).await.unwrap();
             let packet = SphinxPacket::from_bytes(&pr_opener.open(&setup).unwrap()).unwrap();
             let secret = identity.sphinx_shared(packet.alpha()).unwrap();
@@ -604,6 +624,9 @@ mod tests {
             let (next, next_res) = connect(&exit_dst, &identity).await.unwrap();
             let (mut ns_sealer, mut ns_opener) = next_res.session.split();
             let (mut nr, mut nw) = next.into_split();
+            write_frame(&mut nw, &ns_sealer.seal(&[crate::run::FRAME_CIRCUIT]).unwrap())
+                .await
+                .unwrap();
             write_frame(&mut nw, &ns_sealer.seal(&packet.to_bytes()).unwrap())
                 .await
                 .unwrap();
@@ -667,6 +690,9 @@ mod tests {
             let (prev, prev_res) = accept(&listener, &identity).await.unwrap();
             let (mut pr, mut pw) = prev.into_split();
             let (mut pw_sealer, mut pr_opener) = prev_res.session.split();
+            let _mode = pr_opener
+                .open(&read_frame(&mut pr).await.unwrap())
+                .unwrap();
             let setup = read_frame(&mut pr).await.unwrap();
             let packet = SphinxPacket::from_bytes(&pr_opener.open(&setup).unwrap()).unwrap();
             let secret = identity.sphinx_shared(packet.alpha()).unwrap();
@@ -679,6 +705,9 @@ mod tests {
             let (next, next_res) = connect(&exit_dst, &identity).await.unwrap();
             let (mut ns_sealer, mut ns_opener) = next_res.session.split();
             let (mut nr, mut nw) = next.into_split();
+            write_frame(&mut nw, &ns_sealer.seal(&[crate::run::FRAME_CIRCUIT]).unwrap())
+                .await
+                .unwrap();
             write_frame(&mut nw, &ns_sealer.seal(&packet.to_bytes()).unwrap())
                 .await
                 .unwrap();
@@ -734,5 +763,44 @@ mod tests {
                 .is_err(),
             "a replayed return cell must be rejected (out of sequence)"
         );
+    }
+
+    #[tokio::test]
+    async fn a_relay_without_exit_enabled_refuses_to_splice() {
+        // A node that is the circuit's terminal hop but was not started with exit
+        // enabled must refuse to splice to the target, tearing the circuit down.
+        let echo_addr = spawn_echo().await;
+        let exit = NodeIdentity::generate().unwrap();
+        let client = NodeIdentity::generate().unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let exit_addr = listener.local_addr().unwrap().to_string();
+        let exit_bytes = exit.to_bytes();
+        tokio::spawn(async move {
+            let identity = NodeIdentity::from_bytes(&exit_bytes).unwrap();
+            let (stream, result) = accept(&listener, &identity).await.unwrap();
+            let replay = Mutex::new(ReplayCache::new());
+            let _ = crate::serve::serve_connection(
+                &identity,
+                stream,
+                result.session,
+                &HashMap::<NodeId, String>::new(),
+                &replay,
+                ExitPolicy {
+                    allow_loopback: true,
+                    offer_exit: false, // exit NOT offered
+                },
+            )
+            .await;
+        });
+
+        let circuit = vec![hop_of(&exit, &exit_addr)];
+        let (mut sink, mut stream) = open_circuit(&client, &circuit, &echo_addr).await.unwrap();
+        let _ = sink.send(b"should never reach the target").await;
+        // No splice happens, so no return bytes ever arrive — the circuit is dead.
+        let res = tokio::time::timeout(Duration::from_secs(5), stream.recv())
+            .await
+            .expect("recv resolves in time");
+        assert!(res.is_err(), "a non-exit relay must refuse to splice");
     }
 }

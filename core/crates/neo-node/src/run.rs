@@ -25,6 +25,18 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// allocation an attacker can trigger with a forged length prefix.
 const MAX_FRAME: usize = 64 * 1024;
 
+/// Connection mode: the first sealed frame a peer sends after the handshake is a
+/// single mode byte declaring how the rest of the connection behaves, so one
+/// relay port serves both one-shot onion messages and persistent circuits. The
+/// mode is carried inside the session (authenticated by the immediate peer) and
+/// re-sent to each next hop, so it propagates along the path.
+///
+/// A one-shot Sphinx onion message (`neo send`, forwarded/delivered once).
+pub const FRAME_MESSAGE: u8 = 1;
+/// A persistent TCP-over-onion circuit (setup packet, then streamed cells; the
+/// exit splices a real TCP connection).
+pub const FRAME_CIRCUIT: u8 = 2;
+
 /// Write a length-prefixed frame to any writer (a stream or a split write half).
 pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, data: &[u8]) -> Result<()> {
     writer.write_all(&(data.len() as u32).to_be_bytes()).await?;
@@ -49,7 +61,7 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>>
 /// Dial `addr` and run the initiator side of the handshake: init → cookie
 /// challenge → cookied init → m2 → key-confirmation m3.
 pub async fn connect(addr: &str, identity: &NodeIdentity) -> Result<(TcpStream, HandshakeResult)> {
-    let mut stream = TcpStream::connect(addr).await?;
+    let mut stream = crate::netif::connect_scoped(addr).await?;
     let (state, init1) = initiator_message1(identity)?;
     write_frame(&mut stream, &init1).await?;
     // Anti-DoS cookie round-trip: echo the responder's challenge in a re-sent m1.

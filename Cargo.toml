@@ -25,12 +25,14 @@ neo-credits = { path = "core/crates/neo-credits" }
 neo-mpc = { path = "core/crates/neo-mpc" }
 neo-verify = { path = "core/crates/neo-verify" }
 neo-dataplane = { path = "core/crates/neo-dataplane" }
+neo-netstack = { path = "core/crates/neo-netstack" }
 neo-node = { path = "core/crates/neo-node" }
 neo-ffi = { path = "core/crates/neo-ffi" }
 neo-seed = { path = "core/crates/neo-seed" }
 
 # External
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+socket2 = { version = "0.5", features = ["all"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 anyhow = "1"
@@ -58,6 +60,7 @@ hex = "0.4"
 serde_json = "1"
 axum = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+smoltcp = { version = "0.13", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp"] }
 
 [profile.release]
 lto = "thin"

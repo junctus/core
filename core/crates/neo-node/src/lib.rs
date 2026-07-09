@@ -12,9 +12,12 @@
 
 pub mod circuit;
 pub mod forward;
+pub mod netif;
 pub mod run;
+pub mod serve;
 pub mod stream;
 pub mod tunnel;
+pub mod tunnel_stack;
 
 use neo_core::{NodeConfig, NodeId, NodeIdentity};
 

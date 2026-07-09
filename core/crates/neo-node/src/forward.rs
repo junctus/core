@@ -99,6 +99,8 @@ pub fn build_onion(circuit: &[Hop], payload: &[u8]) -> Result<(Vec<u8>, String)>
 pub async fn send_onion(identity: &NodeIdentity, circuit: &[Hop], payload: &[u8]) -> Result<()> {
     let (packet_bytes, first_addr) = build_onion(circuit, payload)?;
     let (mut stream, mut result) = connect(&first_addr, identity).await?;
+    // Declare the connection mode, then hand over the onion.
+    write_frame(&mut stream, &result.session.seal(&[crate::run::FRAME_MESSAGE])?).await?;
     let frame = result.session.seal(&packet_bytes)?;
     write_frame(&mut stream, &frame).await?;
     Ok(())
@@ -186,6 +188,8 @@ async fn forward_packet(
     packet: &SphinxPacket,
 ) -> Result<()> {
     let (mut stream, mut result) = connect(next_addr, identity).await?;
+    // Propagate the message mode to the next hop, then the peeled packet.
+    write_frame(&mut stream, &result.session.seal(&[crate::run::FRAME_MESSAGE])?).await?;
     let frame = result.session.seal(&packet.to_bytes())?;
     write_frame(&mut stream, &frame).await?;
     Ok(())
@@ -218,6 +222,12 @@ mod tests {
         let handle = tokio::spawn(async move {
             let identity = NodeIdentity::from_bytes(&identity_bytes).unwrap();
             let (mut stream, mut result) = accept(&listener, &identity).await.unwrap();
+            // Consume the connection-mode frame the peer sends first.
+            let mode = result
+                .session
+                .open(&crate::run::read_frame(&mut stream).await.unwrap())
+                .unwrap();
+            assert_eq!(mode, [crate::run::FRAME_MESSAGE]);
             let mut cache = ReplayCache::new();
             handle_onion_with_cache(
                 &identity,
@@ -291,6 +301,10 @@ mod tests {
         let relay_task: JoinHandle<Result<Outcome>> = tokio::spawn(async move {
             let identity = NodeIdentity::from_bytes(&relay_bytes).unwrap();
             let (mut stream, mut result) = accept(&listener, &identity).await.unwrap();
+            let _mode = result
+                .session
+                .open(&crate::run::read_frame(&mut stream).await.unwrap())
+                .unwrap();
             let empty: HashMap<NodeId, String> = HashMap::new();
             let mut cache = ReplayCache::new();
             handle_onion_with_cache(

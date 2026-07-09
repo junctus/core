@@ -1,0 +1,16 @@
+[package]
+name = "neo-netstack"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Userspace TCP/IP stack: intercepts a TUN's IP packets into TCP flows for tunneling."
+
+[dependencies]
+neo-core.workspace = true
+smoltcp.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "io-util"] }
