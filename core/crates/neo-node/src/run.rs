@@ -5,6 +5,8 @@
 //! (QUIC / MASQUE / WebRTC) arrives in milestone M6 and slots in behind these
 //! same handshake calls.
 
+use std::time::Duration;
+
 use neo_core::{Error, NodeIdentity, Result};
 use neo_crypto::{
     initiator_finish, initiator_message1, responder_confirm, responder_cookie, responder_process,
@@ -12,6 +14,10 @@ use neo_crypto::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+/// A handshake (either side) must complete within this bound, so a stalled or
+/// slowloris peer cannot hold a connection/slot open indefinitely.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Reject absurd frame sizes early. The largest legitimate frame is a PQ-hybrid
 /// handshake message (~2.5 KB: two ML-KEM keys) or a fixed-size onion packet
@@ -65,16 +71,31 @@ pub async fn accept(
     listener: &TcpListener,
     identity: &NodeIdentity,
 ) -> Result<(TcpStream, HandshakeResult)> {
-    let (mut stream, _peer_addr) = listener.accept().await?;
-    let cookie_key = CookieKey::generate()?;
-    let init1 = read_frame(&mut stream).await?;
-    let challenge = responder_cookie(&cookie_key, &init1)?;
-    write_frame(&mut stream, &challenge).await?;
-    let init2 = read_frame(&mut stream).await?;
-    let (msg2, pending) = responder_process(identity, &init2, &cookie_key)?;
-    write_frame(&mut stream, &msg2).await?;
-    let msg3 = read_frame(&mut stream).await?;
-    let result = responder_confirm(pending, &msg3)?;
+    let (stream, _peer_addr) = listener.accept().await?;
+    responder_handshake(stream, identity).await
+}
+
+/// Run the responder handshake on an already-accepted `stream`. Split out from
+/// [`accept`] so a server can `listener.accept()` cheaply on its accept loop and
+/// run this (the slow part) in a spawned per-connection task — a stalled client
+/// then can't head-of-line-block new connections. Bounded by [`HANDSHAKE_TIMEOUT`].
+pub async fn responder_handshake(
+    mut stream: TcpStream,
+    identity: &NodeIdentity,
+) -> Result<(TcpStream, HandshakeResult)> {
+    let result = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+        let cookie_key = CookieKey::generate()?;
+        let init1 = read_frame(&mut stream).await?;
+        let challenge = responder_cookie(&cookie_key, &init1)?;
+        write_frame(&mut stream, &challenge).await?;
+        let init2 = read_frame(&mut stream).await?;
+        let (msg2, pending) = responder_process(identity, &init2, &cookie_key)?;
+        write_frame(&mut stream, &msg2).await?;
+        let msg3 = read_frame(&mut stream).await?;
+        responder_confirm(pending, &msg3)
+    })
+    .await
+    .map_err(|_| Error::Crypto("responder handshake timed out".into()))??;
     Ok((stream, result))
 }
 

@@ -116,46 +116,62 @@ pub async fn run_relay(
     // rejected (a per-connection cache would make replay defense a no-op).
     let replay = Arc::new(std::sync::Mutex::new(ReplayCache::new()));
 
-    // Serve onions forever, one task per connection so a slow forward (dialing
-    // the next hop) never blocks accepting new ones.
+    // Serve onions forever. The accept loop only does the cheap `listener.accept()`;
+    // the (slow) responder handshake and onion handling run in a spawned task, so a
+    // slowloris client can't head-of-line-block new connections. A semaphore bounds
+    // concurrent in-flight handshakes so a connection flood can't exhaust the host.
     let identity = Arc::new(identity);
+    let handshakes = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
     println!("forwarding onions (Ctrl-C to stop)");
     loop {
-        match neo_node::run::accept(&listener, &identity).await {
-            Ok((mut stream, mut result)) => {
-                let identity = identity.clone();
-                let resolver = resolver.clone();
-                let replay = replay.clone();
-                tokio::spawn(async move {
-                    // Snapshot the address book so the borrow doesn't cross await.
-                    let addrs = resolver.read().expect("resolver lock").clone();
-                    match handle_onion_shared(
-                        &identity,
-                        &mut stream,
-                        &mut result.session,
-                        &addrs,
-                        &replay,
-                    )
-                    .await
-                    {
-                        Ok(Outcome::Delivered { payload }) => {
-                            println!(
-                                "delivered {} bytes: {}",
-                                payload.len(),
-                                String::from_utf8_lossy(&payload)
-                            );
-                        }
-                        Ok(Outcome::Forwarded { next }) => {
-                            tracing::info!("forwarded onion to {next}");
-                        }
-                        Err(e) => tracing::warn!("onion handling failed: {e}"),
-                    }
-                });
+        let (stream, _peer) = match listener.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::warn!("accept failed: {e}");
+                continue;
             }
-            Err(e) => tracing::warn!("accept/handshake failed: {e}"),
-        }
+        };
+        // Over the concurrency cap: drop this connection rather than queue unbounded.
+        let Ok(permit) = handshakes.clone().try_acquire_owned() else {
+            tracing::warn!("handshake concurrency cap reached; dropping a connection");
+            continue;
+        };
+        let identity = identity.clone();
+        let resolver = resolver.clone();
+        let replay = replay.clone();
+        tokio::spawn(async move {
+            let _permit = permit; // released when the connection finishes
+            let (mut stream, mut result) =
+                match neo_node::run::responder_handshake(stream, &identity).await {
+                    Ok(x) => x,
+                    Err(e) => {
+                        tracing::warn!("handshake failed: {e}");
+                        return;
+                    }
+                };
+            // Snapshot the address book so the borrow doesn't cross await.
+            let addrs = resolver.read().expect("resolver lock").clone();
+            match handle_onion_shared(&identity, &mut stream, &mut result.session, &addrs, &replay)
+                .await
+            {
+                Ok(Outcome::Delivered { payload }) => {
+                    println!(
+                        "delivered {} bytes: {}",
+                        payload.len(),
+                        String::from_utf8_lossy(&payload)
+                    );
+                }
+                Ok(Outcome::Forwarded { next }) => {
+                    tracing::info!("forwarded onion to {next}");
+                }
+                Err(e) => tracing::warn!("onion handling failed: {e}"),
+            }
+        });
     }
 }
+
+/// Concurrent responder handshakes a relay allows in flight, bounding memory/FD use.
+const MAX_CONCURRENT_HANDSHAKES: usize = 512;
 
 /// Background task: periodically rebuild the relay's `NodeId → addr` book from
 /// the verified snapshot so it can forward to any healthy relay.
