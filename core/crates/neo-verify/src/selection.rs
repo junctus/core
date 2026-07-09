@@ -4,27 +4,37 @@
 //! input*. But path selection has two parties who might each want to cheat: the
 //! **client** (grinding request ids until it lands on relays it likes) and the
 //! **beacon** relay that produces the VRF (choosing an input that steers the
-//! client onto attacker paths). This module combines them so **neither** can
-//! bias the result, and anyone can verify it.
+//! client onto attacker paths). This module combines them so neither can bias
+//! the result **for a fixed commitment**, and anyone can verify it.
 //!
 //! Construction (commit-then-VRF):
-//! 1. The client draws a random nonce and publishes only its **commitment**
-//!    `H(nonce)`. It is bound before it can see any VRF output.
+//! 1. The client commits to a value it cannot vary per attempt — derive it from a
+//!    **beacon-independent epoch and a monotonic counter** via [`epoch_commitment`]
+//!    — and publishes only the **commitment** `H(input)`, bound before it can see
+//!    any VRF output.
 //! 2. The beacon computes a VRF over that commitment. Because a VRF is a
 //!    *function* of its input, the beacon has exactly one possible output for
 //!    the client's commitment — it cannot try alternatives.
 //! 3. The final path seed is `H(domain ‖ commitment ‖ vrf_output)`. The client
 //!    couldn't grind it (the VRF output was unknown at commit time); the beacon
-//!    couldn't grind it (its output was fixed by the commitment). Anyone with
-//!    the beacon's VRF public key verifies the proof and recomputes the seed.
+//!    couldn't grind it (its output was fixed by the commitment).
 //!
-//! Feed the seed to `neo_routing::Router::select_path_seeded` for a verifiably
-//! fair, unbiasable path.
+//! **Residual — beacon abort-grinding (mitigated, not eliminated).** A beacon that
+//! computes the seed *before* replying could selectively **abort** to force a
+//! fresh draw. Deriving the commitment from `(epoch, counter)` defeats this:
+//! retrying the same `(epoch, counter)` reproduces the *identical* commitment,
+//! VRF output, and seed, so an abort yields no new sample. A beacon that then
+//! *persistently* aborts is a detectable liveness fault — log it, rotate the
+//! beacon, or use a threshold of beacons (roadmap). It is no longer a silent bias.
+//!
+//! Feed the seed to `neo_routing::Router::select_path_seeded` for a verifiable,
+//! abort-resistant path.
 
 use crate::vrf::{self, VrfKeypair, VrfProof};
 
 const COMMIT_DOMAIN: &[u8] = b"neo-selection-commit-v1";
 const SEED_DOMAIN: &[u8] = b"neo-selection-seed-v1";
+const EPOCH_DOMAIN: &[u8] = b"neo-selection-epoch-v1";
 
 /// A client's commitment to its selection nonce: `blake3(domain ‖ nonce)`.
 ///
@@ -35,6 +45,19 @@ pub fn commitment(nonce: &[u8]) -> [u8; 32] {
     hasher.update(COMMIT_DOMAIN);
     hasher.update(nonce);
     *hasher.finalize().as_bytes()
+}
+
+/// The recommended commitment for path selection: bound to a **beacon-independent
+/// epoch** and a **monotonic counter** rather than a fresh random nonce, so a
+/// beacon that aborts to force a re-draw gets the *identical* commitment (and thus
+/// the identical seed) on retry — defeating abort-grinding. Advance `counter` only
+/// to intentionally request a new draw, never merely because a beacon aborted.
+pub fn epoch_commitment(epoch: u64, counter: u64) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(EPOCH_DOMAIN);
+    hasher.update(&epoch.to_be_bytes());
+    hasher.update(&counter.to_be_bytes());
+    commitment(hasher.finalize().as_bytes())
 }
 
 /// Beacon side: produce the VRF over the client's commitment plus the path seed.
@@ -114,6 +137,21 @@ mod tests {
         let (_, seed_a) = beacon_respond(&beacon, &commitment(b"nonce-a"));
         let (_, seed_b) = beacon_respond(&beacon, &commitment(b"nonce-b"));
         assert_ne!(seed_a, seed_b);
+    }
+
+    #[test]
+    fn epoch_commitment_is_deterministic_so_aborts_dont_re_draw() {
+        // Same (epoch, counter) ⇒ same commitment ⇒ same seed on retry, so a
+        // beacon abort gains no fresh sample. Advancing the counter re-draws.
+        let beacon = VrfKeypair::generate();
+        let (_, seed1) = beacon_respond(&beacon, &epoch_commitment(7, 0));
+        let (_, seed2) = beacon_respond(&beacon, &epoch_commitment(7, 0));
+        assert_eq!(
+            seed1, seed2,
+            "a retried (epoch, counter) reproduces the seed"
+        );
+        let (_, seed3) = beacon_respond(&beacon, &epoch_commitment(7, 1));
+        assert_ne!(seed1, seed3, "advancing the counter is a fresh draw");
     }
 
     #[test]
