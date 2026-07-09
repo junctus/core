@@ -17,6 +17,10 @@ use neo_discovery::{now_unix, PeerRecord};
 pub const SNAPSHOT_TTL: u64 = 3600;
 /// Consecutive failed health checks before a relay is dropped.
 pub const MAX_STRIKES: u32 = 3;
+/// Maximum relays a seed will hold, bounding memory against a registration flood.
+/// New registrations beyond this are refused until entries age out (strikes /
+/// expiry); already-known relays may still refresh.
+pub const MAX_ENTRIES: usize = 100_000;
 
 /// A registry entry: the record plus this seed's health accounting.
 #[derive(Clone, Debug)]
@@ -79,6 +83,11 @@ impl Registry {
                 Ok(true)
             }
             None => {
+                if self.entries.len() >= MAX_ENTRIES {
+                    return Err(neo_core::Error::Config(
+                        "seed registry is at capacity".into(),
+                    ));
+                }
                 self.entries.insert(
                     record.id,
                     Entry {

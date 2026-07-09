@@ -239,19 +239,43 @@ fn client_ip(headers: &HeaderMap, peer: IpAddr, trusted_proxies: &[IpAddr]) -> I
         .unwrap_or(peer)
 }
 
+/// Relays dial-backed per sweep, bounding sweep cost against a registration flood.
+const MAX_DIAL_PER_SWEEP: usize = 2_000;
+/// Concurrent dial-backs in flight (a slow/black-holing relay can't stall the rest).
+const DIAL_CONCURRENCY: usize = 64;
+
 fn spawn_health_loop(state: Arc<AppState>, interval: Duration) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
+        // A slow sweep must not queue up bursts of catch-up ticks.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
-            let due = state.registry.lock().expect("registry").due_for_check();
-            for record in due {
-                let ok = dial_back(&state.prober, &record, state.allow_loopback).await;
-                state
-                    .registry
-                    .lock()
-                    .expect("registry")
-                    .record_health(&record.id, ok);
+            let mut due = state.registry.lock().expect("registry").due_for_check();
+            due.truncate(MAX_DIAL_PER_SWEEP); // bound per-sweep work
+
+            // Dial concurrently in bounded chunks so one black-holing relay can't
+            // serialize/starve the health of every other relay.
+            for chunk in due.chunks(DIAL_CONCURRENCY) {
+                let mut inflight = Vec::with_capacity(chunk.len());
+                for record in chunk {
+                    let prober = NodeIdentity::from_bytes(&state.prober.to_bytes())
+                        .expect("prober round-trips");
+                    let record = record.clone();
+                    let allow = state.allow_loopback;
+                    inflight.push(tokio::spawn(async move {
+                        (record.id, dial_back(&prober, &record, allow).await)
+                    }));
+                }
+                for handle in inflight {
+                    if let Ok((id, ok)) = handle.await {
+                        state
+                            .registry
+                            .lock()
+                            .expect("registry")
+                            .record_health(&id, ok);
+                    }
+                }
             }
             // Re-sign immediately so a newly-healthy (or newly-evicted) relay
             // shows up in `/snapshot` this sweep, not a snapshot-interval later.
