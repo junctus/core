@@ -30,7 +30,6 @@ if ! id neo-seed >/dev/null 2>&1; then
   useradd --system --home /var/lib/neo-seed --shell /usr/sbin/nologin neo-seed
 fi
 install -d -o neo-seed -g neo-seed -m 0750 /var/lib/neo-seed
-install -d -m 0755 /var/log/caddy
 
 echo ">> generating the witness identity (if absent)"
 # Create the witness key up front, owned by the service user. The seed would
@@ -61,6 +60,10 @@ if ! command -v caddy >/dev/null 2>&1; then
   apt-get update
   apt-get install -y caddy
 fi
+
+# The caddy package runs the service as the `caddy` user, so its access-log dir
+# must be writable by that user — created here, after the package has added it.
+install -d -o caddy -g caddy -m 0750 /var/log/caddy
 
 # Install our site config. If the domain isn't the default, patch it in.
 sed "s/discovery\.junctus\.org/${DOMAIN//./\\.}/g" "$HERE/Caddyfile" > /etc/caddy/Caddyfile

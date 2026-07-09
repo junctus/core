@@ -26,9 +26,10 @@ use anyhow::{bail, Context, Result};
 pub const BAKED_MIRRORS: &[&str] = &["https://discovery.junctus.org"];
 
 /// Ed25519 witness public keys (hex) whose signatures a snapshot must carry.
-/// EMPTY until you bake in your seed's witness key — see the module docs.
+/// A client will not accept a snapshot signed only by witnesses absent here.
 pub const BAKED_WITNESSES: &[&str] = &[
-    // "<64-hex-char witness key from `neo seed`/`GET /witness`>",
+    // discovery.junctus.org — the seed at BAKED_MIRRORS[0].
+    "acb813898892f6f11292ddf79d291927fc1f19e77fec1acbaece86c92814972b",
 ];
 
 /// Default minimum number of distinct trusted witnesses that must sign a
@@ -137,9 +138,19 @@ mod tests {
     }
 
     #[test]
-    fn missing_witnesses_is_a_clear_error() {
-        let err = DiscoveryConfig::resolve(&["https://m".to_string()], &[], Some(1)).unwrap_err();
-        assert!(err.to_string().contains("witness"));
+    fn baked_witnesses_are_valid_hex_keys() {
+        // Clients must ship trusting at least one witness, and every baked entry
+        // must decode to a 32-byte Ed25519 key (a typo here would brick discovery
+        // for every distributed client, so guard it at build time).
+        assert!(
+            !BAKED_WITNESSES.is_empty(),
+            "clients must ship with a trusted witness"
+        );
+        for hexkey in BAKED_WITNESSES {
+            let mut key = [0u8; 32];
+            hex::decode_to_slice(hexkey.trim(), &mut key)
+                .unwrap_or_else(|_| panic!("baked witness is not 32-byte hex: {hexkey}"));
+        }
     }
 
     #[test]
