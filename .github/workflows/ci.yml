@@ -49,3 +49,17 @@ jobs:
 
       - name: Compile-check the TUN data plane
         run: cargo build -p neo-cli --features tun
+
+  audit:
+    name: cargo-audit (RustSec advisories)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      # Surface RustSec advisories against the committed lockfile. The known
+      # `sharks 0.5.0` advisory (RUSTSEC-2024-0398) is ignored for now — its path
+      # is test-only and the secrecy caveat is documented (see neo-mpc) pending a
+      # migration to a vetted GF(256) Shamir. Remove the ignore once migrated.
+      - name: Audit dependencies
+        run: cargo audit --deny warnings --ignore RUSTSEC-2024-0398
