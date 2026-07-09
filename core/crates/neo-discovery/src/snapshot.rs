@@ -148,6 +148,28 @@ impl SignedSnapshot {
         Ok(())
     }
 
+    /// As [`verify`](Self::verify), plus **anti-rollback freshness**: the
+    /// snapshot's `created_at` must be at least `high_water_mark` — the newest
+    /// `created_at` this client has previously accepted (persist it across runs).
+    /// A mirror therefore cannot freeze a client on a stale relay set by serving an
+    /// old, still-signed snapshot. Returns the accepted `created_at` so the caller
+    /// can advance its high-water mark. (`high_water_mark = 0` is the first run.)
+    pub fn verify_fresh(
+        &self,
+        trusted: &[[u8; 32]],
+        threshold: usize,
+        now: u64,
+        high_water_mark: u64,
+    ) -> Result<u64> {
+        self.verify(trusted, threshold, now)?;
+        if self.snapshot.created_at < high_water_mark {
+            return Err(Error::Crypto(
+                "snapshot is older than the last accepted one (rollback refused)".into(),
+            ));
+        }
+        Ok(self.snapshot.created_at)
+    }
+
     /// The attested relays still valid at time `now`. Call after
     /// [`verify`](Self::verify).
     pub fn relays(&self, now: u64) -> Vec<&PeerRecord> {
@@ -344,6 +366,26 @@ mod tests {
         forged.exit = true; // breaks the record's own signature
         let signed = witnessed(&[&w], vec![forged]);
         assert!(signed.verify(&[key(&w)], 1, now_unix()).is_err());
+    }
+
+    #[test]
+    fn verify_fresh_refuses_a_rolled_back_snapshot() {
+        let w = NodeIdentity::generate().unwrap();
+        let r = NodeIdentity::generate().unwrap();
+        let trusted = [key(&w)];
+        let now = now_unix();
+
+        let signed = witnessed(&[&w], vec![relay(&r)]);
+        // First acceptance sets the high-water mark to created_at.
+        let hw = signed
+            .verify_fresh(&trusted, 1, now, 0)
+            .expect("first snapshot accepted");
+        assert_eq!(hw, signed.snapshot.created_at);
+        // Re-serving the same snapshot at an advanced high-water mark is a rollback.
+        assert!(
+            signed.verify_fresh(&trusted, 1, now, hw + 1).is_err(),
+            "a snapshot older than the high-water mark must be refused"
+        );
     }
 
     #[test]

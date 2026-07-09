@@ -133,10 +133,16 @@ pub fn sample_exponential(mean: Duration) -> Duration {
 /// panic there stops mixing entirely). On the rare failure we degrade to a
 /// safe, non-degenerate fraction so a delay is still produced; the unbiasable
 /// timing property only holds while the RNG works, but availability is
-/// preserved either way.
+/// preserved either way. The degradation is **signalled** to stderr (it would
+/// otherwise silently produce a deterministic `-ln(0.5)·mean` delay), so an
+/// operator can notice the mixer is running without fresh entropy.
 fn uniform_open_unit() -> f64 {
     let mut bytes = [0u8; 8];
     if getrandom::getrandom(&mut bytes).is_err() {
+        eprintln!(
+            "neo-mix: WARNING OS RNG unavailable — mixing delay is temporarily \
+             deterministic; the timing-privacy guarantee is degraded until entropy returns"
+        );
         return 0.5;
     }
     // 53-bit mantissa, shifted into (0, 1].
