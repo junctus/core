@@ -37,8 +37,8 @@ pub const MAX_WITNESSES: usize = 64;
 /// clock. This is the forward-looking guard that makes the anti-rollback
 /// high-water mark in [`SignedSnapshot::verify_fresh`] safe: a far-future
 /// `created_at` can't be accepted and then permanently freeze out later
-/// legitimate snapshots. (A client persists the high-water mark and passes it to
-/// `verify_fresh`; that caller wiring is the remaining integration step.)
+/// legitimate snapshots. The client persists the high-water mark (`snapshot.hwm`)
+/// and passes it to `verify_fresh` on both the full and delta fetch paths.
 const MAX_FUTURE_SKEW: u64 = 300;
 
 /// The relay set at a moment in time, as observed by the signing witnesses.

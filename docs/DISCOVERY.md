@@ -69,6 +69,44 @@ that host being able to alter it. A recent snapshot can even be embedded in the
 release binary, so a fresh install's first act is dialing relays directly rather
 than phoning home.
 
+### Snapshot bandwidth: compact records + delta sync
+
+A witnessed snapshot has to scale to thousands of relays without becoming a
+multi-megabyte download that every client repeats. Two mechanisms keep it small
+(`snapshot.rs`, `neo-seed/src/service.rs`, `platforms/desktop/src/discovery.rs`):
+
+- **Compact records.** A `PeerRecord`'s ML-KEM-768 key is 1184 bytes — ~85% of
+  the record. Snapshots omit it and carry the *compact* encoding
+  (`to_compact_bytes`). This is safe because the record `id` is `blake3(signing,
+  kex, kem)` — it already commits to the key — and the record signature is defined
+  over `id`, not the raw key, so **one signature covers both the full and compact
+  forms** and a seed derives the compact snapshot from full registrations without
+  the node re-signing. The dropped key isn't lost: the relay sends it in-band in
+  handshake m2, and the client checks the re-derived `NodeId` against the `id` the
+  witnesses vouched for (`result.peer_id == relay.id`). So a compact record's key
+  commitment is verified **at dial time against live key material**, not at parse
+  time — with no extra round trip. Compact records are snapshot-only; the DHT keeps
+  the full self-certifying form (`verify_full`).
+
+- **Delta sync.** A client holding a snapshot fetches only what changed:
+  `GET /snapshot/diff?base=<fingerprint>` returns a `SnapshotDelta` (upserts +
+  removals + the new signatures) instead of the whole set. The delta carries **no
+  signature of its own** — the client applies it, reconstructs the exact new signed
+  body in canonical id order, and verifies the *witness* signatures over the
+  result. A mirror that smuggles in, drops, or reorders a relay produces a body no
+  signature matches, so the client discards it and falls back to a full fetch.
+  Every path ends at the same `verify_fresh` (signatures + anti-rollback high-water
+  mark), so forcing the fallback can't downgrade integrity. The seed remembers a
+  bounded window of recent relay sets; an unrecognized (too-old) base just gets a
+  full snapshot.
+
+Honest scope: compact records cut *snapshot / mirror / cache* bandwidth, not
+handshake bytes (the key still crosses in m2). Deltas reduce steady-state transfer
+for clients that refresh within the snapshot's validity window; a client offline
+longer falls back to a full fetch. Neither changes the integrity model — a
+snapshot, full or reconstructed, is trusted only when k-of-n witness signatures
+verify over it.
+
 ## Reachability: dial-back attestation
 
 Admission proves a record is internally valid; it does not prove the operator
@@ -82,8 +120,8 @@ hijacked entries.
 ## The seed (`discovery.junctus.org`)
 
 `neo seed` runs a witness signer + health checker + a static HTTP service
-(`GET /snapshot|/healthz|/witness`, `POST /register`). It serves **no user
-traffic**. Deploy bundle in `deploy/discovery/` (systemd unit + Caddy TLS +
+(`GET /snapshot|/snapshot/diff|/healthz|/witness`, `POST /register`). It serves
+**no user traffic**. Deploy bundle in `deploy/discovery/` (systemd unit + Caddy TLS +
 installer). See that directory's README.
 
 Trust is explicit and k-of-n: `discovery.junctus.org` is witness #1 and mirror
@@ -133,6 +171,8 @@ signatures on the snapshot, so the DoH transport and the DNS are untrusted.
 | Learn a client's chosen relay | Whole-snapshot fetch leaks no per-relay selection |
 | Advertise a hijacked address | Dial-back handshake proves address ↔ key |
 | Malicious/hacked seed | Witness signatures + k-of-n; can omit, never forge |
+| Tamper with a snapshot diff | Client reconstructs + re-verifies witness signatures; any mismatch → discard + full refetch |
+| Swap a compact record's key | `id` commits to the key; dial-time `peer_id == id` check rejects a mismatch |
 | Replay an old record | `expires_at` + monotonic `seq` |
 | Registration flooding | Per-IP cooldown; body-size limit |
 

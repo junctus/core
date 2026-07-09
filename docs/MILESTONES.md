@@ -75,11 +75,17 @@ configuration, and the discovery layer is hardened against Sybil, eclipse, and e
 - Done (client plane): **witnessed snapshots** (`neo-discovery::snapshot`) — k-of-n witness-signed relay
   sets; whole-set fetch leaks no per-relay selection (PIR-degenerate); forged records fatal, expired
   filtered. Integrity is separated from distribution, so snapshots serve from any untrusted mirror/CDN.
+- Done (snapshot scaling): **compact records** drop the 1184-byte ML-KEM key (~85% of a record) from
+  snapshots — the record signature covers `id` (which commits to the key), so one signature serves both
+  forms and the client re-checks the key commitment in-band at dial time (`peer_id == id`). **Delta sync**
+  (`GET /snapshot/diff`) ships only what changed since a client's cached set; the client reconstructs and
+  re-verifies the witness signatures, falling back to a full fetch on any mismatch. Anti-rollback
+  (`verify_fresh`) now wired on both paths.
 - Done (DHT hardening): client/server **role split** (clients are DHT-invisible), inbound `PUT`
   verification (`StoreInserts::FilterBoth`), **disjoint query paths**, seq-aware caching + TTLs.
 - Done (seed): `neo-seed` — verify + **dial-back handshake attestation** (proves address ↔ key) +
-  strike-based health + witness-signed snapshot; axum service (`/snapshot`, `/healthz`, `/witness`,
-  rate-limited `/register`), serving **no user traffic**.
+  strike-based health + witness-signed snapshot; axum service (`/snapshot`, `/snapshot/diff`, `/healthz`,
+  `/witness`, rate-limited `/register`), serving **no user traffic**.
 - Done (CLI + ops): `neo seed`, `neo run --relay`, zero-flag `neo run` client, `neo snapshot`; baked
   mirror/witness defaults with flag/env overrides + on-disk snapshot cache; `deploy/discovery/`
   (systemd + Caddy + installer for **discovery.junctus.org**) and `scripts/build-release.sh`
