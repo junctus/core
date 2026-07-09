@@ -1,21 +1,26 @@
 # Core security analysis
 
 An adversarial review of neo's core cryptography and networked data plane,
-conducted as four independent parallel reviews (AKE + session, Sphinx onion
-routing, the novel core: slicing/mix/routing, and the networked
-discovery/seed/forwarding layer). Findings are concrete, cite `file:line`, and
-several were **PoC-confirmed** against the real code. This is an internal review,
-**not** the external audit that gates real-world use.
+conducted over **two rounds**. Round 1 was four independent parallel reviews
+(AKE + session, Sphinx onion routing, the novel core: slicing/mix/routing, and
+the networked discovery/seed/forwarding layer). Round 2 re-reviewed the areas
+that had grown since — the streaming return path, the anonymous-credits earn/spend
+flow, the verifiable committee (VSS), and the Sphinx internals in more depth.
+Findings are concrete, cite `file:line`, and several were **PoC-confirmed**
+against the real code. This is an internal review, **not** the external audit
+that gates real-world use.
 
-**Status:** **all** HIGH/MEDIUM findings from this review are now **fixed** with
-regression tests — the two CRITICAL Sphinx breaks (C-1, C-2), every HIGH (H-1
+**Status:** **all** findings from both rounds are now **fixed** with regression
+tests. Round 1: the two CRITICAL Sphinx breaks (C-1, C-2), every HIGH (H-1
 through H-7), and every MEDIUM (M-1 through M-8), plus the full **wide-block
 non-malleable payload** (Lioness) closing C-1's residual tagging channel. The
 handshake gained both a **key-confirmation flight** and a **stateless retry
 cookie** (H-4): a replayed or connect-and-abandon m1 now costs only a MAC, never
-an ML-KEM encapsulation. The one thing that remains before real use is the
-**external security + cryptography audit**, which no amount of internal review
-replaces.
+an ML-KEM encapsulation. Round 2: the streaming return-path integrity gap (R2-1),
+the unbounded credit-mint (R2-2, CRITICAL), non-verifiable OPRF deanonymization
+(R2-3), and five MED/LOW hardenings across Sphinx and the committee (R2-4..R2-8).
+The one thing that remains before real use is the **external security +
+cryptography audit**, which no amount of internal review replaces.
 
 ## Severity summary
 
@@ -99,6 +104,100 @@ collect ≥ 2 shares — breaking the invariant slicing depends on. **Fix**
 (`routing`): `Router::new` deduplicates by `NodeId`. Test:
 `duplicate_node_ids_are_deduplicated`.
 
+## Review #2 — streaming, credits, committee, deeper Sphinx
+
+A second adversarial pass over the code that landed after round 1. Severity
+summary:
+
+| # | Sev | Area | Finding | Status |
+|---|-----|------|---------|--------|
+| R2-1 | 🟠 HIGH | streaming | Return path had a per-hop XOR but **no end-to-end integrity** → a middle relay could maul the response the client accepts | **fixed** |
+| R2-2 | 🔴 CRIT | credits | `RelayReceipt.bytes` an unbounded `u64` → one validly-signed receipt mints ~`u64::MAX / BYTES_PER_CREDIT` (~10¹³) credits | **fixed** |
+| R2-3 | 🟠 HIGH | credits | **Base** (non-verifiable) OPRF → a malicious issuer can blind-evaluate earners under **different keys** and de-anonymize spends by key-tagging | **fixed** |
+| R2-4 | 🟡 MED | sphinx | `ReplayCache` an unbounded `HashSet` → sustained traffic exhausts relay memory; `handle_onion` fresh-cache footgun | **fixed** |
+| R2-5 | 🟡 MED | sphinx | Payload MAC covered `payload` but **not the length prefix** → parse/truncation oracle if the payload transform ever weakened | **fixed** |
+| R2-6 | 🟡 MED | sphinx | Packet builder didn't reject an **identity-point hop key** → node-independent (public) shared secret | **fixed** |
+| R2-7 | 🟡 MED | committee | `open()` aborted on the **first** bad share → one malicious member vetoes an otherwise-quorate reconstruction | **fixed** |
+| R2-8 | ⚪ LOW | committee | `verify` accepted `member == 0` (the secret's own point); `lagrange_at_zero` could silently invert a zero denominator | **fixed** |
+
+### R2-1 — streaming return-path malleability (HIGH)
+The bidirectional stream layer layered the response with a per-hop XOR keystream
+(so no relay reads it) but carried **no end-to-end integrity tag**. A middle relay
+could flip bytes of the encrypted return payload; the flip survived the remaining
+XOR layers and the client accepted mangled data — the return-path analogue of the
+round-1 C-1 tagging break.
+
+**Fix** (`stream.rs`): the exit prepends an **end-to-end return MAC** (keyed by
+`"neo-stream-return-mac-v1"` over the exit's shared secret, 16 bytes) to the
+response body; the client verifies it after peeling all XOR layers and rejects on
+mismatch. A MAC (not Lioness) is used because responses are arbitrary-length and
+a droppable-but-not-forgeable tag reaches integrity parity with the forward path.
+Tests: `two_hop_round_trip_returns_the_response`, `a_mauled_response_is_rejected_by_the_client`.
+
+### R2-2 — unbounded credit mint (CRITICAL)
+`EarnLedger::record` accepted a receipt's `bytes` field verbatim, and `bytes` is a
+`u64`. A single receipt — validly signed by a free client identity — could claim
+`u64::MAX` bytes and mint ~10¹³ credits in one call, defeating the entire
+proof-of-relay economics.
+
+**Fix** (`earn.rs`): a receipt is capped at `MAX_RECEIPT_BYTES` (100 credits'
+worth); a larger claim is refused. The module docs were corrected to state the
+cap's true scope honestly — it bounds *per receipt*, not *per identity*, so a
+colluding client+relay can still fabricate many capped receipts; earning is
+*identified* so the issuer can rate-limit, and bilateral co-signed receipts are
+the future refinement. Test: `a_receipt_over_the_cap_is_rejected`.
+
+### R2-3 — non-verifiable OPRF de-anonymization (HIGH)
+Credits used `voprf`'s **base** `OprfServer`/`OprfClient`. Base OPRF gives the
+client no way to check the issuer used a consistent key, so a malicious issuer
+could blind-evaluate different earners under different keys and later, at redeem
+time, tell which key a spend verifies under — **partitioning the anonymity set**
+and linking earn↔spend, the exact property the credits exist to prevent.
+
+**Fix** (`lib.rs`): switched to the **verifiable** `VoprfServer`/`VoprfClient`. The
+issuer publishes a committed public key and returns a **DLEQ proof** with every
+blind evaluation; `finalize` verifies the proof against the pinned key and rejects
+if the issuer strayed from it — forcing one key for everyone. Test:
+`evaluation_under_the_wrong_key_is_caught_by_the_proof`.
+
+### R2-4 — unbounded replay cache (MED)
+`ReplayCache` was an ever-growing `HashSet<[u8;32]>`; a relay processing traffic
+indefinitely exhausts memory. Separately, `handle_onion` allocated a fresh cache
+per call — a footgun that silently disables replay defense.
+
+**Fix** (`sphinx.rs` + `forward.rs`): the cache is now a **two-generation rotating**
+structure bounded at `~2 × capacity` tags — it rejects every replay within its
+horizon and rotates (dropping the oldest generation) instead of growing without
+bound. The `handle_onion` fresh-cache helper was removed; callers use
+`handle_onion_with_cache` (owned) or `handle_onion_shared` (`Mutex`). Tests:
+`bounded_replay_cache_still_rejects_recent_replays`, `bounded_replay_cache_caps_memory_by_rotating`.
+
+### R2-5 / R2-6 — Sphinx length authentication & identity hop key (MED)
+The exit-verified payload MAC covered only the payload, not the 2-byte length
+prefix; and `create_packet_keyed` didn't reject a hop advertising the Ristretto
+identity as its routing key (which yields a public, node-independent shared
+secret). **Fix** (`sphinx.rs`): the MAC now covers `len ‖ payload`, and the
+builder rejects an identity hop key — mirroring the process-side identity-`α`
+guard (round-1 C-2). Test: `identity_hop_key_is_rejected_at_build_time`.
+
+### R2-7 / R2-8 — committee reconstruction robustness (MED/LOW)
+`CommitteeSession::open` returned an error on the first share that failed Feldman
+verification, so one malicious member could veto reconstruction even with a full
+honest quorum present. And `KeyShare::verify` accepted `member == 0` (the secret's
+own evaluation point), while `lagrange_at_zero` could silently invert a zero
+denominator on a duplicate index. **Fix** (`vss.rs`): `open` now **skips and
+attributes** bad shares and succeeds whenever ≥ threshold honest shares remain;
+`verify` rejects index 0; `lagrange_at_zero` fails loudly on a zero denominator.
+Tests: `one_bad_share_cannot_veto_a_reconstruction_with_a_quorum`,
+`a_share_claiming_member_zero_never_verifies`.
+
+### Confirmed sound (round 2, no fix needed)
+- **ZK verifiable shuffle** (`neo-verify::shuffle`): the grand-product multiset
+  equality with a Fiat–Shamir multiplication proof was probed for a forged product,
+  a transferable proof across challenges, and a zero-factor bypass — all rejected.
+  Five `poc_*` probes are retained as regression tests. The construction is sound;
+  its honest limit (linear-size, not succinct) is documented, not a defect.
+
 ## What is genuinely solid (verified, not assumed)
 
 The reviews actively tried to break these and could not:
@@ -128,9 +227,12 @@ The reviews actively tried to break these and could not:
 
 ## How this was run
 
-Four independent reviewers read the target files in full and analyzed
-adversarially against protocol-specific threat models (nonce reuse, transcript
-binding, KCI/UKS, tagging, replay, point validation, resource exhaustion,
-signature coverage, info-theoretic-vs-computational honesty). PoC probes were
-written and run for the CRITICAL/HIGH crypto findings, then removed. See M14 in
-`docs/MILESTONES.md` for the remediation roadmap.
+Independent reviewers read the target files in full and analyzed adversarially
+against protocol-specific threat models (nonce reuse, transcript binding, KCI/UKS,
+tagging, replay, point validation, resource exhaustion, signature coverage,
+info-theoretic-vs-computational honesty, OPRF verifiability, VSS robustness). PoC
+probes were written and run for the CRITICAL/HIGH crypto findings, then removed;
+the ZK-shuffle probes were kept as regression tests. Round 1 covered the original
+core; round 2 re-reviewed the streaming, credits, committee, and Sphinx code that
+had grown since. Every finding from both rounds is fixed with a regression test
+and the workspace is `fmt`/`clippy -D warnings`/`test` clean.

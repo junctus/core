@@ -22,6 +22,7 @@ use std::collections::HashSet;
 
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 use curve25519_dalek::ristretto::CompressedRistretto;
+use curve25519_dalek::traits::IsIdentity;
 use curve25519_dalek::Scalar;
 use neo_core::{Error, NodeIdentity, Result};
 use zeroize::Zeroize;
@@ -113,15 +114,59 @@ pub enum Processed {
 }
 
 /// Per-node record of seen packets, for replay rejection.
-#[derive(Default)]
+///
+/// **Bounded.** An unbounded set would let sustained traffic exhaust a relay's
+/// memory (a trivial remote DoS). The cache keeps two generations of at most
+/// `capacity` tags each and rotates — dropping the older generation — when the
+/// active one fills. Memory is therefore capped at ~`2 * capacity` tags, while
+/// every packet within the most recent `capacity`..`2 * capacity` distinct
+/// packets is still rejected as a replay. A packet older than that horizon could
+/// in principle be replayed; the durable bound in production is to rotate the
+/// node's routing key on an epoch and drop the cache wholesale, which this
+/// structure's generational design mirrors in-memory.
 pub struct ReplayCache {
-    seen: HashSet<[u8; 32]>,
+    current: HashSet<[u8; 32]>,
+    previous: HashSet<[u8; 32]>,
+    capacity: usize,
+}
+
+impl Default for ReplayCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ReplayCache {
-    /// A new, empty cache.
+    /// Tags per generation before rotation (~1M ⇒ ~64 MB peak across both gens).
+    pub const DEFAULT_CAPACITY: usize = 1 << 20;
+
+    /// A new, empty cache with the default capacity.
     pub fn new() -> Self {
-        Self::default()
+        Self::with_capacity(Self::DEFAULT_CAPACITY)
+    }
+
+    /// A new, empty cache that holds up to `capacity` tags per generation.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            current: HashSet::new(),
+            previous: HashSet::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// Record `tag`, returning `true` if it is new and `false` if it is a replay
+    /// of a tag still within the cache's horizon.
+    fn check_and_insert(&mut self, tag: [u8; 32]) -> bool {
+        if self.current.contains(&tag) || self.previous.contains(&tag) {
+            return false;
+        }
+        if self.current.len() >= self.capacity {
+            // Rotate: the full generation becomes `previous`; start a fresh one.
+            std::mem::swap(&mut self.current, &mut self.previous);
+            self.current = HashSet::new();
+        }
+        self.current.insert(tag);
+        true
     }
 }
 
@@ -165,6 +210,12 @@ pub fn create_packet_keyed(
                 .map_err(|_| Error::Decode("bad hop key length".into()))?
                 .decompress()
                 .ok_or_else(|| Error::Crypto("hop key not a valid point".into()))?;
+            if y.is_identity() {
+                // An identity hop key yields a public, node-independent shared
+                // secret (s = y·a = identity) — refuse it, mirroring the process
+                // side's rejection of an identity alpha.
+                return Err(Error::Crypto("hop key is the identity point".into()));
+            }
             let alpha_c = alpha_point.compress().to_bytes();
             let s_c = (y * a).compress().to_bytes();
             let b = blinding(&alpha_c, &s_c);
@@ -212,16 +263,22 @@ pub fn create_packet_keyed(
     }
 
     // 5. Onion-encrypt the fixed payload, carrying an **exit-verified** integrity
-    //    tag. Layout: [len:2][mac:MAC_LEN][payload…]. The MAC key is derived from
-    //    the exit's shared secret alone, so a malicious relay that flips payload
-    //    bits cannot produce a matching tag — the exit detects the tamper and
-    //    rejects, instead of delivering attacker-chosen corruption (a payload
-    //    tagging channel). Full non-malleability (a wide-block PRP so a tamper is
-    //    not even a droppable signal) is the remaining hardening (see docs).
+    //    tag. Layout: [len:2][mac:MAC_LEN][payload…]. The MAC covers the length
+    //    prefix *and* the payload (`len ‖ payload`), and its key is derived from
+    //    the exit's shared secret alone — so a malicious relay that flips payload
+    //    bits or the framed length cannot produce a matching tag. The exit detects
+    //    the tamper and rejects, instead of delivering attacker-chosen corruption
+    //    or being steered to mis-parse the length (a payload tagging / truncation
+    //    channel). Full non-malleability (a wide-block PRP so a tamper is not even
+    //    a droppable signal) is the remaining hardening (see docs).
     let exit_secret = &secrets[n - 1];
-    let payload_mac = mac(&subkey("neo-sphinx-payload-mac-v1", exit_secret), payload);
+    let len_bytes = (payload.len() as u16).to_be_bytes();
+    let payload_mac = mac(
+        &subkey("neo-sphinx-payload-mac-v1", exit_secret),
+        &[&len_bytes[..], payload].concat(),
+    );
     let mut delta = vec![0u8; PAYLOAD_LEN];
-    delta[..2].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+    delta[..2].copy_from_slice(&len_bytes);
     delta[2..2 + MAC_LEN].copy_from_slice(&payload_mac);
     delta[2 + MAC_LEN..2 + MAC_LEN + payload.len()].copy_from_slice(payload);
     // Apply one Lioness layer per hop, innermost (exit) first, so hop 0's layer
@@ -262,7 +319,7 @@ pub fn process(
 
     // Only now, on an authenticated packet, record it for replay rejection.
     let tag = subkey("neo-sphinx-replay-v1", &s);
-    if !replay.seen.insert(tag) {
+    if !replay.check_and_insert(tag) {
         return Err(Error::Crypto("replayed Sphinx packet".into()));
     }
 
@@ -291,8 +348,12 @@ pub fn process(
             return Err(Error::Decode("bad payload length".into()));
         }
         let payload = delta[2 + MAC_LEN..2 + MAC_LEN + len].to_vec();
-        // Verify the exit-only integrity tag: reject any en-route payload tamper.
-        let expected = mac(&subkey("neo-sphinx-payload-mac-v1", &s), &payload);
+        // Verify the exit-only integrity tag over `len ‖ payload`: reject any
+        // en-route payload tamper *or* a mangled length prefix.
+        let expected = mac(
+            &subkey("neo-sphinx-payload-mac-v1", &s),
+            &[&delta[..2], payload.as_slice()].concat(),
+        );
         if !ct_eq(&expected, &delta[2..2 + MAC_LEN]) {
             return Err(Error::Crypto(
                 "Sphinx payload integrity check failed".into(),
@@ -580,6 +641,47 @@ mod tests {
             diff > PAYLOAD_LEN / 4,
             "one flipped bit must avalanche across the block (changed {diff} bytes)"
         );
+    }
+
+    #[test]
+    fn identity_hop_key_is_rejected_at_build_time() {
+        // A hop advertising the identity point as its routing key would yield a
+        // public, node-independent shared secret — the builder must refuse it.
+        let a = NodeIdentity::generate().unwrap();
+        let mut evil = hop(&a);
+        evil.public = [0u8; 32]; // compressed Ristretto identity
+        assert!(create_packet(&[evil], b"x").is_err());
+    }
+
+    #[test]
+    fn bounded_replay_cache_still_rejects_recent_replays() {
+        // With a tiny capacity the cache rotates, but a just-seen packet is still
+        // caught as a replay (it lives in the active or previous generation).
+        let a = NodeIdentity::generate().unwrap();
+        let b = NodeIdentity::generate().unwrap();
+        let packet = create_packet(&[hop(&a), hop(&b)], b"secret").unwrap();
+        let mut cache = ReplayCache::with_capacity(4);
+        assert!(process(&a, &mut cache, &packet).is_ok());
+        assert!(
+            process(&a, &mut cache, &packet).is_err(),
+            "an immediate replay must be rejected even under a bounded cache"
+        );
+    }
+
+    #[test]
+    fn bounded_replay_cache_caps_memory_by_rotating() {
+        // Insert well past 2*capacity distinct tags; the cache must never hold
+        // more than 2*capacity, proving it cannot grow without bound.
+        let mut cache = ReplayCache::with_capacity(8);
+        for i in 0..100u32 {
+            let mut tag = [0u8; 32];
+            tag[..4].copy_from_slice(&i.to_be_bytes());
+            assert!(cache.check_and_insert(tag), "distinct tags are all new");
+            assert!(
+                cache.current.len() + cache.previous.len() <= 16,
+                "memory stays capped at 2*capacity"
+            );
+        }
     }
 
     #[test]

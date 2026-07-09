@@ -53,6 +53,12 @@ impl KeyShare {
     /// Verify this share against the public commitments: `f(x)·G == Σ_j c_j·x^j`.
     /// A member that fails this was handed (or is offering) a bad share.
     pub fn verify(&self, commitments: &KeyCommitments) -> bool {
+        // x = 0 is the polynomial's constant term — the *secret itself*, not a
+        // share index. A share claiming member 0 would test `value·G == c_0`
+        // (i.e. value == secret) and must never be accepted as a valid share.
+        if self.member == 0 {
+            return false;
+        }
         let Some(coeffs): Option<Vec<RistrettoPoint>> = commitments
             .0
             .iter()
@@ -135,28 +141,41 @@ impl CommitteeSession {
     }
 
     /// Reconstruct the key from `>= threshold` **verified** shares and decrypt
-    /// the request. Rejects any share that fails Feldman verification (with
-    /// attribution), and fails if fewer than the threshold remain.
+    /// the request.
+    ///
+    /// A share that fails Feldman verification is **skipped and attributed**, not
+    /// treated as fatal: as long as `threshold` honest shares are present the open
+    /// still succeeds, so a single malicious member cannot veto reconstruction by
+    /// injecting one bad share (robustness). It fails only if fewer than the
+    /// threshold *valid* shares remain — and then names the members whose shares
+    /// were rejected.
     pub fn open(&self, offered: &[KeyShare]) -> Result<ClearnetRequest> {
-        // Verify + de-duplicate by member index; a bad share is attributable.
         let mut verified: Vec<&KeyShare> = Vec::new();
         let mut seen = std::collections::HashSet::new();
+        let mut rejected: Vec<u8> = Vec::new();
         for share in offered {
             if !share.verify(&self.commitments) {
-                return Err(Error::Crypto(format!(
-                    "committee member {} offered an invalid share",
-                    share.member
-                )));
+                if !rejected.contains(&share.member) {
+                    rejected.push(share.member);
+                }
+                continue;
             }
             if seen.insert(share.member) {
                 verified.push(share);
             }
         }
         if verified.len() < self.cfg.threshold {
+            let attribution = if rejected.is_empty() {
+                String::new()
+            } else {
+                let names: Vec<String> = rejected.iter().map(|m| format!("member {m}")).collect();
+                format!(" (invalid shares from {})", names.join(", "))
+            };
             return Err(Error::Crypto(format!(
-                "need {} verified shares, have {}",
+                "need {} verified shares, have {}{}",
                 self.cfg.threshold,
-                verified.len()
+                verified.len(),
+                attribution
             )));
         }
 
@@ -184,8 +203,16 @@ fn lagrange_at_zero(shares: &[&KeyShare]) -> Result<Scalar> {
                 continue;
             }
             let xj = Scalar::from(sj.member as u64);
-            // xi != xj because member indices are distinct, so invert is safe.
-            lambda *= (Scalar::ZERO - xj) * (xi - xj).invert();
+            // Member indices must be distinct (open() de-duplicates and rejects
+            // index 0), so xi - xj is non-zero. Guard anyway: a zero denominator
+            // would otherwise invert to zero and silently corrupt the secret.
+            let denom = xi - xj;
+            if denom == Scalar::ZERO {
+                return Err(Error::Crypto(
+                    "duplicate committee member index in reconstruction".into(),
+                ));
+            }
+            lambda *= (Scalar::ZERO - xj) * denom.invert();
         }
         secret += si.value * lambda;
     }
@@ -263,6 +290,36 @@ mod tests {
         assert!(
             format!("{err}").contains(&format!("member {victim}")),
             "the bad share must be attributed to its member"
+        );
+    }
+
+    #[test]
+    fn one_bad_share_cannot_veto_a_reconstruction_with_a_quorum() {
+        // Robustness: offer a full quorum of honest shares plus one corrupted
+        // share. The bad share is skipped, not fatal, so the open still succeeds.
+        let session = CommitteeSession::deal(&request(), cfg()).unwrap();
+        let mut shares: Vec<KeyShare> = [0, 1, 2, 4]
+            .iter()
+            .map(|&i| session.share_of(i).unwrap().clone())
+            .collect();
+        shares[3].value += Scalar::ONE; // corrupt member 5; members 1,2,3 remain (== threshold)
+
+        assert_eq!(
+            session.open(&shares).unwrap(),
+            request(),
+            "a quorum of honest shares opens despite one injected bad share"
+        );
+    }
+
+    #[test]
+    fn a_share_claiming_member_zero_never_verifies() {
+        // x = 0 is the secret's own evaluation point, not a share index.
+        let session = CommitteeSession::deal(&request(), cfg()).unwrap();
+        let mut forged = session.share_of(0).unwrap().clone();
+        forged.member = 0;
+        assert!(
+            !forged.verify(&session.commitments),
+            "a share at index 0 must be rejected outright"
         );
     }
 

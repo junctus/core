@@ -9,7 +9,7 @@
 //! - a **relay** accepts a hop, opens the frame, peels exactly one layer with
 //!   `process`, and either forwards the transformed packet to the next hop
 //!   (dialing it and establishing a fresh session) or, if it is the terminal
-//!   hop, delivers the payload ([`handle_onion`]).
+//!   hop, delivers the payload ([`handle_onion_shared`]).
 //!
 //! Each hop-to-hop link is independently encrypted by the M1 session (link
 //! authentication + forward secrecy, and a passive observer sees only fixed-size
@@ -105,28 +105,15 @@ pub async fn send_onion(identity: &NodeIdentity, circuit: &[Hop], payload: &[u8]
 }
 
 /// Relay: having completed the handshake with the previous hop, read one onion
-/// frame off `stream`, peel a layer, and forward or deliver it.
+/// frame off `stream`, peel a layer, and forward or deliver it — under a
+/// **caller-owned** replay cache so a long-lived relay rejects replays across
+/// connections.
 ///
 /// `session` is the established session with the previous hop; `resolver` maps a
-/// next-hop id to an address. Uses a fresh [`ReplayCache`] per call — a
-/// long-lived relay should share one across connections via
-/// [`handle_onion_with_cache`] so it rejects replays.
-pub async fn handle_onion<S, R>(
-    identity: &NodeIdentity,
-    stream: &mut S,
-    session: &mut Session,
-    resolver: &R,
-) -> Result<Outcome>
-where
-    S: AsyncRead + Unpin,
-    R: NextHop,
-{
-    let mut cache = ReplayCache::new();
-    handle_onion_with_cache(identity, stream, session, resolver, &mut cache).await
-}
-
-/// As [`handle_onion`], but with a caller-owned replay cache so a long-lived
-/// relay rejects replays across connections.
+/// next-hop id to an address. A relay serving many concurrent connections wants
+/// [`handle_onion_shared`], which takes a `Mutex`-guarded cache shared across
+/// tasks; this variant is for a single-threaded owner of the cache. There is
+/// deliberately no fresh-cache-per-call helper: it would silently accept replays.
 pub async fn handle_onion_with_cache<S, R>(
     identity: &NodeIdentity,
     stream: &mut S,
@@ -231,9 +218,16 @@ mod tests {
         let handle = tokio::spawn(async move {
             let identity = NodeIdentity::from_bytes(&identity_bytes).unwrap();
             let (mut stream, mut result) = accept(&listener, &identity).await.unwrap();
-            handle_onion(&identity, &mut stream, &mut result.session, &resolver)
-                .await
-                .unwrap()
+            let mut cache = ReplayCache::new();
+            handle_onion_with_cache(
+                &identity,
+                &mut stream,
+                &mut result.session,
+                &resolver,
+                &mut cache,
+            )
+            .await
+            .unwrap()
         });
         (addr, handle)
     }
@@ -298,7 +292,15 @@ mod tests {
             let identity = NodeIdentity::from_bytes(&relay_bytes).unwrap();
             let (mut stream, mut result) = accept(&listener, &identity).await.unwrap();
             let empty: HashMap<NodeId, String> = HashMap::new();
-            handle_onion(&identity, &mut stream, &mut result.session, &empty).await
+            let mut cache = ReplayCache::new();
+            handle_onion_with_cache(
+                &identity,
+                &mut stream,
+                &mut result.session,
+                &empty,
+                &mut cache,
+            )
+            .await
         });
 
         let circuit = vec![hop_of(&relay, &relay_addr), hop_of(&exit, "10.0.0.1:9000")];

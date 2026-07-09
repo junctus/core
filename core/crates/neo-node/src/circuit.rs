@@ -1,0 +1,592 @@
+//! Persistent circuit tunnels — multi-cell byte streams and TCP tunneling (M21).
+//!
+//! [`stream`](crate::stream) does a single request → response round-trip over a
+//! Sphinx circuit. This module keeps the circuit **open** and carries a
+//! bidirectional **byte stream** across it: many cells in each direction, and at
+//! the exit a spliced **TCP connection** to a target — i.e. real TCP-over-onion
+//! tunneling, the shape a SOCKS proxy or a full VPN return path needs.
+//!
+//! ## How it works
+//!
+//! A single Sphinx packet **sets up** the circuit: it routes to the exit (each
+//! relay learns only its next hop) and carries the target address in its
+//! exit-only payload. Setting it up also fixes the per-hop shared secrets — the
+//! client gets them from [`create_packet_keyed`], each relay derives its own from
+//! the packet's `alpha` — exactly as the one-shot path does.
+//!
+//! After setup the connections stay open and the parties exchange **cells**. A
+//! cell is `[seq: u64][onion-layered body]`. Unlike Sphinx (one packet per hop,
+//! replay-once), cells are a lightweight **counter-keyed symmetric onion**: each
+//! hop XORs one keystream layer `KS(dir_key_i, seq)`, and because `seq` is unique
+//! per direction the keystream never repeats (no XOR reuse). The endpoint body is
+//! `[mac][payload]` with a **per-cell end-to-end MAC** keyed by the exit's secret,
+//! so any middle relay that mauls a cell is detected at the endpoint, never
+//! delivered — the same integrity guarantee the forward Sphinx payload and the
+//! one-shot return path already have.
+//!
+//! Forward (client → exit) layers are applied outermost-first so hop 0 peels
+//! first; return (exit → client) layers are added hop-by-hop and the client peels
+//! all. No relay can read or forge the stream; only the exit and client can.
+//!
+//! **Honest scope:** cells are variable-length here (length hiding is the
+//! transport layer's job — `neo-transport` bucketing / the mixer). Congestion
+//! control and multiplexing many streams over one circuit are the next layer.
+
+use std::sync::Mutex;
+
+use neo_core::{Error, NodeId, NodeIdentity, Result};
+use neo_crypto::{
+    create_packet_keyed, process, Opener, Processed, ReplayCache, Sealer, Session, SphinxPacket,
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::TcpStream;
+
+use crate::forward::{Hop, NextHop};
+use crate::run::{connect, read_frame, write_frame};
+
+/// Per-cell end-to-end MAC length.
+const CELL_MAC_LEN: usize = 16;
+/// Cell header: an 8-byte big-endian sequence number.
+const SEQ_LEN: usize = 8;
+/// Bytes read from a spliced TCP target per return cell.
+const TCP_CHUNK: usize = 8 * 1024;
+
+fn fwd_key(secret: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key("neo-circuit-fwd-v1", secret)
+}
+fn ret_key(secret: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key("neo-circuit-ret-v1", secret)
+}
+fn fwd_mac_key(secret: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key("neo-circuit-fwd-mac-v1", secret)
+}
+fn ret_mac_key(secret: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key("neo-circuit-ret-mac-v1", secret)
+}
+
+/// XOR `data` in place with the keystream `KS(key, seq)`. `seq` makes every cell's
+/// keystream distinct, so a fixed per-hop key is never reused across cells.
+fn xor_cell(data: &mut [u8], key: &[u8; 32], seq: u64) {
+    let mut hasher = blake3::Hasher::new_keyed(key);
+    hasher.update(&seq.to_be_bytes());
+    let mut reader = hasher.finalize_xof();
+    let mut ks = vec![0u8; data.len()];
+    reader.fill(&mut ks);
+    for (b, k) in data.iter_mut().zip(&ks) {
+        *b ^= k;
+    }
+}
+
+/// Per-cell MAC over `seq ‖ payload`, keyed by a direction MAC key.
+fn cell_mac(key: &[u8; 32], seq: u64, payload: &[u8]) -> [u8; CELL_MAC_LEN] {
+    let mut hasher = blake3::Hasher::new_keyed(key);
+    hasher.update(&seq.to_be_bytes());
+    hasher.update(payload);
+    let mut out = [0u8; CELL_MAC_LEN];
+    out.copy_from_slice(&hasher.finalize().as_bytes()[..CELL_MAC_LEN]);
+    out
+}
+
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// The write half of a client's circuit: sends cells to the exit.
+pub struct CircuitSink {
+    w: OwnedWriteHalf,
+    sealer: Sealer,
+    secrets: Vec<[u8; 32]>,
+    seq: u64,
+}
+
+/// The read half of a client's circuit: receives cells from the exit.
+pub struct CircuitStream {
+    r: OwnedReadHalf,
+    opener: Opener,
+    secrets: Vec<[u8; 32]>,
+}
+
+impl CircuitSink {
+    /// Send one application cell to the exit through the circuit.
+    pub async fn send(&mut self, data: &[u8]) -> Result<()> {
+        let seq = self.seq;
+        self.seq += 1;
+        let exit_secret = self.secrets.last().expect("non-empty circuit");
+        // Endpoint body: [e2e MAC][payload], then onion-layer it, hop 0 outermost.
+        let mut body = Vec::with_capacity(CELL_MAC_LEN + data.len());
+        body.extend_from_slice(&cell_mac(&fwd_mac_key(exit_secret), seq, data));
+        body.extend_from_slice(data);
+        for secret in self.secrets.iter().rev() {
+            xor_cell(&mut body, &fwd_key(secret), seq);
+        }
+        let mut cell = Vec::with_capacity(SEQ_LEN + body.len());
+        cell.extend_from_slice(&seq.to_be_bytes());
+        cell.extend_from_slice(&body);
+        let framed = self.sealer.seal(&cell)?;
+        write_frame(&mut self.w, &framed).await
+    }
+}
+
+impl CircuitStream {
+    /// Receive one application cell back from the exit (layers peeled, integrity
+    /// checked). Errors if a relay tampered with the returned cell.
+    pub async fn recv(&mut self) -> Result<Vec<u8>> {
+        let framed = read_frame(&mut self.r).await?;
+        let cell = self.opener.open(&framed)?;
+        if cell.len() < SEQ_LEN + CELL_MAC_LEN {
+            return Err(Error::Decode("short circuit cell".into()));
+        }
+        let seq = u64::from_be_bytes(cell[..SEQ_LEN].try_into().expect("8 bytes"));
+        let mut body = cell[SEQ_LEN..].to_vec();
+        for secret in &self.secrets {
+            xor_cell(&mut body, &ret_key(secret), seq);
+        }
+        let (mac, payload) = body.split_at(CELL_MAC_LEN);
+        let exit_secret = self.secrets.last().expect("non-empty circuit");
+        if !ct_eq(mac, &cell_mac(&ret_mac_key(exit_secret), seq, payload)) {
+            return Err(Error::Crypto("return cell failed integrity check".into()));
+        }
+        Ok(payload.to_vec())
+    }
+}
+
+/// Client: open a persistent circuit through `circuit` to a `target` the exit
+/// will splice a TCP connection to. Returns the send/receive halves.
+pub async fn open_circuit(
+    identity: &NodeIdentity,
+    circuit: &[Hop],
+    target: &str,
+) -> Result<(CircuitSink, CircuitStream)> {
+    if circuit.is_empty() {
+        return Err(Error::Config("a circuit needs at least one hop".into()));
+    }
+    let hops: Vec<neo_crypto::SphinxHop> = circuit
+        .iter()
+        .map(|h| neo_crypto::SphinxHop {
+            id: *h.id.as_bytes(),
+            public: h.sphinx,
+        })
+        .collect();
+    // The setup packet routes to the exit and carries the target in its exit-only
+    // payload; create_packet_keyed hands us the per-hop secrets.
+    let (packet, secrets) = create_packet_keyed(&hops, target.as_bytes())?;
+
+    let (stream, result) = connect(&circuit[0].addr, identity).await?;
+    let (mut sealer, opener) = result.session.split();
+    let setup = sealer.seal(&packet.to_bytes())?;
+    let (r, mut w) = stream.into_split();
+    write_frame(&mut w, &setup).await?;
+
+    Ok((
+        CircuitSink {
+            w,
+            sealer,
+            secrets: secrets.clone(),
+            seq: 0,
+        },
+        CircuitStream { r, opener, secrets },
+    ))
+}
+
+/// Relay/exit: having handshaked with the previous hop, read the circuit's setup
+/// packet and then either **relay** cells to the next hop (adding/removing one
+/// layer per direction) or, at the exit, **splice** a TCP connection to the
+/// target and pump bytes both ways. Runs until either end of the circuit closes.
+pub async fn serve_circuit<R: NextHop>(
+    identity: &NodeIdentity,
+    prev_stream: TcpStream,
+    prev_session: Session,
+    resolver: &R,
+    replay: &Mutex<ReplayCache>,
+) -> Result<()> {
+    let (mut pr, pw) = prev_stream.into_split();
+    let (pw_sealer, pr_opener) = {
+        let (s, o) = prev_session.split();
+        (s, o)
+    };
+
+    let setup_frame = read_frame(&mut pr).await?;
+    let mut pr_opener = pr_opener;
+    let packet_bytes = pr_opener.open(&setup_frame)?;
+    let packet = SphinxPacket::from_bytes(&packet_bytes)?;
+    let secret = identity.sphinx_shared(packet.alpha())?;
+
+    let processed = {
+        let mut cache = replay.lock().expect("replay cache poisoned");
+        process(identity, &mut cache, &packet)?
+    };
+
+    match processed {
+        Processed::Forward { next, packet } => {
+            let next_id = NodeId::from_bytes(next);
+            let addr = resolver
+                .addr_of(&next_id)
+                .ok_or_else(|| Error::Config(format!("no address for next hop {next_id}")))?;
+            let (next_stream, next_result) = connect(&addr, identity).await?;
+            let (mut ns_sealer, ns_opener) = next_result.session.split();
+            let (nr, mut nw) = next_stream.into_split();
+            // Forward the setup packet on to the next hop.
+            let fwd_setup = ns_sealer.seal(&packet.to_bytes())?;
+            write_frame(&mut nw, &fwd_setup).await?;
+            relay_pump(
+                secret, pr, pr_opener, pw, pw_sealer, nr, ns_opener, nw, ns_sealer,
+            )
+            .await
+        }
+        Processed::Deliver { payload } => {
+            let target = String::from_utf8(payload)
+                .map_err(|_| Error::Decode("circuit target not valid utf-8".into()))?;
+            exit_splice(secret, &target, pr, pr_opener, pw, pw_sealer).await
+        }
+    }
+}
+
+/// A middle relay: strip one forward layer toward the exit, add one return layer
+/// back toward the client. The two directions own disjoint halves, so they run
+/// concurrently; the circuit tears down when either side closes.
+#[allow(clippy::too_many_arguments)]
+async fn relay_pump(
+    secret: [u8; 32],
+    mut pr: OwnedReadHalf,
+    mut pr_opener: Opener,
+    mut pw: OwnedWriteHalf,
+    mut pw_sealer: Sealer,
+    mut nr: OwnedReadHalf,
+    mut ns_opener: Opener,
+    mut nw: OwnedWriteHalf,
+    mut ns_sealer: Sealer,
+) -> Result<()> {
+    let fk = fwd_key(&secret);
+    let rk = ret_key(&secret);
+
+    let forward = async {
+        loop {
+            let Ok(framed) = read_frame(&mut pr).await else {
+                break;
+            };
+            let cell = pr_opener.open(&framed)?;
+            let relayed = relay_layer(&cell, &fk)?;
+            let out = ns_sealer.seal(&relayed)?;
+            if write_frame(&mut nw, &out).await.is_err() {
+                break;
+            }
+        }
+        Ok::<(), Error>(())
+    };
+
+    let ret = async {
+        loop {
+            let Ok(framed) = read_frame(&mut nr).await else {
+                break;
+            };
+            let cell = ns_opener.open(&framed)?;
+            let relayed = relay_layer(&cell, &rk)?;
+            let out = pw_sealer.seal(&relayed)?;
+            if write_frame(&mut pw, &out).await.is_err() {
+                break;
+            }
+        }
+        Ok::<(), Error>(())
+    };
+
+    tokio::select! {
+        r = forward => r,
+        r = ret => r,
+    }
+}
+
+/// XOR one layer (`key`, keyed by the cell's own `seq`) onto a `[seq][body]` cell.
+fn relay_layer(cell: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
+    if cell.len() < SEQ_LEN {
+        return Err(Error::Decode("short circuit cell".into()));
+    }
+    let seq = u64::from_be_bytes(cell[..SEQ_LEN].try_into().expect("8 bytes"));
+    let mut out = cell.to_vec();
+    xor_cell(&mut out[SEQ_LEN..], key, seq);
+    Ok(out)
+}
+
+/// The exit: splice a TCP connection to `target`, decrypt forward cells into the
+/// socket, and wrap bytes read back from the socket into return cells.
+async fn exit_splice(
+    secret: [u8; 32],
+    target: &str,
+    mut pr: OwnedReadHalf,
+    mut pr_opener: Opener,
+    mut pw: OwnedWriteHalf,
+    mut pw_sealer: Sealer,
+) -> Result<()> {
+    let tcp = TcpStream::connect(target).await?;
+    let (mut tr, mut tw) = tcp.into_split();
+    let fk = fwd_key(&secret);
+    let fmk = fwd_mac_key(&secret);
+    let rk = ret_key(&secret);
+    let rmk = ret_mac_key(&secret);
+
+    // client → target: peel the exit's forward layer, verify the e2e MAC, write.
+    let to_target = async {
+        loop {
+            let Ok(framed) = read_frame(&mut pr).await else {
+                break;
+            };
+            let cell = pr_opener.open(&framed)?;
+            if cell.len() < SEQ_LEN + CELL_MAC_LEN {
+                return Err(Error::Decode("short forward cell".into()));
+            }
+            let seq = u64::from_be_bytes(cell[..SEQ_LEN].try_into().expect("8 bytes"));
+            let mut body = cell[SEQ_LEN..].to_vec();
+            xor_cell(&mut body, &fk, seq);
+            let (mac, payload) = body.split_at(CELL_MAC_LEN);
+            if !ct_eq(mac, &cell_mac(&fmk, seq, payload)) {
+                return Err(Error::Crypto("forward cell failed integrity check".into()));
+            }
+            if tw.write_all(payload).await.is_err() {
+                break;
+            }
+        }
+        Ok::<(), Error>(())
+    };
+
+    // target → client: chunk the socket, MAC + layer each chunk into a return cell.
+    let to_client = async {
+        let mut seq = 0u64;
+        let mut buf = vec![0u8; TCP_CHUNK];
+        loop {
+            let n = match tr.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            let payload = &buf[..n];
+            let mut body = Vec::with_capacity(CELL_MAC_LEN + n);
+            body.extend_from_slice(&cell_mac(&rmk, seq, payload));
+            body.extend_from_slice(payload);
+            xor_cell(&mut body, &rk, seq);
+            let mut cell = Vec::with_capacity(SEQ_LEN + body.len());
+            cell.extend_from_slice(&seq.to_be_bytes());
+            cell.extend_from_slice(&body);
+            let out = pw_sealer.seal(&cell)?;
+            if write_frame(&mut pw, &out).await.is_err() {
+                break;
+            }
+            seq += 1;
+        }
+        Ok::<(), Error>(())
+    };
+
+    tokio::select! {
+        r = to_target => r,
+        r = to_client => r,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::run::accept;
+    use std::collections::HashMap;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+    use tokio::task::JoinHandle;
+
+    fn hop_of(identity: &NodeIdentity, addr: &str) -> Hop {
+        let p = identity.public();
+        Hop {
+            id: p.id,
+            sphinx: p.sphinx,
+            addr: addr.to_string(),
+        }
+    }
+
+    async fn spawn_serve(
+        id_bytes: Vec<u8>,
+        resolver: HashMap<NodeId, String>,
+    ) -> (String, JoinHandle<Result<()>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let handle = tokio::spawn(async move {
+            let identity = NodeIdentity::from_bytes(&id_bytes).unwrap();
+            let (stream, result) = accept(&listener, &identity).await.unwrap();
+            let replay = Mutex::new(ReplayCache::new());
+            serve_circuit(&identity, stream, result.session, &resolver, &replay).await
+        });
+        (addr, handle)
+    }
+
+    /// Bind a localhost TCP echo server; returns its address.
+    async fn spawn_echo() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            if let Ok((sock, _)) = listener.accept().await {
+                let (mut r, mut w) = sock.into_split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn cells_onion_layer_and_authenticate_end_to_end() {
+        // Pure-crypto check of the cell onion + per-cell MAC, without sockets.
+        let s0 = [1u8; 32]; // relay secret
+        let s1 = [2u8; 32]; // exit secret
+        let secrets = [s0, s1];
+        let seq = 7u64;
+        let payload = b"top secret cell payload";
+
+        // Client builds the forward cell body: [mac][payload], layered hop0-outermost.
+        let mut body = Vec::new();
+        body.extend_from_slice(&cell_mac(&fwd_mac_key(&s1), seq, payload));
+        body.extend_from_slice(payload);
+        for s in secrets.iter().rev() {
+            xor_cell(&mut body, &fwd_key(s), seq);
+        }
+
+        // The middle relay strips its layer only; the plaintext stays hidden.
+        let mut at_relay = body.clone();
+        xor_cell(&mut at_relay, &fwd_key(&s0), seq);
+        assert!(
+            !at_relay.windows(payload.len()).any(|w| w == payload),
+            "a middle relay never sees the plaintext cell"
+        );
+
+        // The exit strips its layer, recovers [mac][payload], and the MAC verifies.
+        let mut at_exit = at_relay.clone();
+        xor_cell(&mut at_exit, &fwd_key(&s1), seq);
+        let (mac, recovered) = at_exit.split_at(CELL_MAC_LEN);
+        assert!(ct_eq(mac, &cell_mac(&fwd_mac_key(&s1), seq, recovered)));
+        assert_eq!(recovered, payload);
+
+        // Maul a byte on the wire: after both layers strip, the MAC fails.
+        let mut mauled = body.clone();
+        let i = mauled.len() / 2;
+        mauled[i] ^= 0xff;
+        xor_cell(&mut mauled, &fwd_key(&s0), seq);
+        xor_cell(&mut mauled, &fwd_key(&s1), seq);
+        let (mac2, rec2) = mauled.split_at(CELL_MAC_LEN);
+        assert!(
+            !ct_eq(mac2, &cell_mac(&fwd_mac_key(&s1), seq, rec2)),
+            "a mauled cell must fail the end-to-end MAC"
+        );
+    }
+
+    #[tokio::test]
+    async fn circuit_carries_a_tcp_byte_stream_both_ways() {
+        let echo_addr = spawn_echo().await;
+
+        let exit = NodeIdentity::generate().unwrap();
+        let relay = NodeIdentity::generate().unwrap();
+        let client = NodeIdentity::generate().unwrap();
+
+        let (exit_addr, _exit) = spawn_serve(exit.to_bytes(), HashMap::new()).await;
+        let mut resolver = HashMap::new();
+        resolver.insert(exit.id(), exit_addr.clone());
+        let (relay_addr, _relay) = spawn_serve(relay.to_bytes(), resolver).await;
+
+        let circuit = vec![hop_of(&relay, &relay_addr), hop_of(&exit, &exit_addr)];
+        let (mut sink, mut stream) = open_circuit(&client, &circuit, &echo_addr).await.unwrap();
+
+        // Send several cells; the exit writes them into the echo socket in order.
+        let parts: [&[u8]; 3] = [b"hello ", b"brave ", b"tunnel"];
+        for p in parts {
+            sink.send(p).await.unwrap();
+        }
+        let expected: Vec<u8> = parts.concat();
+
+        // TCP is a byte stream: cell boundaries need not match send boundaries, so
+        // collect returned bytes until we have the whole echo.
+        let mut got = Vec::new();
+        while got.len() < expected.len() {
+            let chunk = tokio::time::timeout(Duration::from_secs(5), stream.recv())
+                .await
+                .expect("recv in time")
+                .expect("a return cell arrived");
+            got.extend_from_slice(&chunk);
+        }
+        assert_eq!(
+            got, expected,
+            "the byte stream round-trips through the circuit"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_middle_relay_mauling_a_return_cell_is_caught() {
+        let echo_addr = spawn_echo().await;
+
+        let exit = NodeIdentity::generate().unwrap();
+        let relay = NodeIdentity::generate().unwrap();
+        let client = NodeIdentity::generate().unwrap();
+
+        let (exit_addr, _exit) = spawn_serve(exit.to_bytes(), HashMap::new()).await;
+
+        // A malicious middle relay: honest on the forward path, but it flips a byte
+        // of the first return cell before passing it back to the client.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = listener.local_addr().unwrap().to_string();
+        let relay_bytes = relay.to_bytes();
+        let exit_id = exit.id();
+        let exit_dst = exit_addr.clone();
+        tokio::spawn(async move {
+            let identity = NodeIdentity::from_bytes(&relay_bytes).unwrap();
+            let (prev, prev_res) = accept(&listener, &identity).await.unwrap();
+            let (mut pr, mut pw) = prev.into_split();
+            let (mut pw_sealer, mut pr_opener) = prev_res.session.split();
+
+            let setup = read_frame(&mut pr).await.unwrap();
+            let packet = SphinxPacket::from_bytes(&pr_opener.open(&setup).unwrap()).unwrap();
+            let secret = identity.sphinx_shared(packet.alpha()).unwrap();
+            let mut cache = ReplayCache::new();
+            let Processed::Forward { packet, .. } =
+                process(&identity, &mut cache, &packet).unwrap()
+            else {
+                panic!("relay should forward");
+            };
+            let _ = exit_id;
+            let (next, next_res) = connect(&exit_dst, &identity).await.unwrap();
+            let (mut ns_sealer, mut ns_opener) = next_res.session.split();
+            let (mut nr, mut nw) = next.into_split();
+            write_frame(&mut nw, &ns_sealer.seal(&packet.to_bytes()).unwrap())
+                .await
+                .unwrap();
+
+            let fk = fwd_key(&secret);
+            let rk = ret_key(&secret);
+            let forward = async move {
+                while let Ok(f) = read_frame(&mut pr).await {
+                    let c = pr_opener.open(&f).unwrap();
+                    let out = ns_sealer.seal(&relay_layer(&c, &fk).unwrap()).unwrap();
+                    if write_frame(&mut nw, &out).await.is_err() {
+                        break;
+                    }
+                }
+            };
+            let ret = async move {
+                let mut first = true;
+                while let Ok(f) = read_frame(&mut nr).await {
+                    let c = ns_opener.open(&f).unwrap();
+                    let mut r = relay_layer(&c, &rk).unwrap();
+                    if first {
+                        let i = r.len() - 1; // a body byte
+                        r[i] ^= 0xff;
+                        first = false;
+                    }
+                    let out = pw_sealer.seal(&r).unwrap();
+                    if write_frame(&mut pw, &out).await.is_err() {
+                        break;
+                    }
+                }
+            };
+            tokio::join!(forward, ret);
+        });
+
+        let circuit = vec![hop_of(&relay, &relay_addr), hop_of(&exit, &exit_addr)];
+        let (mut sink, mut stream) = open_circuit(&client, &circuit, &echo_addr).await.unwrap();
+        sink.send(b"please echo this").await.unwrap();
+
+        let res = tokio::time::timeout(Duration::from_secs(5), stream.recv())
+            .await
+            .expect("recv in time");
+        assert!(res.is_err(), "client must reject a mauled return cell");
+    }
+}

@@ -28,6 +28,10 @@ const SNAPSHOT_SIG_DOMAIN: &[u8] = b"neo-snapshot-sig-v1";
 pub const MAX_SNAPSHOT_RELAYS: usize = 4096;
 /// Upper bound on witness signatures on one snapshot.
 pub const MAX_WITNESSES: usize = 64;
+/// Maximum seconds a snapshot's `created_at` may run ahead of the verifier's
+/// clock. Caps the anti-rollback high-water mark so a far-future timestamp
+/// can't be accepted and permanently freeze a client.
+const MAX_FUTURE_SKEW: u64 = 300;
 
 /// The relay set at a moment in time, as observed by the signing witnesses.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,6 +113,16 @@ impl SignedSnapshot {
         }
         if self.snapshot.created_at >= self.snapshot.expires_at {
             return Err(Error::Crypto("snapshot validity window is empty".into()));
+        }
+        // Reject an implausibly future-dated snapshot. Without this, a malicious
+        // (or compromised) witness could sign one snapshot with a far-future
+        // `created_at`; a client persisting an anti-rollback high-water mark from
+        // it would then reject every *legitimate* later snapshot — a permanent
+        // freeze / DoS. Bound the future skew to a few minutes.
+        if self.snapshot.created_at > now.saturating_add(MAX_FUTURE_SKEW) {
+            return Err(Error::Crypto(
+                "snapshot created_at is implausibly far in the future".into(),
+            ));
         }
 
         let body = self.snapshot.signable_bytes();
@@ -330,6 +344,43 @@ mod tests {
         forged.exit = true; // breaks the record's own signature
         let signed = witnessed(&[&w], vec![forged]);
         assert!(signed.verify(&[key(&w)], 1, now_unix()).is_err());
+    }
+
+    #[test]
+    fn an_implausibly_future_dated_snapshot_is_rejected() {
+        // Anti-rollback DoS guard: a snapshot whose created_at runs far beyond the
+        // verifier's clock (past MAX_FUTURE_SKEW) is refused, so a rogue or
+        // compromised witness cannot poison a client's persisted high-water mark
+        // and thereby freeze out every legitimate later snapshot.
+        let w = NodeIdentity::generate().unwrap();
+        let trusted = [key(&w)];
+        let now = now_unix();
+
+        let far_future = Snapshot {
+            created_at: now + MAX_FUTURE_SKEW + 3_600,
+            expires_at: now + MAX_FUTURE_SKEW + 90_000,
+            relays: vec![],
+        };
+        let signed = SignedSnapshot {
+            signatures: vec![far_future.sign(&w)],
+            snapshot: far_future,
+        };
+        assert!(
+            signed.verify(&trusted, 1, now).is_err(),
+            "a far-future created_at must be rejected, not just an expired one"
+        );
+
+        // A snapshot only slightly ahead (within tolerated clock skew) still verifies.
+        let soon = Snapshot {
+            created_at: now + MAX_FUTURE_SKEW / 2,
+            expires_at: now + 86_400,
+            relays: vec![],
+        };
+        let signed_ok = SignedSnapshot {
+            signatures: vec![soon.sign(&w)],
+            snapshot: soon,
+        };
+        signed_ok.verify(&trusted, 1, now).unwrap();
     }
 
     #[test]

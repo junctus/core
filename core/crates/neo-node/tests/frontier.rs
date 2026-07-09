@@ -35,9 +35,10 @@ fn relays(n: usize) -> Vec<Relay> {
 #[test]
 fn m10_credit_is_unlinkable_and_single_use() {
     let mut issuer = Issuer::new().unwrap();
+    let pk = issuer.public_key();
     let (blinded, secret) = request().unwrap();
     let issued = issuer.issue(&blinded).unwrap();
-    let credit = finalize(secret, issued).unwrap();
+    let credit = finalize(secret, issued, &pk).unwrap();
 
     assert!(issuer.redeem(&credit).is_ok(), "first spend accepted");
     assert!(issuer.redeem(&credit).is_err(), "double-spend rejected");
@@ -107,8 +108,9 @@ fn m13_oblivious_directory_fetch() {
 fn frontier_composed_request_flow() {
     // --- M10: the client earns and spends a credit to authorize the request. ---
     let mut issuer = Issuer::new().unwrap();
+    let pk = issuer.public_key();
     let (blinded, secret) = request().unwrap();
-    let credit = finalize(secret, issuer.issue(&blinded).unwrap()).unwrap();
+    let credit = finalize(secret, issuer.issue(&blinded).unwrap(), &pk).unwrap();
     issuer
         .redeem(&credit)
         .expect("paid with an unlinkable credit");

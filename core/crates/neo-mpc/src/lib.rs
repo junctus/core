@@ -14,19 +14,31 @@
 //! reconstruct it. A hash bound into the secret makes a corrupted or swapped
 //! share detectable at reconstruction.
 //!
+//! ## Toward MPC-TLS (partly closed)
+//!
+//! Two layers build past the base sharing:
+//! - [`vss`] adds **Feldman-verifiable** sharing of a session *key* (not the raw
+//!   body), so a bad share is attributable — but reconstruction still assembles
+//!   the key at one node.
+//! - [`threshold`] removes that single point: a message encrypted to the
+//!   committee's **joint public key** is decrypted by **client-combined partials**
+//!   (threshold hashed-ElGamal with DLEQ-proved partials), so **no committee node
+//!   ever holds the key or the plaintext** — the property MPC-TLS is really after,
+//!   for the decrypt direction.
+//!
 //! ## What is deferred (honest boundary)
 //!
-//! Full **MPC-TLS** — where the committee computes the TLS session itself under
-//! multi-party computation, so the plaintext is *never* assembled at any single
-//! point, including the moment it is sent to the real server — is a large 2PC/MPC
-//! construction (TLSNotary/`mpz` lineage) and is **not** implemented here. This
-//! crate provides the trust-splitting core (no minority reconstructs) and the
-//! committee model that a future MPC reconstruct-and-send step slots into. The
-//! honest gap: reconstruction here produces the assembled request in one place;
-//! MPC-TLS removes even that.
+//! Full **MPC-TLS** — where the committee computes the TLS handshake and record
+//! encryption itself under 2PC, so the plaintext is *never* assembled at any
+//! single point *including the moment it is sent to the real server* — is a large
+//! garbled-circuit construction (TLSNotary/DECO/`mpz` lineage) and is **not**
+//! implemented here. [`threshold`] delivers the "no single point of plaintext
+//! assembly" property for committee → client; the send-to-upstream-under-MPC step
+//! remains research.
 
 #![forbid(unsafe_code)]
 
+pub mod threshold;
 pub mod vss;
 
 use neo_core::{Error, Result};

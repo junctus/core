@@ -17,11 +17,16 @@
 //! only ever sees the response still wrapped in layers `i+1..n`, which it cannot
 //! remove.
 //!
+//! The response carries an **end-to-end integrity tag** keyed by the exit's
+//! shared secret, so a middle relay that mauls the (XOR-layered) response bits
+//! cannot forge a matching tag — the client rejects a tampered response rather
+//! than accepting attacker-chosen bytes (parity with the forward Sphinx payload:
+//! a tamper is dropped, not delivered).
+//!
 //! **Honest scope:** this is a single request → single response round-trip (the
-//! hard part — a working, layered return path). A persistent multi-cell byte
-//! stream / TCP tunnel builds on this with per-cell counters and connection
-//! splicing, and stream-integrity (a per-layer MAC / wide-block PRP) is the same
-//! deferred hardening as the Sphinx payload (see `docs/SECURITY_ANALYSIS.md`).
+//! hard part — a working, integrity-protected, layered return path). A
+//! persistent multi-cell byte stream / TCP tunnel builds on this with per-cell
+//! counters and connection splicing (deferred).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -33,9 +38,31 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::forward::{Hop, NextHop};
 use crate::run::{connect, read_frame, write_frame};
 
+/// Length of the end-to-end return-path integrity tag.
+const RETURN_MAC_LEN: usize = 16;
+
 /// Derive a per-hop return-path stream key from a Sphinx shared secret.
 fn stream_key(secret: &[u8; 32]) -> [u8; 32] {
     blake3::derive_key("neo-stream-return-v1", secret)
+}
+
+/// End-to-end return-path integrity tag, keyed by the **exit's** shared secret.
+/// The exit prepends it and the client verifies it, so a middle relay that
+/// mauls the (XOR-layered) response bits cannot forge a matching tag — the
+/// client rejects the tampered response instead of accepting attacker-chosen
+/// bytes. This gives the return path the same integrity the forward Sphinx
+/// payload has (a tamper is dropped, not delivered).
+fn return_mac(exit_secret: &[u8; 32], body: &[u8]) -> [u8; RETURN_MAC_LEN] {
+    let key = blake3::derive_key("neo-stream-return-mac-v1", exit_secret);
+    let full = blake3::keyed_hash(&key, body);
+    let mut out = [0u8; RETURN_MAC_LEN];
+    out.copy_from_slice(&full.as_bytes()[..RETURN_MAC_LEN]);
+    out
+}
+
+/// Constant-time equality for the return MAC.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// XOR `data` with a keystream derived from `key` (one layer, one cell).
@@ -72,11 +99,23 @@ pub async fn request_response(
 
     // Read the layered response and peel every hop's layer, in path order.
     let sealed = read_frame(&mut stream).await?;
-    let mut response = result.session.open(&sealed)?;
+    let mut framed = result.session.open(&sealed)?;
     for secret in &secrets {
-        xor_layer(&mut response, &stream_key(secret));
+        xor_layer(&mut framed, &stream_key(secret));
     }
-    Ok(response)
+    // The exit prepended an integrity tag over the response; verify it so a
+    // middle relay cannot maul the response undetectably.
+    if framed.len() < RETURN_MAC_LEN {
+        return Err(Error::Decode("return frame too short".into()));
+    }
+    let (mac, body) = framed.split_at(RETURN_MAC_LEN);
+    let exit_secret = secrets.last().expect("non-empty circuit");
+    if !ct_eq(mac, &return_mac(exit_secret, body)) {
+        return Err(Error::Crypto(
+            "return payload failed integrity check".into(),
+        ));
+    }
+    Ok(body.to_vec())
 }
 
 /// What an exit does with a delivered request to produce a response. The default
@@ -119,8 +158,14 @@ where
 
     let mut response = match processed {
         Processed::Deliver { payload } => {
-            // We are the exit: produce the response.
-            exit(&payload)
+            // We are the exit: produce the response and prepend an integrity tag
+            // (keyed by our shared secret) that only the client can verify.
+            let body = exit(&payload);
+            let mac = return_mac(&secret, &body);
+            let mut framed = Vec::with_capacity(RETURN_MAC_LEN + body.len());
+            framed.extend_from_slice(&mac);
+            framed.extend_from_slice(&body);
+            framed
         }
         Processed::Forward { next, packet } => {
             // Forward to the next hop and read its (layered) response.
@@ -278,5 +323,56 @@ mod tests {
             request,
             "the middle relay must not see the plaintext response"
         );
+    }
+
+    #[tokio::test]
+    async fn a_mauled_response_is_rejected_by_the_client() {
+        // A malicious middle relay flips a response byte; the client's end-to-end
+        // return MAC (keyed by the exit) must reject it, not deliver mangled data.
+        let exit = NodeIdentity::generate().unwrap();
+        let relay = NodeIdentity::generate().unwrap();
+        let client = NodeIdentity::generate().unwrap();
+
+        let (exit_addr, exit_task) = spawn_hop(exit.to_bytes(), Resolver::new()).await;
+        let mut resolver = Resolver::new();
+        resolver.insert(exit.id(), exit_addr.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = listener.local_addr().unwrap().to_string();
+        let relay_bytes = relay.to_bytes();
+        let relay_task = tokio::spawn(async move {
+            let identity = NodeIdentity::from_bytes(&relay_bytes).unwrap();
+            let (mut stream, mut result) = accept(&listener, &identity).await.unwrap();
+            let sealed = read_frame(&mut stream).await.unwrap();
+            let packet = SphinxPacket::from_bytes(&result.session.open(&sealed).unwrap()).unwrap();
+            let secret = identity.sphinx_shared(packet.alpha()).unwrap();
+            let mut cache = ReplayCache::new();
+            let Processed::Forward { next, packet } =
+                process(&identity, &mut cache, &packet).unwrap()
+            else {
+                panic!("relay should forward");
+            };
+            let addr = resolver.get(&NodeId::from_bytes(next)).unwrap().clone();
+            let (mut ns, mut nr) = connect(&addr, &identity).await.unwrap();
+            write_frame(&mut ns, &nr.session.seal(&packet.to_bytes()).unwrap())
+                .await
+                .unwrap();
+            let mut resp = nr
+                .session
+                .open(&read_frame(&mut ns).await.unwrap())
+                .unwrap();
+            resp[RETURN_MAC_LEN + 1] ^= 0xff; // maul a response body byte
+            xor_layer(&mut resp, &stream_key(&secret));
+            write_frame(&mut stream, &result.session.seal(&resp).unwrap())
+                .await
+                .unwrap();
+        });
+
+        let circuit = vec![hop_of(&relay, &relay_addr), hop_of(&exit, &exit_addr)];
+        let outcome = request_response(&client, &circuit, b"give me an honest answer").await;
+        assert!(outcome.is_err(), "a tampered response must be rejected");
+
+        relay_task.await.unwrap();
+        exit_task.await.unwrap().unwrap();
     }
 }

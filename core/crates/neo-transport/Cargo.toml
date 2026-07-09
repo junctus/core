@@ -13,6 +13,7 @@ quic = ["dep:quinn", "dep:rustls", "dep:rcgen"]
 
 [dependencies]
 neo-core.workspace = true
+neo-crypto.workspace = true
 tokio.workspace = true
 getrandom.workspace = true
 quinn = { version = "0.11", optional = true, default-features = false, features = [

@@ -289,6 +289,51 @@ Advance the M12 committee with **verifiable** key custody.
   remains research; key reconstruction here still assembles the key at decrypt time.
 - Tests: threshold opens, minority cannot, every share verifies, a corrupted share is attributed.
 
+### M21 — Persistent circuit tunnels ✅ (multi-cell byte streams + TCP tunneling)
+Close M15/M4.6's one-shot limit: keep a Sphinx circuit **open** and carry a bidirectional byte stream,
+with the exit splicing a real TCP connection to a target.
+- Done: `neo-node::circuit` — a single Sphinx packet sets up the circuit (routing + per-hop secrets),
+  then the parties exchange **cells** (`[seq][onion-layered body]`). Cells are a **counter-keyed
+  symmetric onion** — each hop XORs one keystream layer `KS(dir_key_i, seq)`, `seq` unique per direction
+  so no keystream reuse — with a **per-cell end-to-end MAC** keyed by the exit's secret, so a middle
+  relay that mauls a cell is caught at the endpoint. The exit **splices a TCP connection** and pumps
+  bytes both ways: real TCP-over-onion tunneling. Crate: `neo-node`.
+- Deferred/honest: cells are variable-length (length hiding is the transport layer's job); congestion
+  control and multiplexing many streams over one circuit are the next layer.
+- Tests: onion+MAC layering unit test; a **real TCP byte stream** round-trips through a 2-hop circuit to
+  a localhost echo server; a malicious middle relay mauling a return cell is rejected by the client.
+
+### M22 — MPC-TLS threshold decryption ✅ (no single point of plaintext assembly for decrypt)
+Advance M20 past "key assembled at decrypt": remove the single point where the committee reconstructs.
+- Done: `neo-mpc::threshold` — a message encrypted to the committee's **joint public key**
+  (`commitments[0]` of the Feldman sharing) is decrypted by **client-combined partials**: each member
+  emits `D_i = y_i·R` with a **Chaum–Pedersen DLEQ proof** binding it to its public share, and the
+  client reconstructs `s·R` by **Lagrange-in-the-exponent** (the secret `s` is never formed) to unmask
+  the plaintext. **No committee node ever holds the key or the plaintext.** Crate: `neo-mpc`.
+- Deferred/honest: this delivers the property for the **decrypt** direction (committee → client). Full
+  MPC-TLS — computing the handshake + record encryption under 2PC so the committee talks to a *real
+  upstream* without any member seeing plaintext (garbled-circuit AES-GCM; TLSNotary/DECO/`mpz`) — remains
+  research.
+- Tests: threshold decrypt recovers without assembling the key (two distinct quorums); a sub-threshold
+  set cannot; every partial verifies; a forged partial is caught by its DLEQ proof and an honest quorum
+  still wins; a lone partial leaks nothing.
+
+### M23 — Probe-resistant transports ✅ (REALITY-style auth + MASQUE/WebRTC camouflage)
+Close M6's deferred strong transports.
+- Done: `neo-crypto::reality` — a **REALITY-style authenticated first flight**: a client proves
+  possession of a pre-shared capability (the server's X25519 public, distributed out of band, *not*
+  published) with an authenticator that is **uniform-random to anyone without it**, epoch-bound against
+  capture-replay; the server **silently** decides authenticate-vs-**decoy**, so an active prober cannot
+  distinguish a neo bridge from an ordinary server. `neo-transport::Camouflage` shapes each record to
+  imitate a **QUIC/MASQUE** datagram or a **WebRTC/DTLS** record, and `Transport::dial_reality` /
+  `Listener::accept_reality` run the auth over a real connection. Crates: `neo-crypto`, `neo-transport`.
+- Deferred/honest: `Camouflage` mimics the observable *shape*, not full protocol crypto (a real QUIC
+  transport lives behind the `quic` feature); wiring the decoy to a genuine upstream TLS site and
+  embedding the flight in a true TLS ClientHello are the remaining integration steps.
+- Tests: honest client authenticates and shares a session seed; a prober (wrong key / random / short)
+  only ever sees decoy; authenticators are unlinkable; a captured hello expires after the epoch window;
+  camouflage round-trips both shapes and rejects the wrong shape; auth + camouflage work end-to-end over TCP.
+
 ---
 
 ## Audit gate ⬜

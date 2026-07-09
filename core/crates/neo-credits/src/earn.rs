@@ -9,11 +9,20 @@
 //!
 //! Earning is **identified** — the relay proves it did work — while spending
 //! stays **anonymous** via the VOPRF blinding, so the issuer still cannot link
-//! earn ↔ spend. Honest limit: the proof is a *client-attested* receipt, not a
-//! trustless bandwidth measurement (an open problem even Tor does not solve).
-//! Colluding client+relay can still mint receipts for unperformed work; receipts
-//! bound Sybil/free-riding to the cost of running clients, not to zero. A future
-//! refinement is bilateral receipts (both adjacent hops co-sign).
+//! earn ↔ spend.
+//!
+//! Honest limits, stated plainly:
+//! - The proof is a *client-attested* receipt, not a trustless bandwidth
+//!   measurement (an open problem even Tor does not solve).
+//! - A single receipt is capped at [`MAX_RECEIPT_BYTES`], so one receipt can mint
+//!   at most a bounded number of credits — a forged or fat-fingered `bytes` field
+//!   cannot mint ~`u64::MAX / BYTES_PER_CREDIT` credits in one shot.
+//! - The cap bounds *per receipt*, not *per identity*: colluding client+relay can
+//!   still fabricate many capped receipts (one per circuit nonce) for unperformed
+//!   work. Receipts bind Sybil/free-riding to the cost of running clients, not to
+//!   zero. Because earning is *identified*, the issuer sees the earning relay and
+//!   can rate-limit or blocklist it; a stronger future refinement is bilateral
+//!   receipts (both adjacent hops co-sign) plus issuer-side per-identity rate caps.
 
 use std::collections::{HashMap, HashSet};
 
@@ -21,6 +30,12 @@ use neo_core::{verify_signature, Error, NodeId, NodeIdentity, Result, SIGNATURE_
 
 /// Bytes a relay must prove it forwarded to earn one credit.
 pub const BYTES_PER_CREDIT: u64 = 1_000_000;
+
+/// Maximum bytes a single receipt may attest (100 credits' worth). Bounds the
+/// damage of any one forged/implausible receipt to a small, sane number of
+/// credits instead of the full `u64` range. A real circuit that moves more than
+/// this simply issues more than one receipt.
+pub const MAX_RECEIPT_BYTES: u64 = 100 * BYTES_PER_CREDIT;
 
 /// Domain separator for receipt signatures.
 const RECEIPT_DOMAIN: &[u8] = b"neo-relay-receipt-v1";
@@ -91,6 +106,11 @@ impl EarnLedger {
     /// receipts.
     pub fn record(&mut self, receipt: &RelayReceipt) -> Result<u64> {
         receipt.verify()?;
+        if receipt.bytes > MAX_RECEIPT_BYTES {
+            return Err(Error::Crypto(
+                "relay receipt exceeds per-receipt byte cap".into(),
+            ));
+        }
         let key = (receipt.relay, receipt.client, receipt.nonce);
         if !self.claimed.insert(key) {
             return Err(Error::Crypto("relay receipt already claimed".into()));
@@ -169,13 +189,37 @@ mod tests {
 
         // Gate issuance on the earned credit, then run the anonymous flow.
         assert!(earned >= 1);
+        let pk = issuer.public_key();
         let (blinded, secret) = request().unwrap();
         let issued = issuer.issue(&blinded).unwrap();
-        let credit = finalize(secret, issued).unwrap();
+        let credit = finalize(secret, issued, &pk).unwrap();
         assert!(
             issuer.redeem(&credit).is_ok(),
             "the earned credit spends once"
         );
         assert!(issuer.redeem(&credit).is_err(), "and only once");
+    }
+
+    #[test]
+    fn a_receipt_over_the_cap_is_rejected() {
+        // A validly-signed receipt claiming more than the per-receipt cap is
+        // refused, so one receipt cannot mint an implausible number of credits.
+        let client = NodeIdentity::generate().unwrap();
+        let relay = NodeIdentity::generate().unwrap().id();
+        let mut ledger = EarnLedger::new();
+
+        let greedy = RelayReceipt::issue(&client, relay, MAX_RECEIPT_BYTES + 1, nonce(9));
+        assert!(greedy.verify().is_ok(), "the signature itself is valid");
+        assert!(
+            ledger.record(&greedy).is_err(),
+            "but a receipt over the cap must be refused"
+        );
+
+        // A receipt exactly at the cap is fine and mints the expected credits.
+        let maxed = RelayReceipt::issue(&client, relay, MAX_RECEIPT_BYTES, nonce(10));
+        assert_eq!(
+            ledger.record(&maxed).unwrap(),
+            MAX_RECEIPT_BYTES / BYTES_PER_CREDIT
+        );
     }
 }

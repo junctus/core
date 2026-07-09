@@ -47,16 +47,33 @@ A **3-message, key-confirmed** PQ-hybrid AKE (`neo-crypto::handshake`):
 - **Encrypt-then-slice** k-of-n (`neo-slicing`) — AEAD-encrypt, Reed-Solomon erasure-code, with a
   **per-share MAC** so a corrupt shard is detected, attributed, and routed around. Secrecy is
   *computational* (rests on the AEAD key), not Shamir-information-theoretic — stated plainly in-crate.
-- **Anonymous credits** (`neo-credits`) — VOPRF (Privacy Pass) unlinkable tokens; earning is bound to
-  client-attested proof-of-relay receipts.
-- **Committee exit** (`neo-mpc`) — threshold secret-sharing of the request, and **Feldman-verifiable**
-  sharing of a session key so a minority learns nothing and a bad share is attributable.
+- **Anonymous credits** (`neo-credits`) — **verifiable** VOPRF (Privacy Pass) unlinkable tokens: the
+  issuer publishes a committed key and proves each blind evaluation with a **DLEQ proof**, so it cannot
+  key-tag earners to de-anonymize spends. Earning is bound to client-attested proof-of-relay receipts,
+  each capped so one receipt cannot mint an implausible number of credits.
+- **Committee exit** (`neo-mpc`) — threshold secret-sharing of the request; **Feldman-verifiable**
+  sharing of a session key (minority learns nothing, a bad share is attributable); and **threshold
+  decryption** (`neo-mpc::threshold`) where a message to the committee's joint key is decrypted by
+  **client-combined, DLEQ-proved partials** via Lagrange-in-the-exponent — so **no committee node ever
+  assembles the key or plaintext** (for the decrypt direction).
+- **Persistent circuit tunnels** (`neo-node::circuit`) — a long-lived Sphinx circuit carrying a
+  bidirectional byte stream as **counter-keyed onion cells** (no keystream reuse) with a **per-cell
+  end-to-end MAC**, and a real **TCP splice** at the exit — TCP-over-onion, integrity to parity with the
+  forward path.
+- **Probe-resistant transport** (`neo-crypto::reality`, `neo-transport`) — a **REALITY-style**
+  authenticator (uniform-random to anyone without the pre-shared server key, epoch-bound) driving a
+  silent **authenticate/decoy** split, plus **QUIC/MASQUE** and **WebRTC/DTLS** shape camouflage.
 - **Verifiable privacy** (`neo-verify`) — schnorrkel VRF + a commit-then-VRF unbiasable path seed;
   2-server PIR + keyword oblivious lookup; and a **ZK verifiable shuffle** (grand-product multiset
   equality over Pedersen commitments, Fiat–Shamir) that hides the permutation.
 
 ## Outstanding
 
-- Full **MPC-TLS** (compute the TLS session under MPC so plaintext is never assembled) and a
-  **succinct** ZK shuffle are research; the current constructions are honest, tested cores.
+- **Full MPC-TLS** for the *send* direction — computing the TLS handshake + record encryption under 2PC
+  so the committee can speak to a real upstream server without any member seeing plaintext (garbled-circuit
+  AES-GCM; TLSNotary/DECO/`mpz`) — remains research. The threshold decryption above closes the *decrypt*
+  side; a **succinct** ZK shuffle is likewise research. The current constructions are honest, tested cores.
+- **Wire-level transport integration** — wiring the REALITY decoy to a genuine upstream TLS site and
+  embedding the flight in a true TLS ClientHello; `Camouflage` today mimics observable shape, not full
+  QUIC/DTLS protocol crypto (a real QUIC transport lives behind the `quic` feature).
 - The **external cryptography audit** is the hard gate before real-world use.

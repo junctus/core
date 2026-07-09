@@ -396,6 +396,110 @@ mod tests {
         (0..n).map(|i| Scalar::from((i as u64 + 1) * 7)).collect()
     }
 
+    // ===================== ADVERSARIAL POC TESTS (TEMP) =====================
+
+    // Attack A: Can a cheating prover forge a MulProof where value(R) != p*q?
+    // We honestly commit P=Com(p), Q=Com(q), but set R=Com(p*q + delta) for
+    // delta != 0, then try to make the two verify equations pass.
+    #[test]
+    fn poc_mulproof_cannot_forge_wrong_product() {
+        let h = pedersen_h();
+        let p = Scalar::from(3u64);
+        let q = Scalar::from(5u64);
+        let pb = Scalar::from(11u64);
+        let qb = Scalar::from(13u64);
+        let rb = Scalar::from(17u64);
+        let p_c = commit(&h, &p, &pb);
+        let q_c = commit(&h, &q, &qb);
+        // Wrong product: p*q = 15, but commit to 16.
+        let bad_r = commit(&h, &(p * q + Scalar::ONE), &rb);
+        // Prover runs the honest prover but LIES about r_blind so that the
+        // r_prime it derives is consistent with bad_r? The honest prover derives
+        // r_prime = rb - p*qb, which corresponds to value pq, not pq+1.
+        let proof = MulProof::prove(&h, &p_c, &q_c, &bad_r, &p, &pb, &qb, &rb).unwrap();
+        // If the mul proof is sound, verifying against bad_r must FAIL.
+        assert!(
+            !proof.verify(&h, &p_c, &q_c, &bad_r),
+            "SOUNDNESS BREAK: mul proof accepted a wrong product"
+        );
+        // And the correct commitment must pass.
+        let good_r = commit(&h, &(p * q), &rb);
+        let good = MulProof::prove(&h, &p_c, &q_c, &good_r, &p, &pb, &qb, &rb).unwrap();
+        assert!(good.verify(&h, &p_c, &q_c, &good_r));
+    }
+
+    // Attack B: full-proof forgery for a NON-permutation by driving the honest
+    // machinery, but swapping the b_comms AFTER x is drawn? verify() recomputes
+    // x from the carried comms, so let's confirm we cannot get a stale-x proof.
+    // Here we instead test: does verify() recompute x from proof.a_comms/b_comms
+    // (so a prover cannot present comms different from those bound in x)?
+    #[test]
+    fn poc_verify_recomputes_x_from_carried_comms() {
+        let a = tags(4);
+        let b: Vec<Scalar> = a.iter().rev().copied().collect();
+        let proof = prove(&a, &b).unwrap();
+        assert!(verify(&proof));
+        // Tamper an a_comm to a different but VALID point. If verify recomputes x
+        // from the carried comms, the whole chain (LU_0 = U_0) breaks -> reject.
+        let mut tampered = proof.clone();
+        tampered.a_comms[0] = (RISTRETTO_BASEPOINT_POINT * Scalar::from(7u64)).compress();
+        assert!(!verify(&tampered), "tampered a_comm must be rejected");
+    }
+
+    // Attack C: identity running-product. If value(U_k) = 0 (i.e. a_k = -x),
+    // the product collapses to 0 on that side. Can a prover engineer a
+    // non-permutation whose products still match via a zero factor?
+    // We can't choose x (it's FS), so this is only a completeness probe: does an
+    // identity U_k slip past the is_identity guard (which only checks A_k)?
+    #[test]
+    fn poc_zero_factor_probe() {
+        // Construct inputs and outputs that are NOT a permutation but might share
+        // a product if a common zero factor appears. Hard to force x, so just
+        // sanity check a large non-permutation is rejected across many tries.
+        for seed in 0u64..32 {
+            let a: Vec<Scalar> = (0..5).map(|i| Scalar::from(seed * 100 + i + 1)).collect();
+            let mut b = a.clone();
+            b[0] += Scalar::ONE; // break the multiset
+            let proof = prove(&a, &b).unwrap();
+            assert!(!verify(&proof), "non-permutation accepted at seed {seed}");
+        }
+    }
+
+    // Attack D: Does pedersen_h() land on identity or a known-dlog point?
+    #[test]
+    fn poc_pedersen_h_is_nontrivial() {
+        let h = pedersen_h();
+        assert!(!h.is_identity(), "H must not be identity");
+        assert_ne!(h.compress(), RISTRETTO_BASEPOINT_POINT.compress(), "H != G");
+    }
+
+    // Attack E: can we forge a MulProof by CHOOSING t1,t2 after seeing... no,
+    // FS binds them. But test the classic: reuse a valid transcript with swapped
+    // R. Build a proof for R1, then present it for R2 != R1.
+    #[test]
+    fn poc_mulproof_not_transferable_across_r() {
+        let h = pedersen_h();
+        let (p, q, pb, qb, rb) = (
+            Scalar::from(3u64),
+            Scalar::from(5u64),
+            Scalar::from(11u64),
+            Scalar::from(13u64),
+            Scalar::from(17u64),
+        );
+        let p_c = commit(&h, &p, &pb);
+        let q_c = commit(&h, &q, &qb);
+        let r1 = commit(&h, &(p * q), &rb);
+        let proof = MulProof::prove(&h, &p_c, &q_c, &r1, &p, &pb, &qb, &rb).unwrap();
+        assert!(proof.verify(&h, &p_c, &q_c, &r1));
+        let r2 = commit(&h, &(p * q), &(rb + Scalar::ONE)); // same value, diff blind
+        assert!(
+            !proof.verify(&h, &p_c, &q_c, &r2),
+            "proof must be bound to the exact R it was made for"
+        );
+    }
+
+    // ===================== END ADVERSARIAL POC TESTS =======================
+
     #[test]
     fn a_real_permutation_verifies() {
         let a = tags(6);
