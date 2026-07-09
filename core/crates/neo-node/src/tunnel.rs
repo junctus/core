@@ -2,20 +2,32 @@
 //!
 //! [`bridge_packet_io`] adapts a TUN device (or any [`PacketIo`]) to a pair of
 //! packet channels. [`run_tunnel`] carries those packets to a peer: outbound
-//! packets go through the [`Mixer`] (timing delay + cover traffic), are sealed
-//! with the session, and become wire frames; inbound frames are opened, cover is
-//! dropped, and real packets are delivered. The two combine into a full tunnel;
-//! the wire frames are what the transport (`neo-transport`, or the M1 TCP link)
-//! carries.
+//! packets go through the [`Mixer`] (timing delay + cover traffic), are packed
+//! into a **fixed-size cell** and sealed with the session, and become wire frames;
+//! inbound frames are opened, cover is dropped, and real packets are delivered.
+//!
+//! Every cell — real or cover — is padded to exactly `CELL_HEADER + CELL_PAYLOAD`
+//! bytes before sealing, so a passive observer sees a uniform stream of
+//! identical-length frames: real and cover are indistinguishable by **length** as
+//! well as by content (the mixer already handles inter-packet timing). The wire
+//! frames are what the transport (`neo-transport`, or the M1 TCP link) carries.
 
 use neo_core::{Error, Result};
 use neo_crypto::Session;
 use neo_dataplane::PacketIo;
-use neo_mix::{MixOut, MixParams, Mixer};
+use neo_mix::{MixOut, MixParams, Mixer, COVER_SIZE};
 use tokio::sync::mpsc;
 
 const TAG_REAL: u8 = 0;
 const TAG_COVER: u8 = 1;
+
+/// Fixed cell payload capacity. Every outbound cell (real or cover) is padded to
+/// exactly this size before sealing, so a passive observer sees a uniform stream
+/// of identical-length frames — real and cover are indistinguishable by length.
+/// Sized to hold a full-MTU packet and to be at least `COVER_SIZE`.
+const CELL_PAYLOAD: usize = if COVER_SIZE > 1500 { COVER_SIZE } else { 1500 };
+/// Cell header: a 1-byte tag + a 2-byte real-payload length.
+const CELL_HEADER: usize = 3;
 
 /// Bridge a packet interface to channels: packets read from `io` go to `app_out`,
 /// packets from `app_in` are written to `io`. Runs until either side closes.
@@ -72,18 +84,23 @@ pub async fn run_tunnel(
 
     let outbound = async {
         while let Some(item) = mix_out_rx.recv().await {
-            let mut tagged = Vec::new();
+            // Every cell is a fixed size: [tag][u16 real-len][payload ‖ zero pad].
+            // Real and cover cells are therefore byte-identical in length.
+            let mut cell = vec![0u8; CELL_HEADER + CELL_PAYLOAD];
             match item {
                 MixOut::Real(packet) => {
-                    tagged.push(TAG_REAL);
-                    tagged.extend_from_slice(&packet);
+                    if packet.len() > CELL_PAYLOAD {
+                        return Err(Error::Decode("packet exceeds tunnel cell size".into()));
+                    }
+                    cell[0] = TAG_REAL;
+                    cell[1..3].copy_from_slice(&(packet.len() as u16).to_be_bytes());
+                    cell[CELL_HEADER..CELL_HEADER + packet.len()].copy_from_slice(&packet);
                 }
-                MixOut::Cover(size) => {
-                    tagged.push(TAG_COVER);
-                    tagged.resize(1 + size, 0);
+                MixOut::Cover(_) => {
+                    cell[0] = TAG_COVER; // real-len stays 0, all pad
                 }
             }
-            let frame = sealer.seal(&tagged)?;
+            let frame = sealer.seal(&cell)?;
             if wire_out.send(frame).await.is_err() {
                 break;
             }
@@ -94,14 +111,22 @@ pub async fn run_tunnel(
     let inbound = async {
         while let Some(frame) = wire_in.recv().await {
             let plain = opener.open(&frame)?;
-            match plain.split_first() {
-                Some((&TAG_REAL, payload)) => {
-                    if app_in.send(payload.to_vec()).await.is_err() {
+            if plain.len() < CELL_HEADER {
+                return Err(Error::Decode("short tunnel cell".into()));
+            }
+            match plain[0] {
+                TAG_REAL => {
+                    let len = u16::from_be_bytes([plain[1], plain[2]]) as usize;
+                    if CELL_HEADER + len > plain.len() {
+                        return Err(Error::Decode("bad tunnel cell length".into()));
+                    }
+                    let payload = plain[CELL_HEADER..CELL_HEADER + len].to_vec();
+                    if app_in.send(payload).await.is_err() {
                         break;
                     }
                 }
-                Some((&TAG_COVER, _)) => {} // decoy traffic: drop
-                _ => return Err(Error::Decode("empty tunnel frame".into())),
+                TAG_COVER => {} // decoy traffic: drop
+                _ => return Err(Error::Decode("unknown tunnel cell tag".into())),
             }
         }
         Ok::<(), Error>(())
