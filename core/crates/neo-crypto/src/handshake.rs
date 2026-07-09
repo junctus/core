@@ -36,6 +36,7 @@ use ml_kem::{Ciphertext, Encoded, EncodedSizeUser, KemCore, MlKem768};
 use neo_core::{Error, NodeId, NodeIdentity, Result};
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::Zeroize;
 
 use crate::session::Session;
 
@@ -227,7 +228,7 @@ pub fn responder_process(
     // Responder ephemeral X25519 and DH with the initiator's ephemeral.
     let eph_x = StaticSecret::from(random_32()?);
     let eph_x_pub = PublicKey::from(&eph_x);
-    let dh = eph_x.diffie_hellman(&public_key(eph_x_pub_i)?).to_bytes();
+    let mut dh = eph_x.diffie_hellman(&public_key(eph_x_pub_i)?).to_bytes();
 
     // Encapsulate to the initiator's ephemeral ML-KEM key.
     let ek = KemEncapKey::from_bytes(&encoded_ek(ek_i)?);
@@ -262,7 +263,10 @@ pub fn responder_process(
     );
     let sig_r = identity.sign(&signed_r);
 
-    let (k_i2r, k_r2i, k_confirm) = derive_keys(&dh, &shared_to_array(&ss[..])?, &th);
+    let mut ss_arr = shared_to_array(&ss[..])?;
+    let (k_i2r, k_r2i, k_confirm) = derive_keys(&dh, &ss_arr, &th);
+    dh.zeroize();
+    ss_arr.zeroize();
 
     let mut msg2 = Vec::new();
     put(&mut msg2, eph_x_pub.as_bytes());
@@ -339,7 +343,7 @@ pub fn initiator_finish(state: Initiator, msg2: &[u8]) -> Result<(Vec<u8>, Hands
         .map_err(|_| Error::Crypto("responder signature invalid".into()))?;
     let peer_id = node_id_from(id_pub_r, kex_r, kem_r)?;
 
-    let dh = state
+    let mut dh = state
         .eph_x
         .diffie_hellman(&public_key(eph_x_pub_r)?)
         .to_bytes();
@@ -350,7 +354,10 @@ pub fn initiator_finish(state: Initiator, msg2: &[u8]) -> Result<(Vec<u8>, Hands
         .decapsulate(&ct)
         .map_err(|_| Error::Crypto("ML-KEM decapsulation failed".into()))?;
 
-    let (k_i2r, k_r2i, k_confirm) = derive_keys(&dh, &shared_to_array(&ss[..])?, &th);
+    let mut ss_arr = shared_to_array(&ss[..])?;
+    let (k_i2r, k_r2i, k_confirm) = derive_keys(&dh, &ss_arr, &th);
+    dh.zeroize();
+    ss_arr.zeroize();
 
     // Produce the key-confirmation message (m3) the responder must verify.
     let mut msg3 = Vec::new();
@@ -384,6 +391,8 @@ fn derive_keys(
     hk.expand(b"neo r2i", &mut k_r2i).expect("hkdf r2i");
     hk.expand(b"neo confirm", &mut k_confirm)
         .expect("hkdf confirm");
+    // Wipe the concatenated IKM (dh ‖ ss) — it reconstructs both session keys.
+    ikm.zeroize();
     (k_i2r, k_r2i, k_confirm)
 }
 
