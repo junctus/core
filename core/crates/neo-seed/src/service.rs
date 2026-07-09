@@ -24,7 +24,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::Router;
-use neo_core::NodeIdentity;
+use neo_core::{NodeId, NodeIdentity};
 use neo_discovery::PeerRecord;
 
 use crate::health::dial_back;
@@ -83,6 +83,10 @@ struct AppState {
     snapshot_bytes: RwLock<Vec<u8>>,
     /// Last registration time per source IP (rate limiting).
     cooldowns: Mutex<HashMap<IpAddr, Instant>>,
+    /// Last registration time per relay **key** — bounds a single identity's
+    /// registration rate even across many source IPs (the per-IP limit alone is
+    /// bypassable with IP diversity).
+    key_cooldowns: Mutex<HashMap<NodeId, Instant>>,
     cooldown: Duration,
     /// Proxies whose `X-Forwarded-For` we trust.
     trusted_proxies: Vec<IpAddr>,
@@ -116,6 +120,7 @@ impl Seed {
             prober,
             snapshot_bytes: RwLock::new(Vec::new()),
             cooldowns: Mutex::new(HashMap::new()),
+            key_cooldowns: Mutex::new(HashMap::new()),
             cooldown: config.register_cooldown,
             trusted_proxies: config.trusted_proxies.clone(),
             allow_loopback: config.allow_loopback,
@@ -194,6 +199,11 @@ async fn post_register(
         Err(e) => return (StatusCode::BAD_REQUEST, format!("bad record: {e}\n")),
     };
 
+    // Per-key cooldown: bounds one identity's registration rate across IPs.
+    if !state.check_and_stamp_key_cooldown(record.id) {
+        return (StatusCode::TOO_MANY_REQUESTS, "slow down\n".to_string());
+    }
+
     match state.registry.lock().expect("registry").admit(record) {
         Ok(true) => (
             StatusCode::ACCEPTED,
@@ -216,6 +226,21 @@ impl AppState {
         }
         guard.insert(ip, now);
         // Opportunistically drop stale entries so the map can't grow forever.
+        let cooldown = self.cooldown;
+        guard.retain(|_, last| now.duration_since(*last) < cooldown * 4);
+        true
+    }
+
+    /// Enforce the per-key cooldown; records the timestamp when it passes.
+    fn check_and_stamp_key_cooldown(&self, id: NodeId) -> bool {
+        let mut guard = self.key_cooldowns.lock().expect("key cooldowns");
+        let now = Instant::now();
+        if let Some(last) = guard.get(&id) {
+            if now.duration_since(*last) < self.cooldown {
+                return false;
+            }
+        }
+        guard.insert(id, now);
         let cooldown = self.cooldown;
         guard.retain(|_, last| now.duration_since(*last) < cooldown * 4);
         true
@@ -309,6 +334,7 @@ mod tests {
             prober: NodeIdentity::generate().unwrap(),
             snapshot_bytes: RwLock::new(Vec::new()),
             cooldowns: Mutex::new(HashMap::new()),
+            key_cooldowns: Mutex::new(HashMap::new()),
             cooldown: Duration::from_secs(30),
             trusted_proxies: vec!["127.0.0.1".parse().unwrap()],
             allow_loopback: true,
