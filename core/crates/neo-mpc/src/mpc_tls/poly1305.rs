@@ -12,7 +12,10 @@
 //!
 //! Boundary: the field multiply + `mod 2¹³⁰−5` reduction is the heaviest gadget in
 //! the stack; it is built on the same adder as everything else and verified
-//! against the reference. Multi-block messages iterate the same circuit.
+//! against the reference. `tag_shared`/`tag_circuit` handle a **single 16-byte
+//! block only** (the high bit is hard-coded at position 128, so a partial final
+//! block would be mis-padded). Multi-block messages would iterate the same circuit
+//! by Horner — that iteration is **not** implemented here.
 
 use std::collections::HashSet;
 

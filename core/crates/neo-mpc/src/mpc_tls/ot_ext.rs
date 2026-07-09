@@ -8,6 +8,11 @@
 //! receiver is the base *sender*), which is the trick that lets a single `s` mask
 //! every extended OT. Modelled in-process as one function running the real base
 //! OTs; the transport is the caller's.
+//!
+//! **Semi-honest only.** There is no receiver-consistency check, so a malicious
+//! receiver that sends inconsistent `u` columns can leak bits of the sender's `s`
+//! (a selective-failure channel). The maliciously-secure variant (a correlation
+//! check / KOS-style consistency test) is the hardening step.
 
 use neo_core::{Error, Result};
 

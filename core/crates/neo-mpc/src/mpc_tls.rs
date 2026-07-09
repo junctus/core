@@ -4,9 +4,10 @@
 //! [`threshold`](crate::threshold) removed the single point of assembly for a
 //! *committee decrypt*. This module goes to the real thing: the classic 2PC-TLS
 //! construction (DECO / TLSNotary / `mpz` lineage) where the **client role of a
-//! TLS session is split across two parties**, P1 and P2, such that neither alone
-//! holds the traffic key or can read/forge a record — yet together they speak to
-//! a real TLS server.
+//! TLS session is split across two parties**, P1 and P2, such that — in the
+//! **semi-honest** model (see the boundary below) — neither alone holds the
+//! traffic key or can read/forge a record, yet together they speak to a real TLS
+//! server.
 //!
 //! It is built bottom-up from real primitives, each verified before the next:
 //! 1. [`ot`] — 1-of-2 **oblivious transfer** (Chou–Orlandi), so the evaluator can

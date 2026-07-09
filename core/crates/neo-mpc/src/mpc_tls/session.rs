@@ -54,6 +54,10 @@ impl PreMasterShares {
 /// `Z = server_secret·X`, and the two client parties' additive shares of `Z`.
 ///
 /// Neither client party knows `Z`: party *i* holds only `Zᵢ = xᵢ·Y`.
+///
+/// **Modelling note:** this is a self-contained *simulation* of the two client
+/// parties and the server — the server's secret is supplied locally to check the
+/// share math — not a live handshake against a remote server on its real curve.
 pub fn shared_ecdhe(
     server_secret: &Scalar,
 ) -> Result<(RistrettoPoint, RistrettoPoint, PreMasterShares)> {
