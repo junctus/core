@@ -24,7 +24,7 @@
 //!   can rate-limit or blocklist it; a stronger future refinement is bilateral
 //!   receipts (both adjacent hops co-sign) plus issuer-side per-identity rate caps.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use neo_core::{verify_signature, Error, NodeId, NodeIdentity, Result, SIGNATURE_LEN};
 
@@ -40,6 +40,10 @@ pub const MAX_RECEIPT_BYTES: u64 = 100 * BYTES_PER_CREDIT;
 /// Domain separator for receipt signatures.
 const RECEIPT_DOMAIN: &[u8] = b"neo-relay-receipt-v1";
 
+/// Longest lifetime a receipt may claim (past `now`), so a pre-signed receipt has
+/// a bounded validity window and the claimed-set only retains recent entries.
+pub const MAX_RECEIPT_LIFETIME: u64 = 7 * 24 * 3600;
+
 /// A client's signed attestation that `relay` forwarded `bytes` for a circuit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RelayReceipt {
@@ -49,6 +53,9 @@ pub struct RelayReceipt {
     pub bytes: u64,
     /// Per-circuit nonce, unique per receipt — prevents double-claiming.
     pub nonce: [u8; 32],
+    /// Unix time after which the receipt is no longer accepted. Bounds the window
+    /// a client can pre-sign receipts for and lets the claimed set age out.
+    pub expires_at: u64,
     /// The attesting client's Ed25519 verifying key.
     pub client: [u8; 32],
     /// The client's signature over the receipt body.
@@ -56,12 +63,20 @@ pub struct RelayReceipt {
 }
 
 impl RelayReceipt {
-    /// A client issues a receipt crediting `relay` for `bytes` on circuit `nonce`.
-    pub fn issue(client: &NodeIdentity, relay: NodeId, bytes: u64, nonce: [u8; 32]) -> Self {
+    /// A client issues a receipt crediting `relay` for `bytes` on circuit `nonce`,
+    /// valid until `expires_at`.
+    pub fn issue(
+        client: &NodeIdentity,
+        relay: NodeId,
+        bytes: u64,
+        nonce: [u8; 32],
+        expires_at: u64,
+    ) -> Self {
         let mut receipt = RelayReceipt {
             relay,
             bytes,
             nonce,
+            expires_at,
             client: client.public().signing.to_bytes(),
             sig: [0u8; SIGNATURE_LEN],
         };
@@ -75,11 +90,12 @@ impl RelayReceipt {
     }
 
     fn signable(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(RECEIPT_DOMAIN.len() + 72);
+        let mut out = Vec::with_capacity(RECEIPT_DOMAIN.len() + 80);
         out.extend_from_slice(RECEIPT_DOMAIN);
         out.extend_from_slice(self.relay.as_bytes());
         out.extend_from_slice(&self.bytes.to_be_bytes());
         out.extend_from_slice(&self.nonce);
+        out.extend_from_slice(&self.expires_at.to_be_bytes());
         out.extend_from_slice(&self.client);
         out
     }
@@ -95,8 +111,10 @@ pub struct EarnLedger {
     residual_bytes: HashMap<NodeId, u64>,
     /// Whole earned credits not yet redeemed for a token, per relay.
     earned: HashMap<NodeId, u64>,
-    /// `(relay, client, nonce)` triples already counted — replay/double-claim guard.
-    claimed: HashSet<(NodeId, [u8; 32], [u8; 32])>,
+    /// `(relay, client, nonce)` triples already counted → the receipt's expiry —
+    /// replay/double-claim guard. Expired entries are pruned so it can't grow
+    /// without bound.
+    claimed: HashMap<(NodeId, [u8; 32], [u8; 32]), u64>,
 }
 
 impl EarnLedger {
@@ -105,19 +123,30 @@ impl EarnLedger {
         Self::default()
     }
 
-    /// Verify and record a receipt. Returns the number of *whole new credits* the
-    /// relay has earned as a result (0 if it hasn't crossed the next threshold),
-    /// crediting them to the relay's earned balance and deducting the corresponding
-    /// bytes. Rejects forged or already-claimed receipts.
-    pub fn record(&mut self, receipt: &RelayReceipt) -> Result<u64> {
+    /// Verify and record a receipt as of time `now`. Returns the number of *whole
+    /// new credits* the relay has earned as a result (0 if it hasn't crossed the
+    /// next threshold), crediting them to the relay's earned balance and deducting
+    /// the corresponding bytes. Rejects forged, over-cap, expired, implausibly
+    /// long-lived, or already-claimed receipts.
+    pub fn record(&mut self, now: u64, receipt: &RelayReceipt) -> Result<u64> {
         receipt.verify()?;
         if receipt.bytes > MAX_RECEIPT_BYTES {
             return Err(Error::Crypto(
                 "relay receipt exceeds per-receipt byte cap".into(),
             ));
         }
+        if now >= receipt.expires_at {
+            return Err(Error::Crypto("relay receipt has expired".into()));
+        }
+        if receipt.expires_at > now.saturating_add(MAX_RECEIPT_LIFETIME) {
+            return Err(Error::Crypto(
+                "relay receipt lifetime is implausibly long".into(),
+            ));
+        }
+        // Prune expired claims so the guard set stays bounded.
+        self.claimed.retain(|_, exp| *exp > now);
         let key = (receipt.relay, receipt.client, receipt.nonce);
-        if !self.claimed.insert(key) {
+        if self.claimed.insert(key, receipt.expires_at).is_some() {
             return Err(Error::Crypto("relay receipt already claimed".into()));
         }
         let bucket = self.residual_bytes.entry(receipt.relay).or_insert(0);
@@ -159,6 +188,8 @@ mod tests {
     use super::*;
     use crate::{finalize, request, Issuer};
 
+    const NOW: u64 = 1_000_000;
+
     fn nonce(seed: u8) -> [u8; 32] {
         [seed; 32]
     }
@@ -171,10 +202,14 @@ mod tests {
 
         // Two half-credit receipts add up to exactly one credit.
         let half = BYTES_PER_CREDIT / 2;
-        let r1 = RelayReceipt::issue(&client, relay, half, nonce(1));
-        let r2 = RelayReceipt::issue(&client, relay, half, nonce(2));
-        assert_eq!(ledger.record(&r1).unwrap(), 0);
-        assert_eq!(ledger.record(&r2).unwrap(), 1, "two halves make one credit");
+        let r1 = RelayReceipt::issue(&client, relay, half, nonce(1), NOW + 3600);
+        let r2 = RelayReceipt::issue(&client, relay, half, nonce(2), NOW + 3600);
+        assert_eq!(ledger.record(NOW, &r1).unwrap(), 0);
+        assert_eq!(
+            ledger.record(NOW, &r2).unwrap(),
+            1,
+            "two halves make one credit"
+        );
         assert_eq!(ledger.residual(&relay), 0);
     }
 
@@ -185,18 +220,44 @@ mod tests {
         let mut ledger = EarnLedger::new();
 
         // Tampered byte count invalidates the signature.
-        let mut forged = RelayReceipt::issue(&client, relay, 10, nonce(1));
+        let mut forged = RelayReceipt::issue(&client, relay, 10, nonce(1), NOW + 3600);
         forged.bytes = BYTES_PER_CREDIT * 1000;
         assert!(forged.verify().is_err());
-        assert!(ledger.record(&forged).is_err());
+        assert!(ledger.record(NOW, &forged).is_err());
 
         // Replaying the same receipt is rejected.
-        let honest = RelayReceipt::issue(&client, relay, 10, nonce(2));
-        assert_eq!(ledger.record(&honest).unwrap(), 0);
+        let honest = RelayReceipt::issue(&client, relay, 10, nonce(2), NOW + 3600);
+        assert_eq!(ledger.record(NOW, &honest).unwrap(), 0);
         assert!(
-            ledger.record(&honest).is_err(),
+            ledger.record(NOW, &honest).is_err(),
             "the same receipt cannot be claimed twice"
         );
+    }
+
+    #[test]
+    fn expired_and_over_long_receipts_are_rejected() {
+        let client = NodeIdentity::generate().unwrap();
+        let relay = NodeIdentity::generate().unwrap().id();
+        let mut ledger = EarnLedger::new();
+
+        // Already expired at `now`.
+        let stale = RelayReceipt::issue(&client, relay, 10, nonce(1), NOW - 1);
+        assert!(
+            ledger.record(NOW, &stale).is_err(),
+            "an expired receipt is refused"
+        );
+
+        // Implausibly long lifetime (beyond MAX_RECEIPT_LIFETIME).
+        let forever =
+            RelayReceipt::issue(&client, relay, 10, nonce(2), NOW + MAX_RECEIPT_LIFETIME + 1);
+        assert!(
+            ledger.record(NOW, &forever).is_err(),
+            "an over-long receipt is refused"
+        );
+
+        // A normal receipt is accepted.
+        let ok = RelayReceipt::issue(&client, relay, 10, nonce(3), NOW + 3600);
+        assert_eq!(ledger.record(NOW, &ok).unwrap(), 0);
     }
 
     #[test]
@@ -208,9 +269,9 @@ mod tests {
         let mut issuer = Issuer::new().unwrap();
 
         // Prove a full credit's worth of relaying — recorded on the issuer's ledger.
-        let receipt = RelayReceipt::issue(&client, relay, BYTES_PER_CREDIT, nonce(7));
+        let receipt = RelayReceipt::issue(&client, relay, BYTES_PER_CREDIT, nonce(7), NOW + 3600);
         assert_eq!(
-            issuer.record_receipt(&receipt).unwrap(),
+            issuer.record_receipt(NOW, &receipt).unwrap(),
             1,
             "one credit earned"
         );
@@ -235,17 +296,18 @@ mod tests {
         let relay = NodeIdentity::generate().unwrap().id();
         let mut ledger = EarnLedger::new();
 
-        let greedy = RelayReceipt::issue(&client, relay, MAX_RECEIPT_BYTES + 1, nonce(9));
+        let greedy =
+            RelayReceipt::issue(&client, relay, MAX_RECEIPT_BYTES + 1, nonce(9), NOW + 3600);
         assert!(greedy.verify().is_ok(), "the signature itself is valid");
         assert!(
-            ledger.record(&greedy).is_err(),
+            ledger.record(NOW, &greedy).is_err(),
             "but a receipt over the cap must be refused"
         );
 
         // A receipt exactly at the cap is fine and mints the expected credits.
-        let maxed = RelayReceipt::issue(&client, relay, MAX_RECEIPT_BYTES, nonce(10));
+        let maxed = RelayReceipt::issue(&client, relay, MAX_RECEIPT_BYTES, nonce(10), NOW + 3600);
         assert_eq!(
-            ledger.record(&maxed).unwrap(),
+            ledger.record(NOW, &maxed).unwrap(),
             MAX_RECEIPT_BYTES / BYTES_PER_CREDIT
         );
     }

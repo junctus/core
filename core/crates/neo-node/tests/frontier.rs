@@ -44,8 +44,9 @@ fn m10_credit_is_unlinkable_and_single_use() {
         relay,
         neo_credits::earn::BYTES_PER_CREDIT,
         [1u8; 32],
+        1_000_000 + 3600,
     );
-    issuer.record_receipt(&receipt).unwrap();
+    issuer.record_receipt(1_000_000, &receipt).unwrap();
     let (blinded, secret) = request().unwrap();
     let issued = issuer.issue(&relay, &blinded).unwrap();
     let credit = finalize(secret, issued, &pk).unwrap();
@@ -126,8 +127,9 @@ fn frontier_composed_request_flow() {
         relay,
         neo_credits::earn::BYTES_PER_CREDIT,
         [2u8; 32],
+        1_000_000 + 3600,
     );
-    issuer.record_receipt(&receipt).unwrap();
+    issuer.record_receipt(1_000_000, &receipt).unwrap();
     let (blinded, secret) = request().unwrap();
     let credit = finalize(secret, issuer.issue(&relay, &blinded).unwrap(), &pk).unwrap();
     issuer

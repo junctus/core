@@ -84,12 +84,12 @@ impl Issuer {
         Ok(())
     }
 
-    /// Record a proof-of-relay receipt against the issuer's ledger, crediting the
-    /// earning relay. Returns the number of whole new credits earned. This is the
-    /// **only** way a relay accrues the earned balance [`issue`](Issuer::issue)
-    /// requires.
-    pub fn record_receipt(&mut self, receipt: &RelayReceipt) -> Result<u64> {
-        self.ledger.record(receipt)
+    /// Record a proof-of-relay receipt (as of time `now`) against the issuer's
+    /// ledger, crediting the earning relay. Returns the number of whole new credits
+    /// earned. This is the **only** way a relay accrues the earned balance
+    /// [`issue`](Issuer::issue) requires.
+    pub fn record_receipt(&mut self, now: u64, receipt: &RelayReceipt) -> Result<u64> {
+        self.ledger.record(now, receipt)
     }
 
     /// Whole earned credits `relay` has not yet redeemed for a token.
@@ -229,8 +229,10 @@ mod tests {
     fn earn_credit(issuer: &mut Issuer, nonce: u8) -> NodeId {
         let client = neo_core::NodeIdentity::generate().unwrap();
         let relay = neo_core::NodeIdentity::generate().unwrap().id();
-        let receipt = RelayReceipt::issue(&client, relay, BYTES_PER_CREDIT, [nonce; 32]);
-        assert_eq!(issuer.record_receipt(&receipt).unwrap(), 1);
+        let now = 1_000_000;
+        let receipt =
+            RelayReceipt::issue(&client, relay, BYTES_PER_CREDIT, [nonce; 32], now + 3600);
+        assert_eq!(issuer.record_receipt(now, &receipt).unwrap(), 1);
         relay
     }
 
