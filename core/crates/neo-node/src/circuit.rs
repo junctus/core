@@ -216,6 +216,7 @@ pub async fn serve_circuit<R: NextHop>(
     prev_session: Session,
     resolver: &R,
     replay: &Mutex<ReplayCache>,
+    policy: ExitPolicy,
 ) -> Result<()> {
     let (mut pr, pw) = prev_stream.into_split();
     let (pw_sealer, pr_opener) = {
@@ -254,9 +255,20 @@ pub async fn serve_circuit<R: NextHop>(
         Processed::Deliver { payload } => {
             let target = String::from_utf8(payload)
                 .map_err(|_| Error::Decode("circuit target not valid utf-8".into()))?;
-            exit_splice(secret, &target, pr, pr_opener, pw, pw_sealer).await
+            exit_splice(secret, &target, pr, pr_opener, pw, pw_sealer, policy).await
         }
     }
+}
+
+/// Policy governing what an exit may splice a TCP connection to. The default
+/// **denies** every non-public destination (loopback, RFC1918, link-local /
+/// metadata, ULA, CGNAT, hostnames) — an SSRF / open-proxy guard. `allow_loopback`
+/// opens localhost for local dev/test only; production leaves it `false`. Port
+/// allowlisting and a full exit policy are M31.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ExitPolicy {
+    /// Permit loopback splice targets (local dev/test only).
+    pub allow_loopback: bool,
 }
 
 /// A middle relay: strip one forward layer toward the exit, add one return layer
@@ -333,8 +345,20 @@ async fn exit_splice(
     mut pr_opener: Opener,
     mut pw: OwnedWriteHalf,
     mut pw_sealer: Sealer,
+    policy: ExitPolicy,
 ) -> Result<()> {
-    let tcp = TcpStream::connect(target).await?;
+    // SSRF / open-proxy guard: refuse to splice to any non-public destination.
+    if !neo_core::net::is_safe_dial_target(target, policy.allow_loopback) {
+        return Err(Error::Config(format!(
+            "exit refuses to splice to non-public target {target}"
+        )));
+    }
+    let tcp = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        TcpStream::connect(target),
+    )
+    .await
+    .map_err(|_| Error::Config("exit target connect timed out".into()))??;
     let (mut tr, mut tw) = tcp.into_split();
     let fk = fwd_key(&secret);
     let fmk = fwd_mac_key(&secret);
@@ -432,7 +456,17 @@ mod tests {
             let identity = NodeIdentity::from_bytes(&id_bytes).unwrap();
             let (stream, result) = accept(&listener, &identity).await.unwrap();
             let replay = Mutex::new(ReplayCache::new());
-            serve_circuit(&identity, stream, result.session, &resolver, &replay).await
+            serve_circuit(
+                &identity,
+                stream,
+                result.session,
+                &resolver,
+                &replay,
+                ExitPolicy {
+                    allow_loopback: true,
+                },
+            )
+            .await
         });
         (addr, handle)
     }

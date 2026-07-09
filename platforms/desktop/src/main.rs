@@ -91,6 +91,11 @@ enum Command {
         /// useful for local multi-relay demos where all relays share 127.0.0.1).
         #[arg(long, default_value_t = 30)]
         register_cooldown: u64,
+        /// Permit dial-back to loopback relays (local dev/test only). Off by
+        /// default so an attacker cannot make a public seed dial its own
+        /// localhost services (SSRF).
+        #[arg(long, default_value_t = false)]
+        allow_loopback: bool,
     },
     /// Fetch, verify, and print the current relay snapshot (diagnostics).
     Snapshot {
@@ -221,6 +226,7 @@ async fn main() -> anyhow::Result<()> {
             health_interval,
             snapshot_interval,
             register_cooldown,
+            allow_loopback,
         } => {
             run_seed(
                 &bind,
@@ -228,6 +234,7 @@ async fn main() -> anyhow::Result<()> {
                 health_interval,
                 snapshot_interval,
                 register_cooldown,
+                allow_loopback,
             )
             .await?
         }
@@ -357,6 +364,7 @@ async fn run_seed(
     health_interval: u64,
     snapshot_interval: u64,
     register_cooldown: u64,
+    allow_loopback: bool,
 ) -> anyhow::Result<()> {
     use std::time::Duration;
 
@@ -373,6 +381,7 @@ async fn run_seed(
         health_interval: Duration::from_secs(health_interval.max(1)),
         snapshot_interval: Duration::from_secs(snapshot_interval.max(1)),
         register_cooldown: Duration::from_secs(register_cooldown),
+        allow_loopback,
         ..SeedConfig::default()
     };
     let seed = Seed::new(witness, prober, config);

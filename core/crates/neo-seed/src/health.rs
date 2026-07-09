@@ -22,8 +22,17 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 /// Succeeds if *any* advertised address completes the handshake with a peer
 /// key equal to `record.signing`. Uses `prober` as the local identity for the
 /// handshake (a seed's own identity is fine — the check is one-directional).
-pub async fn dial_back(prober: &NodeIdentity, record: &PeerRecord) -> bool {
+///
+/// **SSRF guard:** an advertised address that is not a safe *public* IP:port
+/// literal (loopback, RFC1918, link-local / cloud metadata, ULA, CGNAT, or a
+/// hostname) is skipped, so an attacker cannot register a record naming an
+/// internal address and make the seed dial it. `allow_loopback` opens localhost
+/// for local dev/test only.
+pub async fn dial_back(prober: &NodeIdentity, record: &PeerRecord, allow_loopback: bool) -> bool {
     for addr in &record.addrs {
+        if !neo_core::net::is_safe_dial_target(addr, allow_loopback) {
+            continue;
+        }
         if handshake_matches(prober, addr, &record.signing).await {
             return true;
         }
@@ -62,7 +71,7 @@ mod tests {
             PeerRecord::build_signed(&relay_id, vec![addr], true, false, now_unix() + 3600, 1)
                 .unwrap();
         let prober = NodeIdentity::generate().unwrap();
-        assert!(dial_back(&prober, &record).await);
+        assert!(dial_back(&prober, &record, true).await);
         let _ = server.await;
     }
 
@@ -82,17 +91,17 @@ mod tests {
             PeerRecord::build_signed(&imposter, vec![addr], true, false, now_unix() + 3600, 1)
                 .unwrap();
         let prober = NodeIdentity::generate().unwrap();
-        assert!(!dial_back(&prober, &record).await);
+        assert!(!dial_back(&prober, &record, true).await);
         server.abort();
     }
 
     #[tokio::test]
     async fn dial_back_fails_on_a_dead_address() {
-        // Reserved TEST-NET-1 address that won't answer.
+        // A safe (loopback, dev) but closed port: dial fails, so attestation fails.
         let relay_id = NodeIdentity::generate().unwrap();
         let record = PeerRecord::build_signed(
             &relay_id,
-            vec!["192.0.2.1:9".into()],
+            vec!["127.0.0.1:1".into()],
             true,
             false,
             now_unix() + 3600,
@@ -100,6 +109,31 @@ mod tests {
         )
         .unwrap();
         let prober = NodeIdentity::generate().unwrap();
-        assert!(!dial_back(&prober, &record).await);
+        assert!(!dial_back(&prober, &record, true).await);
+    }
+
+    #[tokio::test]
+    async fn dial_back_refuses_internal_ssrf_targets() {
+        // A record naming internal addresses must never be dialed (SSRF guard),
+        // even though the record itself is validly signed.
+        let relay_id = NodeIdentity::generate().unwrap();
+        let record = PeerRecord::build_signed(
+            &relay_id,
+            vec![
+                "169.254.169.254:80".into(), // cloud metadata
+                "10.0.0.1:443".into(),       // RFC1918
+                "127.0.0.1:9000".into(),     // loopback (allow_loopback=false)
+            ],
+            true,
+            false,
+            now_unix() + 3600,
+            1,
+        )
+        .unwrap();
+        let prober = NodeIdentity::generate().unwrap();
+        assert!(
+            !dial_back(&prober, &record, false).await,
+            "internal targets must not be dialed"
+        );
     }
 }

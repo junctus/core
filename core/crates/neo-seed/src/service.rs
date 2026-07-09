@@ -49,6 +49,10 @@ pub struct SeedConfig {
     /// everyone else is keyed by their real socket address, so a client cannot
     /// spoof `X-Forwarded-For` to mint unlimited distinct cooldown keys.
     pub trusted_proxies: Vec<IpAddr>,
+    /// Permit dial-back to loopback targets (local dev/test only). Production
+    /// leaves this `false` so an attacker cannot make the seed dial its own
+    /// localhost services (SSRF).
+    pub allow_loopback: bool,
 }
 
 impl Default for SeedConfig {
@@ -63,6 +67,7 @@ impl Default for SeedConfig {
                 "127.0.0.1".parse().expect("v4 loopback"),
                 "::1".parse().expect("v6 loopback"),
             ],
+            allow_loopback: false,
         }
     }
 }
@@ -81,6 +86,8 @@ struct AppState {
     cooldown: Duration,
     /// Proxies whose `X-Forwarded-For` we trust.
     trusted_proxies: Vec<IpAddr>,
+    /// Whether dial-back may target loopback (dev/test).
+    allow_loopback: bool,
 }
 
 impl AppState {
@@ -111,6 +118,7 @@ impl Seed {
             cooldowns: Mutex::new(HashMap::new()),
             cooldown: config.register_cooldown,
             trusted_proxies: config.trusted_proxies.clone(),
+            allow_loopback: config.allow_loopback,
         });
         // Publish an initial (empty) signed snapshot immediately.
         state.resign_snapshot();
@@ -238,7 +246,7 @@ fn spawn_health_loop(state: Arc<AppState>, interval: Duration) {
             ticker.tick().await;
             let due = state.registry.lock().expect("registry").due_for_check();
             for record in due {
-                let ok = dial_back(&state.prober, &record).await;
+                let ok = dial_back(&state.prober, &record, state.allow_loopback).await;
                 state
                     .registry
                     .lock()
@@ -279,6 +287,7 @@ mod tests {
             cooldowns: Mutex::new(HashMap::new()),
             cooldown: Duration::from_secs(30),
             trusted_proxies: vec!["127.0.0.1".parse().unwrap()],
+            allow_loopback: true,
         });
         state.resign_snapshot();
         state
