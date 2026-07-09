@@ -12,7 +12,15 @@
 //! that 1-bit selective-failure channel and is the remaining step.
 //!
 //! Modelled in-process; the equality test here compares hashes of the parties'
-//! check values, revealing only the equal/not-equal bit.
+//! check values, revealing only the equal/not-equal bit. The advertised ≤1-bit
+//! leakage is the guarantee of the *referenced protocol* run over a committed,
+//! simultaneous secure-equality channel — this hash-compare stands in for that
+//! subprotocol, it does not itself provide it.
+//!
+//! **Not wired into the TLS session.** The shipped `session`/`sha256`/`poly1305`
+//! gadgets run the *pure semi-honest* [`garble::eval_2pc`](super::garble::eval_2pc);
+//! `dual_execute` here is a standalone, tested demonstration of the technique, not
+//! (yet) on the MPC-TLS path.
 
 use std::collections::HashSet;
 

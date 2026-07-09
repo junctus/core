@@ -5,14 +5,20 @@
 //! clearnet request. This turns "no responsible exit" from a *statistical*
 //! property (M7's rotating exits) into a *cryptographic* one.
 //!
-//! ## What is implemented (real, information-theoretic)
+//! ## What is implemented
 //!
 //! The clearnet request is **threshold secret-shared** (Shamir over GF(256)) into
-//! one share per committee member. Any `k-1` members — even colluding — learn
-//! *nothing* about the destination or payload (this is Shamir's information-
-//! theoretic guarantee, not a computational assumption). Any `k` members
-//! reconstruct it. A hash bound into the secret makes a corrupted or swapped
-//! share detectable at reconstruction.
+//! one share per committee member: any `k` reconstruct it, and a hash bound into
+//! the secret makes a corrupted/swapped share detectable at reconstruction.
+//!
+//! **Honesty caveat on secrecy.** Textbook Shamir gives *information-theoretic*
+//! secrecy (any `k-1` shares reveal nothing). The shipped backing crate `sharks
+//! 0.5.0` (unmaintained, RUSTSEC-2024-0398) draws the top polynomial coefficient
+//! from `1..=255` rather than `0..=255`, so a below-threshold coalition gets a
+//! *small statistical* advantage — the information-theoretic bound holds only for a
+//! bias-free implementation. Migrating to a vetted GF(256) Shamir (e.g. the
+//! `blahaj` fork) with a share-uniformity test is tracked as hardening; the
+//! verifiable [`vss`] path (used by the real MPC-TLS flow) does not depend on it.
 //!
 //! ## Toward MPC-TLS (partly closed)
 //!
@@ -149,7 +155,9 @@ impl MemberShare {
 }
 
 /// Secret-share `request` across a committee. Returns one [`MemberShare`] per
-/// member; hand exactly one to each. Any `threshold-1` of them reveal nothing.
+/// member; hand exactly one to each. Any `threshold-1` of them reveal (almost)
+/// nothing — see the crate doc's honesty caveat on the `sharks 0.5.0` coefficient
+/// bias; the guarantee is information-theoretic only for a bias-free Shamir.
 pub fn deal(request: &ClearnetRequest, cfg: CommitteeConfig) -> Result<Vec<MemberShare>> {
     cfg.validate()?;
 

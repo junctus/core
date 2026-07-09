@@ -145,12 +145,14 @@ pub fn combine_ciphertext(share1: &[u8], share2: &[u8]) -> Vec<u8> {
 /// only XOR-shares of the traffic key, derive the Poly1305 one-time key from
 /// keystream block 0, encrypt with block 1, and MAC the ciphertext — every
 /// non-linear step inside the garbled circuit — so **neither ever holds the key,
-/// the keystream, or the plaintext**. Returns the public record `(ciphertext,
-/// tag)`, which verifies against a stock ChaCha20-Poly1305 implementation.
+/// the keystream, or the plaintext**. Returns the public record `(ciphertext, tag)`.
 ///
-/// One 16-byte block; the RFC 8439 AEAD's AAD handling and length-block framing
-/// add further Poly1305 blocks through the very same [`poly1305::tag_shared`]
-/// circuit (Horner iteration), noted as the faithful-framing detail.
+/// **Not the RFC 8439 AEAD tag.** The tag here is a single-block Poly1305 over the
+/// bare 16-byte ciphertext; the RFC AEAD tag additionally MACs the AAD and a final
+/// `len(AAD) ‖ len(CT)` length block. So this verifies against a stock **Poly1305**
+/// of the ciphertext, **not** against a stock ChaCha20-Poly1305 AEAD. Full RFC
+/// framing (AAD + length block) iterates the same [`poly1305::tag_shared`] circuit
+/// (Horner) and is the remaining step.
 pub fn seal_record_shared(
     key_a: &[u8; 32],
     key_b: &[u8; 32],
@@ -285,8 +287,8 @@ mod tests {
         // The two parties, each holding only a key share, seal the record under 2PC.
         let (ciphertext, tag) = seal_record_shared(&key_a, &key_b, &nonce, &pt_a, &pt_b).unwrap();
 
-        // It matches a stock ChaCha20-Poly1305 sealing: poly key = block 0, encrypt
-        // under block 1, MAC the ciphertext.
+        // It matches the ChaCha20-Poly1305 *primitives* (not the full RFC AEAD tag):
+        // poly key = block 0, encrypt under block 1, raw Poly1305 over the ciphertext.
         let key: [u8; 32] = core::array::from_fn(|i| key_a[i] ^ key_b[i]);
         let block0 = chacha20_block_ref(&key, 0, &nonce);
         let poly_key: [u8; 32] = block0[..32].try_into().unwrap();
