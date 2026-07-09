@@ -6,13 +6,21 @@
 //! is acceptable. The order of preference is: fetch fresh from the configured
 //! mirrors; if none are reachable, fall back to a still-valid cached snapshot
 //! so a client that has run before can bootstrap fully offline of the seeds.
+//!
+//! When a client already holds a cached snapshot it first asks for a **delta**
+//! (`GET /snapshot/diff`) instead of the whole set: it sends its set's
+//! fingerprint, applies whatever changed, and re-verifies the reconstructed
+//! snapshot against the witnesses. The delta is a pure optimization — any
+//! failure (an unreachable endpoint, a plain CDN mirror, a malformed or
+//! non-verifying result) falls back to a full fetch, which is verified the same
+//! way — so anti-rollback can't be downgraded by forcing the fallback.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use neo_discovery::now_unix;
-use neo_discovery::snapshot::SignedSnapshot;
+use neo_discovery::snapshot::{manifest_digest, SignedSnapshot, SnapshotDelta};
 use neo_discovery::PeerRecord;
 
 use crate::defaults::{DiscoveryConfig, CACHE_MAX_AGE};
@@ -55,14 +63,6 @@ fn bump_hwm(created_at: u64) {
     }
 }
 
-/// Anti-rollback decision: a snapshot is acceptable only if it is at least as
-/// new as the newest one previously accepted — so an untrusted mirror cannot
-/// freeze the client on a stale-but-validly-signed snapshot (e.g. to keep it
-/// routing through an already-evicted relay). Pure for testability.
-fn accepts_created_at(created_at: u64, hwm: u64) -> bool {
-    created_at >= hwm
-}
-
 fn http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(HTTP_TIMEOUT)
@@ -90,41 +90,93 @@ pub async fn obtain_snapshot(cfg: &DiscoveryConfig) -> Result<SignedSnapshot> {
     }
 }
 
-/// Fetch `/snapshot` from each mirror in turn; return the first that verifies.
+/// Fetch a verified snapshot from each mirror in turn; return the first that
+/// verifies. If a cached snapshot exists it is used as a delta base, so most
+/// refreshes transfer only what changed.
 pub async fn fetch_verified(cfg: &DiscoveryConfig) -> Result<SignedSnapshot> {
     let client = http_client()?;
     let now = now_unix();
+    let hwm = read_hwm();
+    let base = cached_base();
     let mut last_err = anyhow!("no mirrors configured");
 
     for mirror in &cfg.mirrors {
-        let url = format!("{mirror}/snapshot");
-        match fetch_one(&client, &url).await {
-            Ok(bytes) => match SignedSnapshot::from_bytes(&bytes) {
-                Ok(snapshot) => match snapshot.verify(&cfg.witnesses, cfg.threshold, now) {
-                    Ok(()) if !accepts_created_at(snapshot.snapshot.created_at, read_hwm()) => {
-                        last_err = anyhow!(
-                            "{mirror}: snapshot rolled back (created_at {} < last accepted {})",
-                            snapshot.snapshot.created_at,
-                            read_hwm()
-                        );
-                    }
-                    Ok(()) => {
-                        bump_hwm(snapshot.snapshot.created_at);
-                        tracing::info!(
-                            mirror = %mirror,
-                            relays = snapshot.relays(now).len(),
-                            "fetched verified snapshot"
-                        );
-                        return Ok(snapshot);
-                    }
-                    Err(e) => last_err = anyhow!("{mirror}: snapshot failed verification: {e}"),
-                },
-                Err(e) => last_err = anyhow!("{mirror}: malformed snapshot: {e}"),
-            },
+        match fetch_from_mirror(&client, mirror, cfg, base.as_ref(), now, hwm).await {
+            Ok(snapshot) => {
+                tracing::info!(
+                    mirror = %mirror,
+                    relays = snapshot.relays(now).len(),
+                    "fetched verified snapshot"
+                );
+                return Ok(snapshot);
+            }
             Err(e) => last_err = anyhow!("{mirror}: {e}"),
         }
     }
     Err(last_err)
+}
+
+/// Fetch and verify a snapshot from one mirror: try a delta first (if we have a
+/// base), then a full `/snapshot`. Both paths verify identically.
+async fn fetch_from_mirror(
+    client: &reqwest::Client,
+    mirror: &str,
+    cfg: &DiscoveryConfig,
+    base: Option<&SignedSnapshot>,
+    now: u64,
+    hwm: u64,
+) -> Result<SignedSnapshot> {
+    if let Some(base) = base {
+        if let Some(snapshot) = try_delta(client, mirror, cfg, base, now, hwm).await {
+            return Ok(snapshot);
+        }
+    }
+    let body = fetch_one(client, &format!("{mirror}/snapshot")).await?;
+    let snapshot = SignedSnapshot::from_bytes(&body).context("malformed snapshot")?;
+    accept_snapshot(snapshot, cfg, now, hwm)
+}
+
+/// Best-effort delta fetch: request `/snapshot/diff` with our base fingerprint,
+/// apply the returned delta (or accept a full snapshot the seed sent instead),
+/// and verify the result. Returns `None` on **any** failure so the caller falls
+/// back to a full fetch — a delta is only ever an optimization, and the result
+/// is verified against the witnesses exactly like a full snapshot.
+async fn try_delta(
+    client: &reqwest::Client,
+    mirror: &str,
+    cfg: &DiscoveryConfig,
+    base: &SignedSnapshot,
+    now: u64,
+    hwm: u64,
+) -> Option<SignedSnapshot> {
+    let digest = manifest_digest(&base.snapshot.relays);
+    let url = format!("{mirror}/snapshot/diff?base={}", hex::encode(digest));
+    let (body, is_delta) = fetch_with_kind(client, &url).await.ok()?;
+    let snapshot = if is_delta {
+        SnapshotDelta::from_bytes(&body)
+            .ok()?
+            .apply(&base.snapshot.relays)
+    } else {
+        // The seed didn't recognize our base and sent a full snapshot instead.
+        SignedSnapshot::from_bytes(&body).ok()?
+    };
+    accept_snapshot(snapshot, cfg, now, hwm).ok()
+}
+
+/// Verify a snapshot (signatures + freshness/anti-rollback) and advance the
+/// high-water mark. Shared by the delta and full paths so anti-rollback is
+/// enforced identically and cannot be downgraded by forcing a full fallback.
+fn accept_snapshot(
+    snapshot: SignedSnapshot,
+    cfg: &DiscoveryConfig,
+    now: u64,
+    hwm: u64,
+) -> Result<SignedSnapshot> {
+    snapshot
+        .verify_fresh(&cfg.witnesses, cfg.threshold, now, hwm)
+        .context("snapshot failed verification or was rolled back")?;
+    bump_hwm(snapshot.snapshot.created_at);
+    Ok(snapshot)
 }
 
 async fn fetch_one(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
@@ -135,6 +187,32 @@ async fn fetch_one(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
     Ok(resp.bytes().await.context("reading body")?.to_vec())
 }
 
+/// Fetch a body and whether the seed marked it a delta (`X-Neo-Diff: delta`)
+/// rather than a full snapshot.
+async fn fetch_with_kind(client: &reqwest::Client, url: &str) -> Result<(Vec<u8>, bool)> {
+    let resp = client.get(url).send().await.context("request failed")?;
+    if !resp.status().is_success() {
+        bail!("HTTP {}", resp.status());
+    }
+    let is_delta = resp
+        .headers()
+        .get("x-neo-diff")
+        .map(|v| v.as_bytes() == b"delta")
+        .unwrap_or(false);
+    Ok((
+        resp.bytes().await.context("reading body")?.to_vec(),
+        is_delta,
+    ))
+}
+
+/// The cached snapshot's relay set, to use as a delta base. Parsed only — the
+/// reconstructed result is fully verified, so a stale or even corrupt base at
+/// worst forces a full-snapshot fallback, never an unverified acceptance.
+fn cached_base() -> Option<SignedSnapshot> {
+    let bytes = std::fs::read(cache_path().ok()?).ok()?;
+    SignedSnapshot::from_bytes(&bytes).ok()
+}
+
 /// Load and re-verify the cached snapshot, honoring both its own expiry and the
 /// local [`CACHE_MAX_AGE`] freshness bound.
 pub fn load_cached(cfg: &DiscoveryConfig) -> Option<SignedSnapshot> {
@@ -142,13 +220,13 @@ pub fn load_cached(cfg: &DiscoveryConfig) -> Option<SignedSnapshot> {
     let bytes = std::fs::read(&path).ok()?;
     let snapshot = SignedSnapshot::from_bytes(&bytes).ok()?;
     let now = now_unix();
-    snapshot.verify(&cfg.witnesses, cfg.threshold, now).ok()?;
+    // Verify signatures + anti-rollback (same check the online paths use).
+    snapshot
+        .verify_fresh(&cfg.witnesses, cfg.threshold, now, read_hwm())
+        .ok()?;
     // Reject a snapshot that's technically valid but older than we're willing
-    // to run on without a refetch, or that would roll back the relay set.
+    // to run on without a refetch.
     if now.saturating_sub(snapshot.snapshot.created_at) > CACHE_MAX_AGE.as_secs() {
-        return None;
-    }
-    if !accepts_created_at(snapshot.snapshot.created_at, read_hwm()) {
         return None;
     }
     Some(snapshot)
@@ -197,16 +275,81 @@ pub fn pick_relay(relays: &[&PeerRecord]) -> Option<PeerRecord> {
 
 #[cfg(test)]
 mod tests {
-    use super::accepts_created_at;
+    use super::*;
+    use neo_core::NodeIdentity;
+    use neo_discovery::snapshot::Snapshot;
+
+    fn witnessed(
+        witness: &NodeIdentity,
+        relays: Vec<PeerRecord>,
+        created_at: u64,
+    ) -> SignedSnapshot {
+        let snapshot = Snapshot {
+            created_at,
+            expires_at: created_at + 3600,
+            relays,
+        };
+        let signatures = vec![snapshot.sign(witness)];
+        SignedSnapshot {
+            snapshot,
+            signatures,
+        }
+    }
+
+    fn cfg_for(witness: &NodeIdentity) -> DiscoveryConfig {
+        DiscoveryConfig {
+            mirrors: vec!["https://example.invalid".into()],
+            witnesses: vec![witness.public().signing.to_bytes()],
+            threshold: 1,
+        }
+    }
 
     #[test]
-    fn anti_rollback_accepts_newer_or_equal_rejects_older() {
-        // First ever snapshot (hwm = 0) is accepted.
-        assert!(accepts_created_at(1000, 0));
-        // A newer or equal snapshot is accepted.
-        assert!(accepts_created_at(2000, 1000));
-        assert!(accepts_created_at(1000, 1000));
-        // An older (rolled-back) snapshot is rejected.
-        assert!(!accepts_created_at(999, 1000));
+    fn delta_applied_to_a_base_verifies_like_a_full_snapshot() {
+        // End-to-end of the client delta path without HTTP: a base set, a delta
+        // that adds a relay, applied and verified exactly as fetch would.
+        let w = NodeIdentity::generate().unwrap();
+        let cfg = cfg_for(&w);
+        let now = now_unix();
+
+        let a = NodeIdentity::generate().unwrap();
+        let base_rec =
+            PeerRecord::build_signed(&a, vec!["1.1.1.1:1".into()], true, false, now + 3600, 1)
+                .unwrap();
+        let base = witnessed(&w, vec![base_rec.clone()], now);
+
+        let b = NodeIdentity::generate().unwrap();
+        let added =
+            PeerRecord::build_signed(&b, vec!["2.2.2.2:2".into()], true, false, now + 3600, 1)
+                .unwrap();
+        let mut new_set = vec![base_rec, added.clone()];
+        new_set.sort_by(|x, y| x.id.as_bytes().cmp(y.id.as_bytes()));
+        let new_snapshot = Snapshot {
+            created_at: now + 1,
+            expires_at: now + 3601,
+            relays: new_set,
+        };
+        let delta = SnapshotDelta {
+            created_at: new_snapshot.created_at,
+            expires_at: new_snapshot.expires_at,
+            upserts: vec![added],
+            removed: vec![],
+            signatures: vec![new_snapshot.sign(&w)],
+        };
+
+        let reconstructed = delta.apply(&base.snapshot.relays);
+        // The client's accept step (verify + anti-rollback) succeeds.
+        let accepted = accept_snapshot(reconstructed, &cfg, now, 0).unwrap();
+        assert_eq!(accepted.snapshot.relays.len(), 2);
+    }
+
+    #[test]
+    fn accept_snapshot_enforces_anti_rollback() {
+        let w = NodeIdentity::generate().unwrap();
+        let cfg = cfg_for(&w);
+        let now = now_unix();
+        let snap = witnessed(&w, vec![], now);
+        // A snapshot older than the high-water mark is refused on both paths.
+        assert!(accept_snapshot(snap, &cfg, now, now + 1).is_err());
     }
 }
