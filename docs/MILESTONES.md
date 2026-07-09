@@ -205,6 +205,90 @@ PIR/oblivious peer discovery + ZK proof-of-mixing, so privacy is provable rather
 
 ---
 
+## Hardening & expansion
+
+### M14 — Core security hardening ✅ (14 findings fixed; 4 heaviest tracked)
+Driven by the adversarial internal review in `docs/SECURITY_ANALYSIS.md` (four parallel reviews across
+the AKE/session, Sphinx, slicing/mix/routing, and discovery/forwarding surfaces).
+- Done (with regression tests): **C-1** exit-verified Sphinx payload integrity; **C-2** reject the
+  identity `α`; **H-1** authenticate header before recording the replay tag; **H-2** relay shares one
+  lifetime `ReplayCache`; **H-3** bind the full `NodeId` (kex/kem) into the handshake + return it (UKS);
+  **H-5** stop trusting `X-Forwarded-For` (trusted-proxy allowlist + right-most hop); **H-6** slicing
+  secrecy documented as computational; **H-7** feed all 32 seed bytes into seeded path selection
+  (keyed XOF + rejection sampling); **M-1** `Router` dedup by `NodeId`; **M-2** reject trailing bytes
+  after handshake messages; **M-4** bind the slicing header as AEAD associated data; **M-5** mixer
+  degrades instead of panicking on RNG failure; **M-7** bound frame allocation (64 KiB); **M-8**
+  concurrent routes must be fully node-disjoint (no shared exit).
+- Tracked (the heaviest): **H-4** key-confirmation flight + m1 anti-replay (a 3-message redesign);
+  **M-3** per-share authentication (a share-format change); **M-6** client snapshot anti-rollback
+  persistence; full **wide-block non-malleable payload** for complete tagging resistance.
+- Done when: those four close with tests; then the external audit gate.
+
+### M15 — Bidirectional streaming ✅ (request/response round-trip; persistent TCP tunnel next)
+Extend the one-shot onion delivery (M4.6) with a **return path**, giving a full round-trip.
+- Done: `neo-node::stream` — since Sphinx already makes the *forward* payload confidential to the exit,
+  only the reverse direction is layered. Each hop derives a **return-path stream key** from the Sphinx
+  shared secret it already computes (`create_packet_keyed` gives the client all of them); the exit
+  encrypts its response and each relay adds its own layer, so a middle relay never sees the plaintext
+  response and the client (holding all keys) peels them.
+- Deferred: a persistent multi-cell byte stream / TCP tunnel (per-cell counters + connection splicing)
+  and per-layer stream integrity (same wide-block hardening as the Sphinx payload, M14).
+- Tests: 1- and 2-hop request/response over real sockets; middle relay cannot read the response.
+
+### M16 — NAT traversal ✅ (reachability + ladder + libp2p behaviours; hole-punch needs real NAT)
+Reachability detection + a connection ladder wired to real libp2p behaviours — the deferred half of M4.
+- Done: `Reachability` (AutoNAT-driven) + `connection_ladder_for` (a public node skips hole-punching a
+  directly-dialable peer; a NAT'd node tries Direct → DCUtR hole-punch → Circuit Relay v2). The libp2p
+  backend now carries **AutoNAT**, **Circuit Relay v2 client**, and **DCUtR** behaviours, and exposes
+  `reachability()`. Crates: `neo-discovery`.
+- Deferred/honest: end-to-end hole-punching between two NAT'd hosts needs a real-NAT environment to
+  exercise; here the strategy is unit-tested and the behaviours are wired + compile + co-exist with the
+  DHT (the two-node connect and cross-node lookup tests still pass under the `libp2p` feature).
+
+### M17 — Earn-side credit accounting ✅ (proof-of-relay receipts)
+Bind credit issuance to proven relayed bandwidth. Done: `neo-credits::earn` — client-signed
+[`RelayReceipt`]s, an `EarnLedger` that verifies + de-duplicates them and converts proven bytes into
+earned credits, gating the (identified) issuance while spending stays anonymous. Honest limit: receipts
+are client-attested, not a trustless bandwidth measurement (bilateral co-signed receipts are the
+refinement). Tests: accumulate-to-credit, forged/replayed rejection, earn→unlinkable-spend lifecycle.
+
+### M18 — DoH rendezvous bootstrap ✅
+Censorship-resistant seed/witness bootstrap over DNS-over-HTTPS so the mirror/witness list rotates
+without a client rebuild and the lookup resists blocking.
+- Done: `neo-discovery::bootstrap` — a `BootstrapRecord` (current mirrors + witnesses) signed by a
+  long-lived **bootstrap key** (only that key is baked into clients), with rollback protection
+  (`not_before`) and a compact hex TXT encoding. CLI `doh` module fetches the TXT over DoH (JSON API),
+  joins the character-strings, and verifies against the trusted bootstrap keys. Commands:
+  `neo bootstrap-record` (operator signs + prints the TXT to publish) and `neo bootstrap-resolve`
+  (client fetches + verifies over DoH). Crates: `neo-discovery` / CLI.
+- Tests: sign/verify/TXT round-trip, untrusted-key + tamper + rollback rejection, garbage-safe parse,
+  DoH-JSON TXT extraction + chunk-join, and an end-to-end record-through-the-TXT-channel test.
+
+### M19 — ZK verifiable shuffle ✅ (sound, ZK; not succinct, not audited)
+A real zero-knowledge shuffle argument replacing the `proof_of_mixing` conservation scaffold.
+- Done: `neo-verify::shuffle` — a **grand-product / multiset-equality** argument over Ristretto Pedersen
+  commitments with chained ZK **multiplication proofs** and a final equality proof, all Fiat–Shamir.
+  The verifier learns nothing of the permutation; soundness rests on discrete-log (Pedersen binding) in
+  the ROM; proof size is `O(n)`.
+- Deferred/honest: not succinct (constant-size), and **not** independently audited; binding the scalar
+  tags to actual mix packets is the integration step.
+- Tests: real/identity/single-element permutations verify; dropped, altered, and duplicated tags and a
+  tampered commitment are all rejected.
+
+### M20 — MPC-TLS committee ✅ (verifiable custody; full 2PC-TLS still deferred)
+Advance the M12 committee with **verifiable** key custody.
+- Done: `neo-mpc::vss` — encrypt the request under a fresh session key, then **Feldman-verifiably**
+  secret-share the *key* over Ristretto: every member can check its share against public commitments, a
+  minority learns nothing (Shamir), and a corrupted share is detected **and attributed** at open time.
+- Deferred/honest: full 2PC/MPC-TLS — computing the TLS session under MPC so the plaintext is never
+  assembled at any single point, including the send to the real server (TLSNotary/`mpz` lineage) —
+  remains research; key reconstruction here still assembles the key at decrypt time.
+- Tests: threshold opens, minority cannot, every share verifies, a corrupted share is attributed.
+
+---
+
 ## Audit gate ⬜
 External security + cryptography audit **before anyone relies on neo for real safety.** This is a hard
 gate, not a milestone to rush past.
+
+[`RelayReceipt`]: ../core/crates/neo-credits/src/earn.rs

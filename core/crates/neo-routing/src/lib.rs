@@ -37,7 +37,16 @@ pub struct Router {
 
 impl Router {
     /// Build a router over a fixed relay set.
+    ///
+    /// **Deduplicates by `NodeId`**: the node-disjoint guarantee is what stops a
+    /// single relay from ever holding ≥ 2 of a flow's k shares. Selection is
+    /// disjoint over *indices*, so a relay list containing one identity twice
+    /// (e.g. a Sybil advertising two addresses) could otherwise place the same
+    /// node on two "disjoint" paths. Keeping the first entry per id makes
+    /// index-disjoint imply node-disjoint.
     pub fn new(relays: Vec<Relay>) -> Self {
+        let mut seen = std::collections::HashSet::new();
+        let relays = relays.into_iter().filter(|r| seen.insert(r.id)).collect();
         Self { relays }
     }
 
@@ -98,6 +107,11 @@ impl Router {
     /// Select a path *deterministically* from a 32-byte seed — e.g. a VRF output
     /// (see `neo-verify`). Because the seed is verifiable and unbiasable, the
     /// chosen path is reproducible and cannot be ground by an adversary (M11).
+    ///
+    /// The permutation is driven by a keyed BLAKE3 XOF over the **full 32-byte**
+    /// seed with rejection sampling — so all 256 bits of VRF entropy bind the
+    /// path (a 64-bit PRNG could not even reach most permutations once there are
+    /// ≳21 relays) and there is no modulo bias.
     pub fn select_path_seeded(&self, seed: &[u8; 32], hops: usize) -> Result<Vec<Relay>> {
         if hops == 0 {
             return Err(Error::Config("a path needs at least one hop".into()));
@@ -108,11 +122,11 @@ impl Router {
                 self.relays.len()
             )));
         }
-        let mut state = u64::from_le_bytes(seed[..8].try_into().expect("32-byte seed"));
         let n = self.relays.len();
+        let mut reader = blake3::Hasher::new_keyed(seed).finalize_xof();
         let mut order: Vec<usize> = (0..n).collect();
         for i in (1..n).rev() {
-            let j = (splitmix64(&mut state) % (i as u64 + 1)) as usize;
+            let j = draw_below(&mut reader, i as u64 + 1) as usize;
             order.swap(i, j);
         }
         Ok(order
@@ -123,13 +137,20 @@ impl Router {
     }
 }
 
-/// A small deterministic PRNG (SplitMix64) for reproducible seeded selection.
-fn splitmix64(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut z = *state;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
+/// Draw a uniform value in `0..bound` from a BLAKE3 XOF with rejection sampling
+/// (no modulo bias). `bound` is small (a relay count), so rejections are rare.
+fn draw_below(reader: &mut blake3::OutputReader, bound: u64) -> u64 {
+    debug_assert!(bound > 0);
+    // Largest multiple of `bound` that fits in u64; reject draws at or above it.
+    let limit = u64::MAX - (u64::MAX % bound);
+    loop {
+        let mut b = [0u8; 8];
+        reader.fill(&mut b);
+        let v = u64::from_le_bytes(b);
+        if v < limit {
+            return v % bound;
+        }
+    }
 }
 
 /// A uniformly random permutation of `0..n` from OS randomness (Fisher–Yates).
@@ -183,6 +204,16 @@ mod tests {
     fn path_needs_enough_relays() {
         let router = Router::new(relays(2));
         assert!(router.select_path(3).is_err());
+    }
+
+    #[test]
+    fn duplicate_node_ids_are_deduplicated() {
+        // The same relay listed twice must not let index-disjoint selection put
+        // one node on two "disjoint" paths.
+        let base = relays(1).pop().unwrap();
+        let dup = base.clone();
+        let router = Router::new(vec![base, dup]);
+        assert_eq!(router.len(), 1, "duplicate NodeId collapsed to one relay");
     }
 
     #[test]

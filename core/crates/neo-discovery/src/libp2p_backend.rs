@@ -17,7 +17,8 @@ use libp2p::kad::store::{MemoryStore, RecordStore};
 use libp2p::kad::{GetRecordOk, InboundRequest, QueryId, QueryResult, Quorum, Record, RecordKey};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{
-    identify, kad, noise, tcp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
+    autonat, dcutr, identify, kad, noise, relay, tcp, yamux, Multiaddr, PeerId, StreamProtocol,
+    Swarm, SwarmBuilder,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -29,13 +30,22 @@ use neo_core::NodeId;
 // return types as `neo_core::Result` instead.
 use neo_core::Error;
 
-/// The neo network behaviour: Kademlia DHT for discovery + identify for peer info.
+/// The neo network behaviour: Kademlia DHT + identify, plus the NAT-traversal
+/// stack (M16) — AutoNAT (reachability detection), Circuit Relay v2 client
+/// (reach/be-reached via a relay), and DCUtR (direct-connection upgrade /
+/// hole-punching).
 #[derive(NetworkBehaviour)]
 pub struct Behaviour {
     /// Trackerless peer/record discovery.
     pub kademlia: kad::Behaviour<MemoryStore>,
-    /// Exchanges peer identity and observed addresses.
+    /// Exchanges peer identity and observed addresses (feeds AutoNAT/DCUtR).
     pub identify: identify::Behaviour,
+    /// Detects whether this node is publicly reachable or behind NAT.
+    pub autonat: autonat::Behaviour,
+    /// Circuit Relay v2 client: connect to / be reachable through a relay.
+    pub relay_client: relay::client::Behaviour,
+    /// Direct-connection upgrade (hole-punching) once a relayed path exists.
+    pub dcutr: dcutr::Behaviour,
 }
 
 /// A libp2p node running the neo network behaviour.
@@ -61,7 +71,11 @@ impl Libp2pNode {
                 yamux::Config::default,
             )
             .map_err(|e| Error::Config(format!("libp2p tcp transport: {e}")))?
-            .with_behaviour(|key| {
+            // Circuit Relay v2 client: upgrades the transport so this node can be
+            // reached (and reach others) through a relay when behind NAT.
+            .with_relay_client(noise::Config::new, yamux::Config::default)
+            .map_err(|e| Error::Config(format!("libp2p relay client: {e}")))?
+            .with_behaviour(|key, relay_client| {
                 let peer_id = key.public().to_peer_id();
                 let mut cfg = kad::Config::new(StreamProtocol::new("/neo/kad/1.0.0"));
                 // Query over independent paths so one adversarial routing-table
@@ -77,6 +91,9 @@ impl Libp2pNode {
                         "/neo/id/1.0.0".into(),
                         key.public(),
                     )),
+                    autonat: autonat::Behaviour::new(peer_id, autonat::Config::default()),
+                    relay_client,
+                    dcutr: dcutr::Behaviour::new(peer_id),
                 }
             })
             .map_err(|e| Error::Config(format!("libp2p behaviour: {e}")))?
@@ -119,6 +136,17 @@ impl Libp2pNode {
     /// This node's libp2p peer id.
     pub fn peer_id(&self) -> PeerId {
         *self.swarm.local_peer_id()
+    }
+
+    /// This node's current reachability as determined by AutoNAT (M16). Feeds
+    /// [`connection_ladder_for`](crate::connection_ladder_for) so a public node
+    /// skips hole-punching a peer it can dial directly.
+    pub fn reachability(&self) -> crate::Reachability {
+        match self.swarm.behaviour().autonat.nat_status() {
+            autonat::NatStatus::Public(_) => crate::Reachability::Public,
+            autonat::NatStatus::Private => crate::Reachability::Private,
+            autonat::NatStatus::Unknown => crate::Reachability::Unknown,
+        }
     }
 
     /// Start listening on a multiaddr (e.g. `/ip4/127.0.0.1/tcp/0`).

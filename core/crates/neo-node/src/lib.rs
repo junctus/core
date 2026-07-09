@@ -12,6 +12,7 @@
 
 pub mod forward;
 pub mod run;
+pub mod stream;
 pub mod tunnel;
 
 use neo_core::{NodeConfig, NodeId, NodeIdentity};

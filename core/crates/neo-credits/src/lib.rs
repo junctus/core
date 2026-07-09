@@ -14,6 +14,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod earn;
+
 use std::collections::HashSet;
 
 use neo_core::{Error, Result};

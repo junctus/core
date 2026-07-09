@@ -12,3 +12,4 @@ schnorrkel.workspace = true
 rand_core.workspace = true
 getrandom.workspace = true
 blake3.workspace = true
+curve25519-dalek.workspace = true

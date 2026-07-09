@@ -17,6 +17,7 @@ tun = ["neo-node/tun", "neo-dataplane/tun"]
 
 [dependencies]
 neo-core.workspace = true
+neo-crypto.workspace = true
 neo-node.workspace = true
 neo-mix.workspace = true
 neo-dataplane.workspace = true
@@ -30,3 +31,4 @@ tracing-subscriber.workspace = true
 hex.workspace = true
 reqwest.workspace = true
 getrandom.workspace = true
+serde_json.workspace = true

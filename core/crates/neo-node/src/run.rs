@@ -10,8 +10,11 @@ use neo_crypto::{initiator_finish, initiator_message1, responder_process, Handsh
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-/// Reject absurd frame sizes early (handshake messages are a few KB).
-const MAX_FRAME: usize = 16 * 1024 * 1024;
+/// Reject absurd frame sizes early. The largest legitimate frame is a PQ-hybrid
+/// handshake message (~2.5 KB: two ML-KEM keys) or a fixed-size onion packet
+/// (~2.4 KB); 64 KiB is a generous ceiling that bounds the per-connection
+/// allocation an attacker can trigger with a forged length prefix.
+const MAX_FRAME: usize = 64 * 1024;
 
 /// Write a length-prefixed frame to any writer (a stream or a split write half).
 pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, data: &[u8]) -> Result<()> {

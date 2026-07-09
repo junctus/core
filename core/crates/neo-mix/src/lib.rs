@@ -128,9 +128,17 @@ pub fn sample_exponential(mean: Duration) -> Duration {
 }
 
 /// A uniform float in `(0, 1]` from the OS CSPRNG.
+///
+/// A transient OS-RNG failure must **not** panic the long-lived mixer task (a
+/// panic there stops mixing entirely). On the rare failure we degrade to a
+/// safe, non-degenerate fraction so a delay is still produced; the unbiasable
+/// timing property only holds while the RNG works, but availability is
+/// preserved either way.
 fn uniform_open_unit() -> f64 {
     let mut bytes = [0u8; 8];
-    getrandom::getrandom(&mut bytes).expect("OS RNG unavailable");
+    if getrandom::getrandom(&mut bytes).is_err() {
+        return 0.5;
+    }
     // 53-bit mantissa, shifted into (0, 1].
     let x = u64::from_le_bytes(bytes) >> 11;
     (x as f64 + 1.0) / (1u64 << 53) as f64

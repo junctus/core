@@ -19,6 +19,7 @@ use core::fmt;
 
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 use curve25519_dalek::ristretto::CompressedRistretto;
+use curve25519_dalek::traits::IsIdentity;
 use curve25519_dalek::Scalar;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use ml_kem::{Encoded, EncodedSizeUser, KemCore, MlKem768};
@@ -206,12 +207,20 @@ impl NodeIdentity {
     }
 
     /// Sphinx shared secret `route_scalar · alpha` (compressed). Errors if
-    /// `alpha` is not a valid Ristretto point.
+    /// `alpha` is not a valid Ristretto point **or is the identity element**.
+    ///
+    /// Rejecting the identity is essential: `identity · route_scalar` is the
+    /// identity for *every* node's key, so an `alpha` of the identity would yield
+    /// a node-independent, publicly-known shared secret — letting anyone derive a
+    /// victim's per-hop keys and forge a packet it accepts, with no key at all.
     pub fn sphinx_shared(&self, alpha: [u8; 32]) -> Result<[u8; 32]> {
         let point = CompressedRistretto::from_slice(&alpha)
             .map_err(|_| Error::Decode("bad Ristretto point length".into()))?
             .decompress()
             .ok_or_else(|| Error::Crypto("alpha is not a valid Ristretto point".into()))?;
+        if point.is_identity() {
+            return Err(Error::Crypto("alpha is the identity point".into()));
+        }
         Ok((point * self.route_scalar()).compress().to_bytes())
     }
 

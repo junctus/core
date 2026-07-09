@@ -19,8 +19,9 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use neo_core::{NodeId, NodeIdentity};
+use neo_crypto::ReplayCache;
 use neo_discovery::{now_unix, PeerRecord};
-use neo_node::forward::{handle_onion, Hop, Outcome};
+use neo_node::forward::{handle_onion_shared, Hop, Outcome};
 use tokio::net::TcpListener;
 
 use crate::defaults::DiscoveryConfig;
@@ -110,6 +111,11 @@ pub async fn run_relay(
     let resolver: Resolver = Arc::new(RwLock::new(HashMap::new()));
     spawn_resolver_refresh(cfg.clone(), resolver.clone());
 
+    // One replay cache for the relay's whole lifetime, shared across every
+    // connection — so a Sphinx packet replayed on a *new* connection is
+    // rejected (a per-connection cache would make replay defense a no-op).
+    let replay = Arc::new(std::sync::Mutex::new(ReplayCache::new()));
+
     // Serve onions forever, one task per connection so a slow forward (dialing
     // the next hop) never blocks accepting new ones.
     let identity = Arc::new(identity);
@@ -119,10 +125,19 @@ pub async fn run_relay(
             Ok((mut stream, mut result)) => {
                 let identity = identity.clone();
                 let resolver = resolver.clone();
+                let replay = replay.clone();
                 tokio::spawn(async move {
                     // Snapshot the address book so the borrow doesn't cross await.
                     let addrs = resolver.read().expect("resolver lock").clone();
-                    match handle_onion(&identity, &mut stream, &mut result.session, &addrs).await {
+                    match handle_onion_shared(
+                        &identity,
+                        &mut stream,
+                        &mut result.session,
+                        &addrs,
+                        &replay,
+                    )
+                    .await
+                    {
                         Ok(Outcome::Delivered { payload }) => {
                             println!(
                                 "delivered {} bytes: {}",

@@ -27,6 +27,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod vss;
+
 use neo_core::{Error, Result};
 use sharks::{Share, Sharks};
 
@@ -47,7 +49,7 @@ pub struct ClearnetRequest {
 impl ClearnetRequest {
     /// Serialize `[domain][2-byte dest len][dest][payload]` — the plaintext body
     /// that gets secret-shared (after a hash is prepended; see [`deal`]).
-    fn body(&self) -> Result<Vec<u8>> {
+    pub(crate) fn body(&self) -> Result<Vec<u8>> {
         if self.destination.len() > u16::MAX as usize {
             return Err(Error::Config("destination too long".into()));
         }
@@ -58,7 +60,7 @@ impl ClearnetRequest {
         Ok(out)
     }
 
-    fn from_body(bytes: &[u8]) -> Result<Self> {
+    pub(crate) fn from_body(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < 2 {
             return Err(Error::Decode("committee request too short".into()));
         }

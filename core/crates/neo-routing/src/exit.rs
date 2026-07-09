@@ -5,7 +5,7 @@
 //! responsibility is spread thin and rotated (the *statistical* "no responsible
 //! exit"; the cryptographic committee exit is M12).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use neo_core::{Error, NodeId, Result};
 
@@ -95,10 +95,19 @@ impl ExitSelector {
     }
 }
 
-/// Tracks routes currently in use so no two *concurrent* requests share a full route.
+/// Tracks routes currently in use so no two *concurrent* requests share **any
+/// hop** — including the exit.
+///
+/// Rejecting only byte-identical routes (the old behavior) let two concurrent
+/// requests share an exit node as long as an upstream hop differed, which
+/// concentrates exit exposure on one node exactly when the design wants it
+/// diffused. This registry enforces full node-disjointness across all active
+/// routes instead.
 #[derive(Default)]
 pub struct RouteRegistry {
     active: HashSet<Vec<[u8; 32]>>,
+    /// Reference count of each node across all active routes.
+    busy_nodes: HashMap<NodeId, usize>,
 }
 
 impl RouteRegistry {
@@ -111,14 +120,33 @@ impl RouteRegistry {
         route.iter().map(|r| *r.id.as_bytes()).collect()
     }
 
-    /// Register a route as active. Returns `false` if an identical route is already active.
+    /// Register a route as active. Returns `false` if it shares any node with an
+    /// already-active route (so concurrent routes stay fully node-disjoint).
     pub fn try_register(&mut self, route: &[Relay]) -> bool {
-        self.active.insert(Self::key(route))
+        if route.iter().any(|r| self.busy_nodes.contains_key(&r.id)) {
+            return false;
+        }
+        if !self.active.insert(Self::key(route)) {
+            return false;
+        }
+        for relay in route {
+            *self.busy_nodes.entry(relay.id).or_insert(0) += 1;
+        }
+        true
     }
 
     /// Release a route when its request completes.
     pub fn release(&mut self, route: &[Relay]) {
-        self.active.remove(&Self::key(route));
+        if self.active.remove(&Self::key(route)) {
+            for relay in route {
+                if let Some(count) = self.busy_nodes.get_mut(&relay.id) {
+                    *count -= 1;
+                    if *count == 0 {
+                        self.busy_nodes.remove(&relay.id);
+                    }
+                }
+            }
+        }
     }
 
     /// Number of routes currently active.
@@ -192,5 +220,22 @@ mod tests {
         assert_eq!(registry.active_count(), 1);
         registry.release(&route);
         assert!(registry.try_register(&route), "reusable once released");
+    }
+
+    #[test]
+    fn concurrent_routes_may_not_share_an_exit() {
+        // Two different routes that share the exit node must not both be active.
+        let shared_exit = relay();
+        let route_a = [relay(), shared_exit.clone()];
+        let route_b = [relay(), shared_exit.clone()];
+        let mut registry = RouteRegistry::new();
+        assert!(registry.try_register(&route_a));
+        assert!(
+            !registry.try_register(&route_b),
+            "a concurrent route sharing the exit must be rejected"
+        );
+        // After releasing A, the exit is free again.
+        registry.release(&route_a);
+        assert!(registry.try_register(&route_b));
     }
 }

@@ -26,7 +26,7 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use hkdf::Hkdf;
 use ml_kem::kem::{Decapsulate, Encapsulate};
 use ml_kem::{Ciphertext, Encoded, EncodedSizeUser, KemCore, MlKem768};
-use neo_core::{Error, NodeIdentity, Result};
+use neo_core::{Error, NodeId, NodeIdentity, Result};
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -43,6 +43,11 @@ pub struct HandshakeResult {
     pub session: Session,
     /// The peer's long-term Ed25519 verifying key (their authenticated identity).
     pub peer: VerifyingKey,
+    /// The peer's full self-certifying [`NodeId`], recomputed from all three
+    /// long-term keys proven **in-band**. Authorize on this — not on a key from
+    /// an out-of-band record — so a handshake cannot be attributed to the wrong
+    /// node identity (unknown-key-share).
+    pub peer_id: NodeId,
 }
 
 /// Initiator state carried between the two handshake messages.
@@ -61,12 +66,17 @@ pub fn initiator_message1(identity: &NodeIdentity) -> Result<(Initiator, Vec<u8>
     let ek_bytes = eph_kem_ek.as_bytes();
 
     let nonce = random_32()?;
-    let id_pub = identity.public().signing;
+    let public = identity.public();
+    let id_pub = public.signing;
+    let kex = *public.kex.as_bytes();
+    let kem = public.kem_bytes();
 
     let signed = bind_m1(
         eph_x_pub.as_bytes(),
         ek_bytes.as_ref(),
         id_pub.as_bytes(),
+        &kex,
+        &kem,
         &nonce,
     );
     let sig = identity.sign(&signed);
@@ -75,6 +85,8 @@ pub fn initiator_message1(identity: &NodeIdentity) -> Result<(Initiator, Vec<u8>
     put(&mut msg1, eph_x_pub.as_bytes());
     put(&mut msg1, ek_bytes.as_ref());
     put(&mut msg1, id_pub.as_bytes());
+    put(&mut msg1, &kex);
+    put(&mut msg1, &kem);
     put(&mut msg1, &nonce);
     put(&mut msg1, &sig.to_bytes());
 
@@ -97,13 +109,25 @@ pub fn responder_process(
     let eph_x_pub_i = get(&mut cur)?;
     let ek_i = get(&mut cur)?;
     let id_pub_i = get(&mut cur)?;
+    let kex_i = get(&mut cur)?;
+    let kem_i = get(&mut cur)?;
     let nonce_i = get(&mut cur)?;
     let sig_i = get(&mut cur)?;
+    // Reject trailing bytes: they are not covered by `sig_i` (which signs the
+    // parsed fields) but *are* hashed into the transcript, so an on-path
+    // attacker appending one byte would desync the two sides' keys — a silent
+    // DoS. Refuse the message instead.
+    if !cur.is_empty() {
+        return Err(Error::Decode(
+            "trailing bytes after handshake message 1".into(),
+        ));
+    }
 
     let peer = verifying_key(id_pub_i)?;
-    let signed = bind_m1(eph_x_pub_i, ek_i, id_pub_i, nonce_i);
+    let signed = bind_m1(eph_x_pub_i, ek_i, id_pub_i, kex_i, kem_i, nonce_i);
     peer.verify_strict(&signed, &signature(sig_i)?)
         .map_err(|_| Error::Crypto("initiator signature invalid".into()))?;
+    let peer_id = node_id_from(id_pub_i, kex_i, kem_i)?;
 
     // Responder ephemeral X25519 and DH with the initiator's ephemeral.
     let eph_x = StaticSecret::from(random_32()?);
@@ -118,12 +142,17 @@ pub fn responder_process(
     let ct_bytes = &ct[..];
 
     let nonce_r = random_32()?;
-    let id_pub_r = identity.public().signing;
+    let public_r = identity.public();
+    let id_pub_r = public_r.signing;
+    let kex_r = *public_r.kex.as_bytes();
+    let kem_r = public_r.kem_bytes();
     let th = transcript(
         msg1,
         eph_x_pub.as_bytes(),
         ct_bytes,
         id_pub_r.as_bytes(),
+        &kex_r,
+        &kem_r,
         &nonce_r,
     );
 
@@ -132,6 +161,8 @@ pub fn responder_process(
         eph_x_pub.as_bytes(),
         ct_bytes,
         id_pub_r.as_bytes(),
+        &kex_r,
+        &kem_r,
         &nonce_r,
     );
     let sig_r = identity.sign(&signed_r);
@@ -142,6 +173,8 @@ pub fn responder_process(
     put(&mut msg2, eph_x_pub.as_bytes());
     put(&mut msg2, ct_bytes);
     put(&mut msg2, id_pub_r.as_bytes());
+    put(&mut msg2, &kex_r);
+    put(&mut msg2, &kem_r);
     put(&mut msg2, &nonce_r);
     put(&mut msg2, &sig_r.to_bytes());
 
@@ -150,6 +183,7 @@ pub fn responder_process(
         HandshakeResult {
             session: Session::new(k_r2i, k_i2r),
             peer,
+            peer_id,
         },
     ))
 }
@@ -160,14 +194,30 @@ pub fn initiator_finish(state: Initiator, msg2: &[u8]) -> Result<HandshakeResult
     let eph_x_pub_r = get(&mut cur)?;
     let ct_bytes = get(&mut cur)?;
     let id_pub_r = get(&mut cur)?;
+    let kex_r = get(&mut cur)?;
+    let kem_r = get(&mut cur)?;
     let nonce_r = get(&mut cur)?;
     let sig_r = get(&mut cur)?;
+    if !cur.is_empty() {
+        return Err(Error::Decode(
+            "trailing bytes after handshake message 2".into(),
+        ));
+    }
 
     let peer = verifying_key(id_pub_r)?;
-    let th = transcript(&state.msg1, eph_x_pub_r, ct_bytes, id_pub_r, nonce_r);
-    let signed_r = bind_m2(&th, eph_x_pub_r, ct_bytes, id_pub_r, nonce_r);
+    let th = transcript(
+        &state.msg1,
+        eph_x_pub_r,
+        ct_bytes,
+        id_pub_r,
+        kex_r,
+        kem_r,
+        nonce_r,
+    );
+    let signed_r = bind_m2(&th, eph_x_pub_r, ct_bytes, id_pub_r, kex_r, kem_r, nonce_r);
     peer.verify_strict(&signed_r, &signature(sig_r)?)
         .map_err(|_| Error::Crypto("responder signature invalid".into()))?;
+    let peer_id = node_id_from(id_pub_r, kex_r, kem_r)?;
 
     let dh = state
         .eph_x
@@ -184,6 +234,7 @@ pub fn initiator_finish(state: Initiator, msg2: &[u8]) -> Result<HandshakeResult
     Ok(HandshakeResult {
         session: Session::new(k_i2r, k_r2i),
         peer,
+        peer_id,
     })
 }
 
@@ -201,28 +252,59 @@ fn derive_keys(dh: &[u8; 32], ss: &[u8; 32], transcript: &[u8; 32]) -> ([u8; 32]
     (k_i2r, k_r2i)
 }
 
-fn transcript(msg1: &[u8], eph_x_r: &[u8], ct: &[u8], id_r: &[u8], nonce_r: &[u8]) -> [u8; 32] {
+#[allow(clippy::too_many_arguments)]
+fn transcript(
+    msg1: &[u8],
+    eph_x_r: &[u8],
+    ct: &[u8],
+    id_r: &[u8],
+    kex_r: &[u8],
+    kem_r: &[u8],
+    nonce_r: &[u8],
+) -> [u8; 32] {
     let mut h = Hasher::new();
-    for part in [DOMAIN, msg1, eph_x_r, ct, id_r, nonce_r] {
+    for part in [DOMAIN, msg1, eph_x_r, ct, id_r, kex_r, kem_r, nonce_r] {
         h.update(part);
     }
     *h.finalize().as_bytes()
 }
 
-fn bind_m1(eph_x: &[u8], ek: &[u8], id: &[u8], nonce: &[u8]) -> Vec<u8> {
+fn bind_m1(eph_x: &[u8], ek: &[u8], id: &[u8], kex: &[u8], kem: &[u8], nonce: &[u8]) -> Vec<u8> {
     let mut v = Vec::new();
-    for part in [DOMAIN, b"|m1|".as_ref(), eph_x, ek, id, nonce] {
+    for part in [DOMAIN, b"|m1|".as_ref(), eph_x, ek, id, kex, kem, nonce] {
         v.extend_from_slice(part);
     }
     v
 }
 
-fn bind_m2(th: &[u8], eph_x: &[u8], ct: &[u8], id: &[u8], nonce: &[u8]) -> Vec<u8> {
+#[allow(clippy::too_many_arguments)]
+fn bind_m2(
+    th: &[u8],
+    eph_x: &[u8],
+    ct: &[u8],
+    id: &[u8],
+    kex: &[u8],
+    kem: &[u8],
+    nonce: &[u8],
+) -> Vec<u8> {
     let mut v = Vec::new();
-    for part in [DOMAIN, b"|m2|".as_ref(), th, eph_x, ct, id, nonce] {
+    for part in [DOMAIN, b"|m2|".as_ref(), th, eph_x, ct, id, kex, kem, nonce] {
         v.extend_from_slice(part);
     }
     v
+}
+
+/// Recompute a peer's self-certifying [`NodeId`] from the long-term keys it
+/// proved in-band — so the caller authorizes on the identity actually
+/// authenticated, not one taken from an out-of-band record.
+fn node_id_from(signing: &[u8], kex: &[u8], kem: &[u8]) -> Result<NodeId> {
+    let s: [u8; 32] = signing
+        .try_into()
+        .map_err(|_| Error::Decode("bad signing key length".into()))?;
+    let k: [u8; 32] = kex
+        .try_into()
+        .map_err(|_| Error::Decode("bad kex key length".into()))?;
+    NodeId::from_keys(&s, &k, kem)
 }
 
 fn random_32() -> Result<[u8; 32]> {
@@ -314,6 +396,29 @@ mod tests {
         let bob = NodeIdentity::generate().unwrap();
         let (_state, mut m1) = initiator_message1(&alice).unwrap();
         m1[8] ^= 0xff; // flip a byte inside the signed ephemeral key
+        assert!(responder_process(&bob, &m1).is_err());
+    }
+
+    #[test]
+    fn handshake_binds_and_returns_the_full_node_id() {
+        // Both sides authenticate the peer's *full* self-certifying NodeId, not
+        // just its Ed25519 key — computed from keys proven in-band.
+        let alice = NodeIdentity::generate().unwrap();
+        let bob = NodeIdentity::generate().unwrap();
+        let (state, m1) = initiator_message1(&alice).unwrap();
+        let (m2, bob_res) = responder_process(&bob, &m1).unwrap();
+        let alice_res = initiator_finish(state, &m2).unwrap();
+        assert_eq!(bob_res.peer_id, alice.id());
+        assert_eq!(alice_res.peer_id, bob.id());
+    }
+
+    #[test]
+    fn trailing_bytes_are_rejected() {
+        // A single appended byte must be refused (else it silently desyncs keys).
+        let alice = NodeIdentity::generate().unwrap();
+        let bob = NodeIdentity::generate().unwrap();
+        let (_state, mut m1) = initiator_message1(&alice).unwrap();
+        m1.push(0x00);
         assert!(responder_process(&bob, &m1).is_err());
     }
 

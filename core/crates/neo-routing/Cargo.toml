@@ -9,3 +9,4 @@ description = "Disjoint multipath and fresh-per-request path/exit selection for 
 [dependencies]
 neo-core.workspace = true
 getrandom.workspace = true
+blake3.workspace = true

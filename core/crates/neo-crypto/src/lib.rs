@@ -17,4 +17,6 @@ pub use handshake::{
     initiator_finish, initiator_message1, responder_process, HandshakeResult, Initiator,
 };
 pub use session::{Opener, Sealer, Session};
-pub use sphinx::{create_packet, process, Processed, ReplayCache, SphinxHop, SphinxPacket};
+pub use sphinx::{
+    create_packet, create_packet_keyed, process, Processed, ReplayCache, SphinxHop, SphinxPacket,
+};

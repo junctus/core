@@ -20,6 +20,7 @@ neo-mix.workspace = true
 neo-dataplane.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+blake3.workspace = true
 
 [dev-dependencies]
 # Frontier crates, used only by the M10–M13 capstone integration test.

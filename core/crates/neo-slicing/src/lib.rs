@@ -3,9 +3,18 @@
 //! A flow is **encrypted first, then sliced** into `n` shares (`data + parity`)
 //! with a Reed-Solomon code, so that:
 //! - any `data` (= `k`) of the `n` shares reconstruct the flow, and
-//! - fewer than `k` shares — or all `n` without the key — reveal nothing, because
-//!   every share is a fragment of AEAD ciphertext that is pseudorandom without
+//! - a share on its own is a fragment of AEAD ciphertext, pseudorandom without
 //!   the key.
+//!
+//! **Confidentiality here is *computational*, not information-theoretic.** This
+//! is erasure coding over AEAD ciphertext for availability and traffic-splitting
+//! — it is **not** Shamir secret sharing. Secrecy rests *entirely* on the AEAD
+//! key staying secret: an adversary who gathers *all* `n` shares and later
+//! learns the key recovers the plaintext. "Fewer than `k` shares reveal nothing"
+//! means "cannot *reconstruct*" (an erasure-code property) and "a lone ciphertext
+//! fragment is pseudorandom to a bounded adversary" — it does **not** claim
+//! Shamir-style, key-independent k-of-n secrecy. (For that, Shamir-share the AEAD
+//! key too — Krawczyk SSMS; tracked as a hardening item.)
 //!
 //! Shares are meant to travel node-disjoint paths (see `neo-routing`), so no
 //! single relay ever holds a complete, meaningful flow. The AEAD key is carried
@@ -16,7 +25,7 @@
 
 #![forbid(unsafe_code)]
 
-use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use neo_core::{Error, Result};
 use reed_solomon_erasure::galois_8::ReedSolomon;
@@ -25,6 +34,18 @@ use reed_solomon_erasure::galois_8::ReedSolomon;
 pub const KEY_LEN: usize = 32;
 /// AEAD nonce length (ChaCha20-Poly1305, 96-bit).
 const NONCE_LEN: usize = 12;
+
+/// The share header, bound into the AEAD as associated data so a share that
+/// lies about the reconstruction parameters (`data`/`parity`/`cipher_len`)
+/// fails authentication cleanly rather than silently steering reassembly.
+fn header_aad(data_shares: u8, parity_shares: u8, cipher_len: u32) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(6 + 16);
+    aad.extend_from_slice(b"neo-slice-hdr-v1");
+    aad.push(data_shares);
+    aad.push(parity_shares);
+    aad.extend_from_slice(&cipher_len.to_be_bytes());
+    aad
+}
 
 /// One share of a sliced flow. Individually meaningless without `k` peers and the key.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,9 +115,21 @@ pub fn encrypt_and_slice(
     let mut nonce = [0u8; NONCE_LEN];
     getrandom::getrandom(&mut nonce).map_err(|e| Error::Rng(e.to_string()))?;
 
+    // ChaCha20-Poly1305 appends a fixed 16-byte tag, so the ciphertext length is
+    // known up front and can be bound into the AAD alongside the share params.
+    const TAG_LEN: usize = 16;
+    let cipher_len = plaintext.len() + TAG_LEN;
+    let aad = header_aad(data_shares as u8, parity_shares as u8, cipher_len as u32);
+
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
     let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce), plaintext)
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
         .map_err(|_| Error::Crypto("AEAD encrypt failed".into()))?;
 
     let shard_len = ciphertext.len().div_ceil(data_shares).max(1);
@@ -179,9 +212,16 @@ pub fn reassemble_and_decrypt(key: &[u8; KEY_LEN], shares: &[Share]) -> Result<V
     }
     ciphertext.truncate(cipher_len);
 
+    let aad = header_aad(k as u8, m as u8, cipher_len as u32);
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
     cipher
-        .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
+        .decrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: ciphertext.as_ref(),
+                aad: &aad,
+            },
+        )
         .map_err(|_| Error::Crypto("AEAD decrypt failed (wrong key or corrupt shares)".into()))
 }
 
@@ -215,7 +255,9 @@ mod tests {
     }
 
     #[test]
-    fn fewer_than_k_shares_reveal_nothing() {
+    fn fewer_than_k_shares_cannot_reconstruct() {
+        // Note: this asserts the *erasure-code* threshold (can't reconstruct),
+        // not secrecy. Confidentiality is computational — see the module docs.
         let msg = b"insufficient shares must fail";
         let shares = encrypt_and_slice(&KEY, msg, 3, 2).unwrap();
         let too_few: Vec<Share> = shares.into_iter().take(2).collect();

@@ -58,6 +58,13 @@ pub struct SphinxPacket {
 pub const PACKET_LEN: usize = 32 + BETA_LEN + MAC_LEN + PAYLOAD_LEN;
 
 impl SphinxPacket {
+    /// The packet's current ephemeral group element `alpha`. A relay derives its
+    /// per-hop shared secret (and thus a return-path stream key) from this via
+    /// [`NodeIdentity::sphinx_shared`](neo_core::NodeIdentity::sphinx_shared).
+    pub fn alpha(&self) -> [u8; 32] {
+        self.alpha
+    }
+
     /// Serialize to the fixed wire form (`PACKET_LEN` bytes).
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(PACKET_LEN);
@@ -120,11 +127,22 @@ impl ReplayCache {
 
 /// Build a Sphinx packet for `path` carrying `payload`.
 pub fn create_packet(path: &[SphinxHop], payload: &[u8]) -> Result<SphinxPacket> {
+    Ok(create_packet_keyed(path, payload)?.0)
+}
+
+/// Build a Sphinx packet and also return the per-hop shared secrets, in path
+/// order. The secrets let a circuit builder derive per-hop **stream keys** for a
+/// layered return path (each relay derives the same secret from the packet's
+/// `alpha` via [`NodeIdentity::sphinx_shared`]). Keep the secrets private.
+pub fn create_packet_keyed(
+    path: &[SphinxHop],
+    payload: &[u8],
+) -> Result<(SphinxPacket, Vec<[u8; 32]>)> {
     let n = path.len();
     if n == 0 || n > MAX_HOPS {
         return Err(Error::Config(format!("path length must be 1..={MAX_HOPS}")));
     }
-    if payload.len() + 2 > PAYLOAD_LEN {
+    if payload.len() + 2 + MAC_LEN > PAYLOAD_LEN {
         return Err(Error::Config(
             "payload too large for a Sphinx packet".into(),
         ));
@@ -193,20 +211,30 @@ pub fn create_packet(path: &[SphinxHop], payload: &[u8]) -> Result<SphinxPacket>
         next_addr = path[i].id;
     }
 
-    // 5. Onion-encrypt the fixed payload (XOR streams — order-independent).
+    // 5. Onion-encrypt the fixed payload, carrying an **exit-verified** integrity
+    //    tag. Layout: [len:2][mac:MAC_LEN][payload…]. The MAC key is derived from
+    //    the exit's shared secret alone, so a malicious relay that flips payload
+    //    bits cannot produce a matching tag — the exit detects the tamper and
+    //    rejects, instead of delivering attacker-chosen corruption (a payload
+    //    tagging channel). Full non-malleability (a wide-block PRP so a tamper is
+    //    not even a droppable signal) is the remaining hardening (see docs).
+    let exit_secret = &secrets[n - 1];
+    let payload_mac = mac(&subkey("neo-sphinx-payload-mac-v1", exit_secret), payload);
     let mut delta = vec![0u8; PAYLOAD_LEN];
     delta[..2].copy_from_slice(&(payload.len() as u16).to_be_bytes());
-    delta[2..2 + payload.len()].copy_from_slice(payload);
+    delta[2..2 + MAC_LEN].copy_from_slice(&payload_mac);
+    delta[2 + MAC_LEN..2 + MAC_LEN + payload.len()].copy_from_slice(payload);
     for key in &pi {
         xor(&mut delta, &keystream(key, PAYLOAD_LEN));
     }
 
-    Ok(SphinxPacket {
+    let packet = SphinxPacket {
         alpha: alphas[0],
         beta,
         gamma,
         delta,
-    })
+    };
+    Ok((packet, secrets))
 }
 
 /// Process a packet at this node: verify, peel one layer, and either forward or
@@ -218,18 +246,22 @@ pub fn process(
 ) -> Result<Processed> {
     let s = identity.sphinx_shared(packet.alpha)?;
 
-    let tag = subkey("neo-sphinx-replay-v1", &s);
-    if !replay.seen.insert(tag) {
-        return Err(Error::Crypto("replayed Sphinx packet".into()));
-    }
-
     let rho = subkey("neo-sphinx-rho-v1", &s);
     let mu = subkey("neo-sphinx-mu-v1", &s);
     let pi = subkey("neo-sphinx-pi-v1", &s);
 
-    // Authenticate the header before touching it.
+    // Authenticate the header BEFORE mutating any replay state. Otherwise a
+    // forged packet (valid alpha, garbage beta/gamma) inserts its replay tag,
+    // fails the MAC, and thereby causes the *genuine* packet with the same alpha
+    // to be dropped as a "replay" — a cheap targeted-drop / cache-poisoning DoS.
     if !ct_eq(&mac(&mu, &packet.beta), &packet.gamma) {
         return Err(Error::Crypto("Sphinx header MAC failed".into()));
+    }
+
+    // Only now, on an authenticated packet, record it for replay rejection.
+    let tag = subkey("neo-sphinx-replay-v1", &s);
+    if !replay.seen.insert(tag) {
+        return Err(Error::Crypto("replayed Sphinx packet".into()));
     }
 
     // Decrypt the header: extend by a zero block, XOR the keystream, then shift.
@@ -249,16 +281,22 @@ pub fn process(
     xor(&mut delta, &keystream(&pi, PAYLOAD_LEN));
 
     if next == EXIT_ADDR {
-        if delta.len() < 2 {
+        if delta.len() < 2 + MAC_LEN {
             return Err(Error::Decode("payload too short".into()));
         }
         let len = u16::from_be_bytes([delta[0], delta[1]]) as usize;
-        if 2 + len > PAYLOAD_LEN {
+        if 2 + MAC_LEN + len > PAYLOAD_LEN {
             return Err(Error::Decode("bad payload length".into()));
         }
-        Ok(Processed::Deliver {
-            payload: delta[2..2 + len].to_vec(),
-        })
+        let payload = delta[2 + MAC_LEN..2 + MAC_LEN + len].to_vec();
+        // Verify the exit-only integrity tag: reject any en-route payload tamper.
+        let expected = mac(&subkey("neo-sphinx-payload-mac-v1", &s), &payload);
+        if !ct_eq(&expected, &delta[2..2 + MAC_LEN]) {
+            return Err(Error::Crypto(
+                "Sphinx payload integrity check failed".into(),
+            ));
+        }
+        Ok(Processed::Deliver { payload })
     } else {
         let b = blinding(&packet.alpha, &s);
         let alpha_point = CompressedRistretto::from_slice(&packet.alpha)
@@ -437,6 +475,64 @@ mod tests {
         assert!(
             process(&a, &mut cache, &packet).is_err(),
             "replay must be rejected"
+        );
+    }
+
+    #[test]
+    fn payload_tampering_is_detected_at_the_exit() {
+        // A malicious middle relay flips a payload byte before forwarding; the
+        // exit's integrity tag must reject it rather than deliver corruption.
+        let a = NodeIdentity::generate().unwrap();
+        let b = NodeIdentity::generate().unwrap();
+        let packet = create_packet(&[hop(&a), hop(&b)], b"HELLO-WORLD-12345").unwrap();
+
+        let mut cache = ReplayCache::new();
+        let mut forwarded = match process(&a, &mut cache, &packet).unwrap() {
+            Processed::Forward { packet, .. } => *packet,
+            Processed::Deliver { .. } => panic!("first hop should forward"),
+        };
+        // Tamper with a byte inside the payload region ([2+MAC_LEN..] maps to
+        // plaintext position, XOR keystream is position-preserving).
+        forwarded.delta[2 + MAC_LEN + 3] ^= 0xff;
+
+        let mut cache_b = ReplayCache::new();
+        assert!(
+            process(&b, &mut cache_b, &forwarded).is_err(),
+            "exit must reject a tampered payload (no silent corruption / tagging)"
+        );
+    }
+
+    #[test]
+    fn identity_alpha_is_rejected() {
+        // alpha = the Ristretto identity (all-zero encoding) would give a
+        // node-independent, public shared secret — must be refused.
+        let a = NodeIdentity::generate().unwrap();
+        let mut packet = create_packet(&[hop(&a)], b"x").unwrap();
+        packet.alpha = [0u8; 32];
+        let mut cache = ReplayCache::new();
+        assert!(process(&a, &mut cache, &packet).is_err());
+    }
+
+    #[test]
+    fn forged_packet_that_fails_mac_does_not_poison_replay_cache() {
+        // H-1: a forged packet (valid alpha, broken MAC) must not burn the
+        // replay tag and cause the genuine packet to be dropped.
+        let a = NodeIdentity::generate().unwrap();
+        let b = NodeIdentity::generate().unwrap();
+        let genuine = create_packet(&[hop(&a), hop(&b)], b"secret").unwrap();
+
+        let mut forged = genuine.clone();
+        forged.gamma[0] ^= 0xff; // same alpha, invalid MAC
+
+        let mut cache = ReplayCache::new();
+        assert!(
+            process(&a, &mut cache, &forged).is_err(),
+            "forged fails MAC"
+        );
+        // The genuine packet must still process — its replay tag was not burned.
+        assert!(
+            process(&a, &mut cache, &genuine).is_ok(),
+            "genuine packet must not be collateral-dropped"
         );
     }
 

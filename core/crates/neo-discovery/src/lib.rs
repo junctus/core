@@ -20,6 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use neo_core::{Error, NodeId, NodeIdentity, Result, KEM_PUBLIC_LEN, SIGNATURE_LEN};
 
+pub mod bootstrap;
 #[cfg(feature = "libp2p")]
 pub mod libp2p_backend;
 pub mod snapshot;
@@ -291,14 +292,49 @@ pub enum ConnectStrategy {
     },
 }
 
+/// A node's own network reachability, as determined by AutoNAT (M16).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reachability {
+    /// Publicly dialable (has a routable, port-forwarded address).
+    Public,
+    /// Behind a NAT / firewall — not directly dialable from the internet.
+    Private,
+    /// Not yet determined (too few AutoNAT probes).
+    Unknown,
+}
+
 /// Ordered connection attempts for reaching `peer`: direct if it advertises an
 /// address, then a hole punch, then a relay fallback if one is known.
 pub fn connection_ladder(peer: &PeerRecord, relays: &[PeerRecord]) -> Vec<ConnectStrategy> {
+    connection_ladder_for(Reachability::Unknown, peer, relays)
+}
+
+/// A reachability-aware connection ladder (M16).
+///
+/// - A **direct** dial is tried first whenever the peer advertises an address.
+/// - A **hole punch** (DCUtR) is only useful when at least one side is behind a
+///   NAT that a coordinated simultaneous-open can traverse; if *we* are public
+///   and the peer advertises an address, a direct dial suffices and hole-punch
+///   is skipped.
+/// - A **relay** (Circuit Relay v2) is the last resort when neither direct nor
+///   hole-punch can work (e.g. a peer with no dialable address behind a
+///   symmetric NAT).
+pub fn connection_ladder_for(
+    local: Reachability,
+    peer: &PeerRecord,
+    relays: &[PeerRecord],
+) -> Vec<ConnectStrategy> {
     let mut ladder = Vec::new();
-    if !peer.addrs.is_empty() {
+    let peer_dialable = !peer.addrs.is_empty();
+    if peer_dialable {
         ladder.push(ConnectStrategy::Direct);
     }
-    ladder.push(ConnectStrategy::HolePunch);
+    // Hole-punching helps unless we are already public *and* the peer is
+    // directly dialable (then Direct is enough).
+    let direct_suffices = local == Reachability::Public && peer_dialable;
+    if !direct_suffices {
+        ladder.push(ConnectStrategy::HolePunch);
+    }
     if let Some(relay) = relays.iter().find(|r| r.relay && r.id != peer.id) {
         ladder.push(ConnectStrategy::Relay { via: relay.id });
     }
@@ -550,5 +586,35 @@ mod tests {
         let peer = record(false, false, false); // no advertised address
         let ladder = connection_ladder(&peer, &[]);
         assert_eq!(ladder, vec![ConnectStrategy::HolePunch]);
+    }
+
+    #[test]
+    fn public_local_to_dialable_peer_needs_only_a_direct_dial() {
+        let peer = record(false, false, true); // dialable
+        let ladder = connection_ladder_for(Reachability::Public, &peer, &[]);
+        assert_eq!(
+            ladder,
+            vec![ConnectStrategy::Direct],
+            "no hole-punch needed"
+        );
+    }
+
+    #[test]
+    fn private_local_still_tries_hole_punch_then_relay() {
+        let peer = record(false, false, true);
+        let relays = vec![record(true, false, true)];
+        let ladder = connection_ladder_for(Reachability::Private, &peer, &relays);
+        assert_eq!(ladder[0], ConnectStrategy::Direct);
+        assert_eq!(ladder[1], ConnectStrategy::HolePunch);
+        assert!(matches!(ladder[2], ConnectStrategy::Relay { .. }));
+    }
+
+    #[test]
+    fn undialable_peer_relies_on_hole_punch_and_relay() {
+        let peer = record(false, false, false); // no address
+        let relays = vec![record(true, false, true)];
+        let ladder = connection_ladder_for(Reachability::Public, &peer, &relays);
+        assert_eq!(ladder[0], ConnectStrategy::HolePunch);
+        assert!(matches!(ladder[1], ConnectStrategy::Relay { .. }));
     }
 }

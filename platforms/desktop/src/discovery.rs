@@ -32,6 +32,37 @@ pub fn cache_path() -> Result<PathBuf> {
     Ok(neo_dir()?.join("snapshot.bin"))
 }
 
+/// Path of the anti-rollback high-water mark (highest accepted `created_at`).
+fn hwm_path() -> Result<PathBuf> {
+    Ok(neo_dir()?.join("snapshot.hwm"))
+}
+
+/// The highest snapshot `created_at` this client has ever accepted (0 if none).
+fn read_hwm() -> u64 {
+    hwm_path()
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Record a newly-accepted snapshot's `created_at` as the new high-water mark.
+fn bump_hwm(created_at: u64) {
+    if read_hwm() < created_at {
+        if let Ok(p) = hwm_path() {
+            let _ = std::fs::write(p, created_at.to_string());
+        }
+    }
+}
+
+/// Anti-rollback decision: a snapshot is acceptable only if it is at least as
+/// new as the newest one previously accepted — so an untrusted mirror cannot
+/// freeze the client on a stale-but-validly-signed snapshot (e.g. to keep it
+/// routing through an already-evicted relay). Pure for testability.
+fn accepts_created_at(created_at: u64, hwm: u64) -> bool {
+    created_at >= hwm
+}
+
 fn http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(HTTP_TIMEOUT)

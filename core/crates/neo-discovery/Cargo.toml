@@ -16,6 +16,7 @@ libp2p = ["dep:libp2p"]
 neo-core.workspace = true
 tokio.workspace = true
 getrandom.workspace = true
+hex.workspace = true
 libp2p = { version = "0.54", optional = true, features = [
     "tokio",
     "tcp",
@@ -24,4 +25,7 @@ libp2p = { version = "0.54", optional = true, features = [
     "kad",
     "identify",
     "macros",
+    "autonat",
+    "relay",
+    "dcutr",
 ] }

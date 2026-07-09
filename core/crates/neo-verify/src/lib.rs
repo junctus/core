@@ -12,4 +12,5 @@ pub mod oblivious;
 pub mod pir;
 pub mod proof_of_mixing;
 pub mod selection;
+pub mod shuffle;
 pub mod vrf;

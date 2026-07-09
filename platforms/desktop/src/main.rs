@@ -12,6 +12,7 @@ use tokio::net::TcpListener;
 
 mod defaults;
 mod discovery;
+mod doh;
 mod roles;
 
 #[derive(Parser)]
@@ -122,6 +123,31 @@ enum Command {
         #[arg(long)]
         threshold: Option<usize>,
     },
+    /// Operator: sign a bootstrap record (current mirrors + witnesses) with a
+    /// bootstrap key and print the DNS TXT value to publish for DoH rendezvous.
+    BootstrapRecord {
+        /// Bootstrap signing identity (long-lived; its public key is baked into clients).
+        #[arg(long, default_value = "bootstrap.key")]
+        identity: PathBuf,
+        /// Current discovery mirror base URLs (repeatable).
+        #[arg(long = "mirror", required = true)]
+        mirrors: Vec<String>,
+        /// Current trusted witness keys, hex (repeatable).
+        #[arg(long = "witness", required = true)]
+        witnesses: Vec<String>,
+    },
+    /// Fetch and verify current mirrors + witnesses over DNS-over-HTTPS.
+    BootstrapResolve {
+        /// DoH JSON resolver endpoint.
+        #[arg(long, default_value = "https://cloudflare-dns.com/dns-query")]
+        resolver: String,
+        /// TXT record name to look up (e.g. `_neo-bootstrap.junctus.org`).
+        #[arg(long)]
+        name: String,
+        /// Trusted bootstrap public key(s), hex (repeatable).
+        #[arg(long = "key", required = true)]
+        keys: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -221,8 +247,67 @@ async fn main() -> anyhow::Result<()> {
             let identity = NodeIdentity::generate()?;
             roles::run_send(identity, cfg, message, hops).await?
         }
+        Command::BootstrapRecord {
+            identity,
+            mirrors,
+            witnesses,
+        } => bootstrap_record(&identity, mirrors, &witnesses)?,
+        Command::BootstrapResolve {
+            resolver,
+            name,
+            keys,
+        } => bootstrap_resolve(&resolver, &name, &keys).await?,
     }
     Ok(())
+}
+
+/// Operator: sign a bootstrap record and print the TXT value to publish.
+fn bootstrap_record(
+    identity_path: &Path,
+    mirrors: Vec<String>,
+    witness_hexes: &[String],
+) -> anyhow::Result<()> {
+    use neo_discovery::bootstrap::BootstrapRecord;
+    use neo_discovery::now_unix;
+
+    let identity = roles::load_or_create_identity(identity_path)?;
+    let witnesses = decode_keys(witness_hexes)?;
+    let record = BootstrapRecord::sign(&identity, now_unix(), mirrors, witnesses)?;
+
+    println!(
+        "bootstrap key : {}",
+        hex::encode(identity.public().signing.to_bytes())
+    );
+    println!("\nPublish this as a DNS TXT record (split into 255-char strings if needed),");
+    println!("then clients resolve it over DoH. TXT value:\n");
+    println!("{}", record.to_txt());
+    Ok(())
+}
+
+/// Client/diagnostic: fetch + verify current mirrors and witnesses over DoH.
+async fn bootstrap_resolve(resolver: &str, name: &str, key_hexes: &[String]) -> anyhow::Result<()> {
+    let keys = decode_keys(key_hexes)?;
+    let (mirrors, witnesses) = doh::resolve_via_doh(resolver, name, &keys, 0).await?;
+    println!("verified bootstrap for {name}:");
+    println!("  mirrors   : {mirrors:?}");
+    println!("  witnesses : {}", witnesses.len());
+    for w in &witnesses {
+        println!("    {}", hex::encode(w));
+    }
+    Ok(())
+}
+
+/// Decode a list of 64-hex-char Ed25519 keys into 32-byte arrays.
+fn decode_keys(hexes: &[String]) -> anyhow::Result<Vec<[u8; 32]>> {
+    hexes
+        .iter()
+        .map(|h| {
+            let mut key = [0u8; 32];
+            hex::decode_to_slice(h.trim(), &mut key)
+                .map_err(|e| anyhow::anyhow!("invalid key hex {h}: {e}"))?;
+            Ok(key)
+        })
+        .collect()
 }
 
 /// Parsed arguments for `neo run`.
@@ -288,6 +373,7 @@ async fn run_seed(
         health_interval: Duration::from_secs(health_interval.max(1)),
         snapshot_interval: Duration::from_secs(snapshot_interval.max(1)),
         register_cooldown: Duration::from_secs(register_cooldown),
+        ..SeedConfig::default()
     };
     let seed = Seed::new(witness, prober, config);
     println!("seed witness key : {}", seed.witness_hex());

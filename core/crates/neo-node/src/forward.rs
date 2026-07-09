@@ -21,6 +21,7 @@
 //! the primitive a request/response or stream layer is built on next.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use neo_core::{Error, NodeId, NodeIdentity, Result};
 use neo_crypto::{
@@ -142,6 +143,43 @@ where
     let packet = SphinxPacket::from_bytes(&packet_bytes)?;
 
     match process(identity, cache, &packet)? {
+        Processed::Deliver { payload } => Ok(Outcome::Delivered { payload }),
+        Processed::Forward { next, packet } => {
+            let next_id = NodeId::from_bytes(next);
+            let addr = resolver
+                .addr_of(&next_id)
+                .ok_or_else(|| Error::Config(format!("no address known for next hop {next_id}")))?;
+            forward_packet(identity, &addr, &packet).await?;
+            Ok(Outcome::Forwarded { next: next_id })
+        }
+    }
+}
+
+/// Relay handler with a **shared, long-lived** replay cache — the correct
+/// default for a real relay. Reads one onion frame, peels a layer under the
+/// shared cache (so a packet replayed on a *new* connection is rejected), and
+/// forwards or delivers. The cache lock is held only for the synchronous
+/// `process` call, never across an await.
+pub async fn handle_onion_shared<S, R>(
+    identity: &NodeIdentity,
+    stream: &mut S,
+    session: &mut Session,
+    resolver: &R,
+    cache: &Mutex<ReplayCache>,
+) -> Result<Outcome>
+where
+    S: AsyncRead + Unpin,
+    R: NextHop,
+{
+    let frame = read_frame(stream).await?;
+    let packet_bytes = session.open(&frame)?;
+    let packet = SphinxPacket::from_bytes(&packet_bytes)?;
+
+    let processed = {
+        let mut guard = cache.lock().expect("replay cache poisoned");
+        process(identity, &mut guard, &packet)?
+    };
+    match processed {
         Processed::Deliver { payload } => Ok(Outcome::Delivered { payload }),
         Processed::Forward { next, packet } => {
             let next_id = NodeId::from_bytes(next);

@@ -44,6 +44,11 @@ pub struct SeedConfig {
     pub snapshot_interval: Duration,
     /// Minimum gap between registrations from one IP.
     pub register_cooldown: Duration,
+    /// Peers whose `X-Forwarded-For` header is trusted (the fronting proxy).
+    /// **Only** these sources may set the client IP the cooldown keys on;
+    /// everyone else is keyed by their real socket address, so a client cannot
+    /// spoof `X-Forwarded-For` to mint unlimited distinct cooldown keys.
+    pub trusted_proxies: Vec<IpAddr>,
 }
 
 impl Default for SeedConfig {
@@ -53,6 +58,11 @@ impl Default for SeedConfig {
             health_interval: Duration::from_secs(60),
             snapshot_interval: Duration::from_secs(60),
             register_cooldown: Duration::from_secs(30),
+            // The seed sits behind a loopback reverse proxy (Caddy) by default.
+            trusted_proxies: vec![
+                "127.0.0.1".parse().expect("v4 loopback"),
+                "::1".parse().expect("v6 loopback"),
+            ],
         }
     }
 }
@@ -69,6 +79,8 @@ struct AppState {
     /// Last registration time per source IP (rate limiting).
     cooldowns: Mutex<HashMap<IpAddr, Instant>>,
     cooldown: Duration,
+    /// Proxies whose `X-Forwarded-For` we trust.
+    trusted_proxies: Vec<IpAddr>,
 }
 
 impl AppState {
@@ -98,6 +110,7 @@ impl Seed {
             snapshot_bytes: RwLock::new(Vec::new()),
             cooldowns: Mutex::new(HashMap::new()),
             cooldown: config.register_cooldown,
+            trusted_proxies: config.trusted_proxies.clone(),
         });
         // Publish an initial (empty) signed snapshot immediately.
         state.resign_snapshot();
@@ -163,7 +176,7 @@ async fn post_register(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    let ip = client_ip(&headers, peer.ip());
+    let ip = client_ip(&headers, peer.ip(), &state.trusted_proxies);
     if !state.check_and_stamp_cooldown(ip) {
         return (StatusCode::TOO_MANY_REQUESTS, "slow down\n".to_string());
     }
@@ -201,12 +214,19 @@ impl AppState {
     }
 }
 
-/// The client IP, honoring `X-Forwarded-For` from the fronting proxy.
-fn client_ip(headers: &HeaderMap, peer: IpAddr) -> IpAddr {
+/// The client IP for rate-limiting. `X-Forwarded-For` is honored **only** when
+/// the real socket peer is a trusted proxy; otherwise the socket peer is used,
+/// so a direct client cannot spoof the header to dodge the per-IP cooldown.
+fn client_ip(headers: &HeaderMap, peer: IpAddr, trusted_proxies: &[IpAddr]) -> IpAddr {
+    if !trusted_proxies.contains(&peer) {
+        return peer;
+    }
+    // Trusted proxy: take the right-most entry it appended (the last untrusted
+    // hop it observed), not the left-most (which the client controls).
     headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
+        .and_then(|s| s.rsplit(',').next())
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(peer)
 }
@@ -258,9 +278,26 @@ mod tests {
             snapshot_bytes: RwLock::new(Vec::new()),
             cooldowns: Mutex::new(HashMap::new()),
             cooldown: Duration::from_secs(30),
+            trusted_proxies: vec!["127.0.0.1".parse().unwrap()],
         });
         state.resign_snapshot();
         state
+    }
+
+    #[test]
+    fn xff_is_ignored_from_an_untrusted_peer() {
+        let trusted = ["127.0.0.1".parse().unwrap()];
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
+        // A direct (untrusted) client cannot spoof its rate-limit key.
+        let direct: IpAddr = "203.0.113.9".parse().unwrap();
+        assert_eq!(client_ip(&headers, direct, &trusted), direct);
+        // Behind the trusted proxy, the forwarded IP is honored.
+        let proxy: IpAddr = "127.0.0.1".parse().unwrap();
+        assert_eq!(
+            client_ip(&headers, proxy, &trusted),
+            "1.2.3.4".parse::<IpAddr>().unwrap()
+        );
     }
 
     #[tokio::test]
