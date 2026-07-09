@@ -14,16 +14,21 @@
 //! node-signed ([`PeerRecord::verify`]), so even a colluding witness set can
 //! at worst *omit* relays, never impersonate them.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
-use neo_core::{Error, NodeIdentity, Result, SIGNATURE_LEN};
+use neo_core::{Error, NodeId, NodeIdentity, Result, SIGNATURE_LEN};
 
 use crate::PeerRecord;
 
-/// Wire-format version of a serialized [`SignedSnapshot`].
-const SNAPSHOT_VERSION: u8 = 1;
+/// Wire-format version of a serialized [`SignedSnapshot`]. v2 carries relays in
+/// the compact encoding (no ML-KEM key); v1 carried full records.
+const SNAPSHOT_VERSION: u8 = 2;
 /// Domain separator for witness signatures over a snapshot body.
-const SNAPSHOT_SIG_DOMAIN: &[u8] = b"neo-snapshot-sig-v1";
+const SNAPSHOT_SIG_DOMAIN: &[u8] = b"neo-snapshot-sig-v2";
+/// Wire-format version of a serialized [`SnapshotDelta`].
+pub const DELTA_VERSION: u8 = 1;
+/// Domain separator for the [`manifest_digest`] a client sends to request a delta.
+const MANIFEST_DOMAIN: &[u8] = b"neo-snapshot-manifest-v1";
 /// Upper bound on relays in one snapshot (a parse-time memory bound).
 pub const MAX_SNAPSHOT_RELAYS: usize = 4096;
 /// Upper bound on witness signatures on one snapshot.
@@ -80,7 +85,10 @@ impl Snapshot {
         out.extend_from_slice(&self.expires_at.to_be_bytes());
         out.extend_from_slice(&(self.relays.len() as u32).to_be_bytes());
         for relay in &self.relays {
-            let bytes = relay.to_bytes();
+            // Snapshots carry the compact encoding (no ML-KEM key). The record
+            // signature is identical for both forms, and a dialing client
+            // recovers the key from the relay's handshake.
+            let bytes = relay.to_compact_bytes();
             out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
             out.extend_from_slice(&bytes);
         }
@@ -260,6 +268,178 @@ impl SignedSnapshot {
     }
 }
 
+/// The canonical fingerprint of a relay set: BLAKE3 over each `(id, seq)` in
+/// ascending-id order. A client sends this as the base a [`SnapshotDelta`]
+/// applies onto, and a seed matches it against the sets it has recently
+/// published. Because `seq` increases on any record change, equal fingerprints
+/// imply byte-identical records — so a seed can build a correct delta knowing
+/// only the fingerprint, and any mismatch falls back to a full snapshot.
+pub fn manifest_digest(relays: &[PeerRecord]) -> [u8; 32] {
+    let mut manifest: Vec<([u8; 32], u64)> =
+        relays.iter().map(|r| (*r.id.as_bytes(), r.seq)).collect();
+    manifest.sort_unstable();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(MANIFEST_DOMAIN);
+    for (id, seq) in &manifest {
+        hasher.update(id);
+        hasher.update(&seq.to_be_bytes());
+    }
+    *hasher.finalize().as_bytes()
+}
+
+/// A witness-verifiable delta between two snapshots — the Tor-consensus-diff
+/// idea, adapted to neo's signed-snapshot model.
+///
+/// A client holding a verified snapshot fetches only what changed, applies it
+/// with [`apply`](Self::apply), reconstructs the exact new signed body, and
+/// verifies the *parent snapshot's* witness signatures over it. The delta
+/// therefore carries no signature of its own: if the reconstruction is wrong by
+/// a single byte — a smuggled relay, a dropped one, a reordering — the witness
+/// signatures do not verify, so a malicious mirror cannot forge state the
+/// witnesses never attested. The only requirement is that both sides encode the
+/// relay set in the same canonical order; [`apply`](Self::apply) and the seed
+/// both use ascending-id order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotDelta {
+    /// `created_at` of the new snapshot the delta reconstructs.
+    pub created_at: u64,
+    /// `expires_at` of the new snapshot.
+    pub expires_at: u64,
+    /// Records to insert-or-replace by id — new relays and higher-seq refreshes,
+    /// in the compact encoding.
+    pub upserts: Vec<PeerRecord>,
+    /// Ids present in the client's base but gone from the new snapshot.
+    pub removed: Vec<NodeId>,
+    /// Witness signatures over the *new* snapshot body.
+    pub signatures: Vec<WitnessSignature>,
+}
+
+impl SnapshotDelta {
+    /// Apply this delta to the client's `base` relay set, producing the new
+    /// signed snapshot. Reconstruction is trustless: the caller must still call
+    /// [`SignedSnapshot::verify`] / [`verify_fresh`](SignedSnapshot::verify_fresh)
+    /// on the result, and a wrong reconstruction fails signature verification.
+    pub fn apply(&self, base: &[PeerRecord]) -> SignedSnapshot {
+        // Keyed by id, so iteration is in ascending-id order — the canonical
+        // order the witnesses signed. Upserts replace by id; removals drop by id.
+        let mut by_id: BTreeMap<[u8; 32], PeerRecord> =
+            base.iter().map(|r| (*r.id.as_bytes(), r.clone())).collect();
+        for id in &self.removed {
+            by_id.remove(id.as_bytes());
+        }
+        for rec in &self.upserts {
+            by_id.insert(*rec.id.as_bytes(), rec.clone());
+        }
+        SignedSnapshot {
+            snapshot: Snapshot {
+                created_at: self.created_at,
+                expires_at: self.expires_at,
+                relays: by_id.into_values().collect(),
+            },
+            signatures: self.signatures.clone(),
+        }
+    }
+
+    /// Serialize for the wire.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(DELTA_VERSION);
+        out.extend_from_slice(&self.created_at.to_be_bytes());
+        out.extend_from_slice(&self.expires_at.to_be_bytes());
+        out.extend_from_slice(&(self.upserts.len() as u32).to_be_bytes());
+        for rec in &self.upserts {
+            let bytes = rec.to_compact_bytes();
+            out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            out.extend_from_slice(&bytes);
+        }
+        out.extend_from_slice(&(self.removed.len() as u32).to_be_bytes());
+        for id in &self.removed {
+            out.extend_from_slice(id.as_bytes());
+        }
+        out.extend_from_slice(&(self.signatures.len() as u16).to_be_bytes());
+        for signature in &self.signatures {
+            out.extend_from_slice(&signature.witness);
+            out.extend_from_slice(&signature.sig);
+        }
+        out
+    }
+
+    /// Parse [`to_bytes`](Self::to_bytes) output. Bounds-checked so it never
+    /// panics on arbitrary input; does **not** verify.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        fn take<'a>(cur: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
+            if cur.len() < n {
+                return Err(Error::Decode("truncated snapshot delta".into()));
+            }
+            let (head, tail) = cur.split_at(n);
+            *cur = tail;
+            Ok(head)
+        }
+        fn take_u32(cur: &mut &[u8]) -> Result<usize> {
+            Ok(u32::from_be_bytes(take(cur, 4)?.try_into().expect("4 bytes")) as usize)
+        }
+
+        let mut cur = bytes;
+        let version = take(&mut cur, 1)?[0];
+        if version != DELTA_VERSION {
+            return Err(Error::Decode(format!(
+                "unsupported snapshot delta version {version}"
+            )));
+        }
+        let created_at = u64::from_be_bytes(take(&mut cur, 8)?.try_into().expect("8 bytes"));
+        let expires_at = u64::from_be_bytes(take(&mut cur, 8)?.try_into().expect("8 bytes"));
+
+        let upsert_count = take_u32(&mut cur)?;
+        if upsert_count > MAX_SNAPSHOT_RELAYS {
+            return Err(Error::Decode("too many upserts in snapshot delta".into()));
+        }
+        let mut upserts = Vec::with_capacity(upsert_count.min(256));
+        for _ in 0..upsert_count {
+            let len = take_u32(&mut cur)?;
+            if len > 8192 {
+                return Err(Error::Decode("delta record too large".into()));
+            }
+            upserts.push(PeerRecord::from_bytes(take(&mut cur, len)?)?);
+        }
+
+        let removed_count = take_u32(&mut cur)?;
+        if removed_count > MAX_SNAPSHOT_RELAYS {
+            return Err(Error::Decode("too many removals in snapshot delta".into()));
+        }
+        let mut removed = Vec::with_capacity(removed_count.min(256));
+        for _ in 0..removed_count {
+            let mut id = [0u8; 32];
+            id.copy_from_slice(take(&mut cur, 32)?);
+            removed.push(NodeId::from_bytes(id));
+        }
+
+        let sig_count =
+            u16::from_be_bytes(take(&mut cur, 2)?.try_into().expect("2 bytes")) as usize;
+        if sig_count > MAX_WITNESSES {
+            return Err(Error::Decode("too many witness signatures".into()));
+        }
+        let mut signatures = Vec::with_capacity(sig_count);
+        for _ in 0..sig_count {
+            let mut witness = [0u8; 32];
+            witness.copy_from_slice(take(&mut cur, 32)?);
+            let mut sig = [0u8; SIGNATURE_LEN];
+            sig.copy_from_slice(take(&mut cur, SIGNATURE_LEN)?);
+            signatures.push(WitnessSignature { witness, sig });
+        }
+        if !cur.is_empty() {
+            return Err(Error::Decode("trailing bytes after snapshot delta".into()));
+        }
+
+        Ok(SnapshotDelta {
+            created_at,
+            expires_at,
+            upserts,
+            removed,
+            signatures,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,8 +489,27 @@ mod tests {
         signed.verify(&trusted, 2, now).unwrap();
         assert_eq!(signed.relays(now).len(), 2);
 
+        // Snapshots serialize relays in the compact form (no ML-KEM key), so a
+        // round trip is intentionally lossy: the parsed relays are compact. The
+        // result still verifies and carries the same relay ids and signatures.
         let parsed = SignedSnapshot::from_bytes(&signed.to_bytes()).unwrap();
-        assert_eq!(parsed, signed);
+        assert!(parsed.snapshot.relays.iter().all(|r| r.is_compact()));
+        assert_eq!(parsed.signatures, signed.signatures);
+        assert_eq!(parsed.snapshot.created_at, signed.snapshot.created_at);
+        assert_eq!(
+            parsed
+                .snapshot
+                .relays
+                .iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>(),
+            signed
+                .snapshot
+                .relays
+                .iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>()
+        );
         parsed.verify(&trusted, 2, now).unwrap();
     }
 
@@ -483,5 +682,128 @@ mod tests {
             let bytes: Vec<u8> = (0..len).map(|i| (seed >> (i % 8 * 8)) as u8).collect();
             let _ = SignedSnapshot::from_bytes(&bytes);
         }
+    }
+
+    #[test]
+    fn manifest_digest_is_order_independent_and_seq_sensitive() {
+        let a = relay(&NodeIdentity::generate().unwrap());
+        let b = relay(&NodeIdentity::generate().unwrap());
+        // The fingerprint does not depend on the order of the input slice.
+        assert_eq!(
+            manifest_digest(&[a.clone(), b.clone()]),
+            manifest_digest(&[b.clone(), a.clone()])
+        );
+        // A seq bump (any record change) changes the fingerprint.
+        let mut a2 = a.clone();
+        a2.seq += 1;
+        assert_ne!(manifest_digest(&[a]), manifest_digest(&[a2]));
+    }
+
+    #[test]
+    fn delta_reconstructs_a_verifiable_snapshot() {
+        let w = NodeIdentity::generate().unwrap();
+        let trusted = [key(&w)];
+        let now = now_unix();
+
+        // The base set the client already holds: a, b, c.
+        let a = NodeIdentity::generate().unwrap();
+        let b = NodeIdentity::generate().unwrap();
+        let c = NodeIdentity::generate().unwrap();
+        let c_rec = relay(&c);
+        let mut base = vec![relay(&a), relay(&b), c_rec.clone()];
+        base.sort_by(|x, y| x.id.as_bytes().cmp(y.id.as_bytes()));
+
+        // New snapshot: drop a, refresh b (higher seq), add d.
+        let d = NodeIdentity::generate().unwrap();
+        let d_rec = relay(&d);
+        let b_refreshed =
+            PeerRecord::build_signed(&b, vec!["9.9.9.9:9".into()], true, false, now + 3600, 2)
+                .unwrap();
+
+        let created = now;
+        let expires = now + 86_400;
+        let mut new_set = vec![c_rec.clone(), b_refreshed.clone(), d_rec.clone()];
+        new_set.sort_by(|x, y| x.id.as_bytes().cmp(y.id.as_bytes()));
+        let new_snapshot = Snapshot {
+            created_at: created,
+            expires_at: expires,
+            relays: new_set,
+        };
+        let signatures = vec![new_snapshot.sign(&w)];
+
+        let delta = SnapshotDelta {
+            created_at: created,
+            expires_at: expires,
+            upserts: vec![d_rec, b_refreshed],
+            removed: vec![a.id()],
+            signatures,
+        };
+
+        // The client applies the delta to its base and verifies the result.
+        let reconstructed = delta.apply(&base);
+        reconstructed
+            .verify(&trusted, 1, now)
+            .expect("reconstructed snapshot verifies against the witness");
+        assert_eq!(reconstructed.snapshot, new_snapshot);
+    }
+
+    #[test]
+    fn delta_roundtrips_on_the_wire() {
+        let w = NodeIdentity::generate().unwrap();
+        let r = NodeIdentity::generate().unwrap();
+        let gone = NodeIdentity::generate().unwrap();
+        let empty = Snapshot {
+            created_at: 100,
+            expires_at: 200,
+            relays: vec![],
+        };
+        let delta = SnapshotDelta {
+            created_at: 100,
+            expires_at: 200,
+            upserts: vec![relay(&r)],
+            removed: vec![gone.id()],
+            signatures: vec![empty.sign(&w)],
+        };
+        let parsed = SnapshotDelta::from_bytes(&delta.to_bytes()).unwrap();
+        assert_eq!(parsed.created_at, 100);
+        assert_eq!(parsed.expires_at, 200);
+        assert_eq!(parsed.removed, delta.removed);
+        assert_eq!(parsed.signatures, delta.signatures);
+        assert_eq!(parsed.upserts.len(), 1);
+        assert_eq!(parsed.upserts[0].id, delta.upserts[0].id);
+        // Upserts come back compact (the ML-KEM key is dropped on the wire).
+        assert!(parsed.upserts[0].is_compact());
+    }
+
+    #[test]
+    fn a_delta_that_smuggles_a_relay_fails_verification() {
+        let w = NodeIdentity::generate().unwrap();
+        let trusted = [key(&w)];
+        let now = now_unix();
+
+        let base = vec![relay(&NodeIdentity::generate().unwrap())];
+        // The witness signs a snapshot identical to the base (no real change).
+        let honest = Snapshot {
+            created_at: now,
+            expires_at: now + 86_400,
+            relays: base.clone(),
+        };
+        let signatures = vec![honest.sign(&w)];
+
+        // A malicious mirror ships a delta that injects a relay the witness
+        // never attested. Reconstruction then fails the signature check.
+        let evil = relay(&NodeIdentity::generate().unwrap());
+        let delta = SnapshotDelta {
+            created_at: now,
+            expires_at: now + 86_400,
+            upserts: vec![evil],
+            removed: vec![],
+            signatures,
+        };
+        let reconstructed = delta.apply(&base);
+        assert!(
+            reconstructed.verify(&trusted, 1, now).is_err(),
+            "an injected relay must break the witness signature"
+        );
     }
 }

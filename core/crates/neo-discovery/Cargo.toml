@@ -17,6 +17,7 @@ neo-core.workspace = true
 tokio.workspace = true
 getrandom.workspace = true
 hex.workspace = true
+blake3.workspace = true
 libp2p = { version = "0.54", optional = true, features = [
     "tokio",
     "tcp",
