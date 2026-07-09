@@ -365,6 +365,299 @@ plaintext are **never assembled at a single party** — built and verified botto
 
 ---
 
+### M25 — Adversarial hardening round 2 ⬜ (verified findings from the M20–M24 review)
+A second internal adversarial review (across the PQ-AKE, Sphinx, REALITY, MPC, credits, seed, and
+circuit surfaces — the code written after M14) surfaced one **critical**, several **high**, and a set
+of medium/low issues. This milestone closes them with regression tests before any of the new capability
+milestones ship. Nothing below is exploitable through today's binary in isolation, but each is a real
+property of shipped, public, documented library code.
+- Plan:
+  - **CRITICAL — REALITY low-order-point authenticator forgery.** `reality.rs::classify` (line 91) does
+    `diffie_hellman(&PublicKey::from(eph)).to_bytes()` with **no contributory / low-order check**, so a
+    prober who sends the identity point gets an all-zero shared secret it can also compute — and forges
+    `Verdict::Authenticated` **without the capability**, falsifying the module's central claim
+    (`reality.rs:14-21`). Fix: after the DH, take the **silent `Decoy`** path if the result is
+    non-contributory (`if ct_eq(&shared, &[0u8;32]) { return Verdict::Decoy }`, or validate `eph` against
+    the small-order set); returning `Decoy` (never an error) preserves indistinguishability. Add a
+    regression test that an identity/low-order `eph` yields `Decoy`.
+  - **HIGH — REALITY replay + static wire fingerprint.** `classify` keeps no per-epoch replay cache, so a
+    captured hello re-authenticates for the current **and** previous epoch (`reality.rs:93`, and the
+    existing `a_captured_hello_expires_after_the_epoch_window` test *proves* this window). The first
+    flight is also a fixed 96-byte high-entropy blob behind a cleartext `00 00 00 60` length prefix
+    (`neo-transport::write_blob`), a passive DPI tell. Fix: bound per-epoch replay cache of seen
+    ephemerals → `Decoy` on repeat; bind server-contributed randomness into the transcript; randomize the
+    pad length. The wire-embedding fix proper is M27.
+  - **HIGH — circuit cells have no end-to-end replay/reorder/drop protection.** `exit_splice` (forward,
+    `circuit.rs:328-349`) and `CircuitStream::recv` (return) read `seq` but never compare it to an
+    expected value, so a malicious middle relay can duplicate/re-inject a captured cell under a fresh
+    **link** counter and the endpoint's e2e MAC still passes. Fix: track `next_expected_seq` per direction
+    and reject out-of-order/duplicate `seq`; amend the `circuit.rs:22-25` doc (which claims parity with
+    Sphinx's replay-once payload) until it holds.
+  - **HIGH — seed dial-back SSRF + health-loop starvation.** `neo-seed` health (`health.rs`) dials any
+    attacker-named address in a registered record via `TcpStream::connect` with no
+    loopback/RFC1918/link-local/`169.254.169.254` filter, and the sweep is a serial `for record in due`
+    loop over the whole (uncapped) registry. Fix: parse each addr to a `SocketAddr` and default-deny
+    private/loopback/link-local/metadata ranges (prefer IP-literal-only, no DNS); cap registry size;
+    run dial-backs with a bounded `FuturesUnordered` + per-sweep time budget; add a global outbound-dial
+    rate limit and IPv6-prefix (`/64`) cooldown keying.
+  - **HIGH — exit-splice open-proxy SSRF.** `exit_splice` calls `TcpStream::connect(target)`
+    (`circuit.rs:320`) with no policy and no internal-range filter; `ExitPolicy::permits` (`exit.rs:57`)
+    exists, is off by default, and is **never threaded in** (it also only checks ports, not IP class).
+    Fix: thread an `Arc<ExitPolicy>` into `serve_circuit`/`exit_splice`, extend `ExitPolicy` to reject
+    loopback/RFC1918/ULA/link-local/metadata destinations, and gate the connect on it. (This is the
+    correctness half of M31; land it here so no exit path is ever wired without it.)
+  - **HIGH — cover packets are length-distinguishable from real packets.** `tunnel.rs:81-83` emits every
+    cover cell as a constant `1 + COVER_SIZE` (1025-byte) frame while real frames are `1 + packet.len()`
+    and length-preserving through the sealer, so a global passive observer partitions cover from real by
+    ciphertext length — defeating the size half of the cover-traffic defense (`neo-mix:8-9`). Fix: pad all
+    real frames to a fixed cell size ≥ `COVER_SIZE` before sealing, carry the true length inside the
+    sealed plaintext, and correct the `neo-mix`/`tunnel.rs` docs. (M30 generalizes this to the circuit.)
+  - **HIGH — unbounded double-spend/claimed sets with no epoch or key rotation.** `Issuer.spent`
+    (`credits/lib.rs:39`) and `EarnLedger.claimed` grow forever with no eviction, and there is no
+    key-rotation API — a redeploy that regenerates the key silently re-enables replay of every historical
+    serial (the `spent` set is not persisted). Fix: tag credits/receipts with an issuer-key **epoch**,
+    keep per-epoch sets that retire, add an explicit rotation API with a redeem grace window, and persist
+    `spent` across restarts. (Prerequisite for M32's economy.)
+  - **MEDIUM — threshold ciphertext is malleable + trusts the joint key.** The threshold hashed-ElGamal
+    ciphertext `(R, c)` is an unauthenticated XOR stream (`threshold.rs:61-72,186-189`) with no INT-CTXT,
+    and `joint_public_key` (`threshold.rs:194`) has no `is_identity()` guard, so an attacker-supplied
+    identity commitment collapses the mask to a fixed public keystream. Fix: adopt KEM-DEM — wrap the
+    payload in ChaCha20-Poly1305 (as `vss.rs` already does) and verify the tag in `combine()`; reject an
+    identity joint key; feed `R` into the KDF. (Prerequisite for M28's committee exit.)
+  - **MEDIUM — semi-honest MPC + doc/model gaps in `session.rs`.** The shipped TLS gadgets route through
+    the pure semi-honest `eval_2pc`; `dualex` is a standalone/test-only demo not on the session path, and
+    `seal_record_shared` emits a **single-block, non-RFC-8439** Poly1305 tag (no length block / AAD) that
+    would not verify against a stock AEAD (`session.rs:173`). Fix: state plainly in `mpc_tls.rs`/
+    `session.rs` that the session is semi-honest-only and the tag is not the AEAD tag; scope the "verifies
+    against stock ChaCha20-Poly1305" claim to the reference used. Full malicious security + real AEAD
+    framing is M33 research, not a doc patch.
+  - **MEDIUM — `sharks 0.5.0` (RUSTSEC-2024-0398) biased Shamir coefficients + overclaimed secrecy.**
+    `neo-mpc` depends on the unmaintained `sharks` whose top polynomial coefficient is drawn from
+    `[1,255]`, so the "information-theoretic, any k-1 learn nothing" doc (`neo-mpc/lib.rs:8-15,152`) is
+    stronger than the primitive delivers. Fix: migrate to the maintained `blahaj` fork (or a vetted
+    GF(256) Shamir) with a share-uniformity test, or soften the doc until then; add
+    `cargo audit --deny warnings` (or `cargo-deny`) to `ci.yml` so future advisories fail the build.
+  - **MEDIUM — VRF beacon abort-grinding.** `neo-verify::selection` computes the path seed before
+    responding, so a malicious beacon can abort-and-retry to draw favorable i.i.d. samples
+    (`selection.rs:42-45`); the "neither can bias" doc (line 7) overclaims. Fix: derive the VRF input from
+    beacon-independent epoch randomness + a monotonic client counter (retries are not fresh samples),
+    treat a missing response as a committed loggable abort, and/or use a threshold of beacons; correct the
+    doc.
+  - **LOW/hygiene bundle.** Zeroize handshake intermediate secrets (`ikm`, `dh`, `ss`, `k_confirm` in
+    `handshake.rs`); add handshake read timeouts + a concurrency semaphore in `run::accept` and spawn the
+    per-connection handshake so a stalled client can't head-of-line the accept loop; reject empty records
+    in `neo-verify::oblivious::build` (a zero-length record aliases an empty bucket, `oblivious.rs:133-144`);
+    use the seeded Fisher–Yates shuffle in `libp2p_backend::sample_relays` instead of `take(n)` over
+    HashMap order (`libp2p_backend.rs:401`); soften the several doc-comments flagged as overclaims
+    (snapshot anti-rollback, `dial_reality` "indistinguishable from random", multi-block Poly1305,
+    slicing "attributable by index").
+- Why it matters: the M20–M24 code is the newest, never-audited surface, and the project's honesty ethos
+  means a shipped overclaim is itself a defect. The REALITY forgery in particular breaks the flagship
+  probe-resistance claim outright and gates every REALITY milestone below.
+- Boundary/risk: these are internal-review findings, not an external audit — they raise the floor but do
+  **not** substitute for the audit gate. Several fixes (real AEAD under 2PC, authenticated garbling) are
+  research and are deliberately left to M33, not forced into this hardening pass.
+
+---
+
+## Game-changer roadmap
+
+The milestones below turn neo's tested-but-unwired primitives into differentiated product capabilities.
+Each is buildable on existing crates — no capability here is a from-scratch research project unless its
+boundary says so. They are sequenced so the enabling wiring (M26) lands before the features that ride it,
+and every REALITY/MPC milestone depends on the M25 hardening fixes.
+
+### M26 — One-tap local proxy over live circuits ⬜ (the "on" switch)
+Why it matters: today no ordinary app can use neo without writing Rust — this is the single translation
+layer between neo-the-engine and neo-the-product.
+- Plan: build a `NeoSocket` that implements `tokio`'s `AsyncRead`/`AsyncWrite` over
+  `CircuitSink::send` / `CircuitStream::recv` (`neo-node/circuit.rs:110-151`), buffering across the
+  variable-length cell boundary (the existing round-trip test at `circuit.rs` already handles
+  `cell != send` manually — that logic becomes `poll_read`). Wrap it in a localhost **SOCKS5** listener
+  that parses the destination and calls `open_circuit` (`circuit.rs:156`) against a snapshot-discovered
+  path (`neo-discovery` + `neo-routing::select_path`), bound by `neo run --proxy 127.0.0.1:1080`.
+  **Requires first wiring `serve_circuit` into the relay loop** — the desktop relay currently runs the
+  one-shot `handle_onion_shared` (`roles.rs:124`), not the persistent circuit path, so relays must run
+  `serve_circuit` for `open_circuit` to have a peer. Add connection pooling / circuit reuse so per-stream
+  Sphinx+PQ setup latency is amortized.
+- Why a game-changer: a localhost SOCKS proxy + an `AsyncRead`/`AsyncWrite` type makes every browser, the
+  OS proxy toggle, and every Rust HTTP/gRPC/WebSocket library (`hyper`, `tonic`, `rustls`,
+  `tokio-tungstenite`) run **unmodified** over a 3-hop onion — with no TUN, no root, no app-store friction.
+  It is the smallest change with the largest "now it's a product" delta and the correct core for the
+  mobile SDK.
+- Boundary/risk: needs the M25 circuit-cell seq enforcement (replay/reorder) and the exit-policy SSRF fix
+  landed first, since this wires `serve_circuit` into a running node. No return-path congestion control
+  yet, so large downloads may stall; Poisson-mixing latency can trip TLS handshake timeouts unless the
+  `PrivacyLevel` dial is surfaced honestly.
+
+### M27 — Genuine in-ClientHello REALITY with a live decoy reverse-proxy ⬜ (flagship)
+Why it matters: this converts neo's tested REALITY auth core from "probe-resistant in theory" into the
+actual REALITY threat model — a bridge that *is* a real website to any prober.
+- Plan: two additive pieces on top of the M23 auth core (`neo-crypto::reality`) and the M25 forgery fix.
+  (1) A minimal, correct **TLS 1.3 ClientHello builder** that hosts the 64-byte ephemeral+tag prefix
+  inside fields that are already uniform-random (`key_share` / `session_ticket` / GREASE), replacing the
+  bespoke `write_blob` u32-length flight (`neo-transport::dial_reality`, `lib.rs:242`) so the first packet
+  is byte-for-byte a normal handshake. (2) Wire the `Verdict::Decoy` branch — today
+  `RealityAccept::Decoy { conn }` hands back a bare `Conn` with no upstream (`lib.rs:298`) — to
+  **reverse-proxy** the un-authenticated connection to an operator-pinned upstream `:443`, reusing the
+  splice pattern already in `exit_splice` (`circuit.rs:312`), so a prober gets a real cert and a real page.
+- Why a game-changer: this is the property that defeats the active-probing that killed Shadowsocks and
+  plain VLESS — a censor's own scanner cannot tell a neo bridge from a benign website because it literally
+  is one to anyone without the capability, and neo layers a PQ-hybrid onion behind it, which REALITY does
+  not. Few VLESS deployments even ship the decoy-proxy correctly.
+- Boundary/risk: matching a specific JA3/JA4 fingerprint exactly is fiddly and drifts as browsers update —
+  a frozen fingerprint becomes its own tell. The authenticate-vs-decoy paths must match on timing, TLS
+  version/ALPN, and TCP-reset behavior or a sophisticated censor distinguishes on side channels. Do **not**
+  use "undetectable" language until this and M25's replay-cache fix both land; keep the honest-boundary
+  note current.
+
+### M28 — Verdict: the committee exit no one can subpoena ⬜ (flagship trust story)
+Why it matters: an exit whose operators are *cryptographically incapable* of complying with a wiretap is
+a trust model Tor and commercial VPNs structurally cannot offer.
+- Plan: wire the tested threshold-decryption core (`neo-mpc::threshold`, M22 — client-combined `D_i = y_i·R`
+  partials with Chaum–Pedersen DLEQ, `s` never formed) to the circuit exit path. The response from the
+  destination is encrypted to the committee's joint public key and decrypted only by client-combined
+  partials, so **no committee member ever holds the key or the plaintext**. Extends `neo-mpc` + the
+  `neo-node::circuit` exit; a `neo run --committee` role joins as a custody/decrypt member. Publish the
+  DLEQ verification as the operator's "verifiable non-custody" artifact.
+- Why a game-changer: "no responsible exit" stops being a statistical hope and becomes a checkable
+  cryptographic fact — a new trust story a journalist can give a source ("even the exit can't rat you
+  out, and here is the DLEQ proof"), and a near-zero-liability role for altruistic operators in strict
+  jurisdictions who would never run a clearnet exit.
+- Boundary/risk: M22 delivers the property for the **decrypt** (committee → client) direction only. A full
+  wiretap-proof exit that *also* speaks to the real upstream with no member seeing plaintext needs the
+  M33 2PC-TLS send-path, which remains research — so this must ship as "the committee cannot read the
+  response," not "plaintext never exists end-to-end." Requires the M25 threshold-malleability (KEM-DEM)
+  and identity-key fixes first. Committee liveness/DoS and Sybil member selection are operational risks.
+
+### M29 — Bridge-in-a-QR: pre-shared REALITY capabilities as unblockable private bridges ⬜
+Why it matters: every unblockable-networking product eventually loses its bridges to enumeration and
+active probing — neo can ship bridges whose *existence* is cryptographically undetectable.
+- Plan: an SDK layer over the M23 REALITY primitives (`RealitySecret::generate/classify`,
+  `RealityKey::client_hello`, `Transport::dial_reality`/`accept_reality`): a `RealityCapability` type that
+  serializes to a QR/link, a **bridge-runner** helper that loops `accept_reality`, forwards
+  `Authenticated` connections into the overlay, and (via M27) reverse-proxies `Decoy` connections to a
+  real upstream, plus epoch-clock management. An app embeds its own private bridge fleet with no public
+  bridge list to scrape.
+- Why a game-changer: a censor holding a bridge IP still cannot confirm it runs neo, and there is no
+  enumerable list — the failure mode that kills Tor bridges and Shadowsocks servers is structurally
+  absent. No other embeddable stack ships the capability-as-unpublished-key property.
+- Boundary/risk: inherits the exact same dependency as M27 — until the decoy is a real TLS session and the
+  flight is embedded in a true ClientHello, a sophisticated censor comparing against real TLS servers can
+  still distinguish it. The SDK must gate any "unblockable" claim on M27; ship it as "probe-resistant
+  against active scanning" until then. Also needs M35-style credit/PoW gating to resist a client-side
+  enumeration of the capability distribution.
+
+### M30 — Fixed-cell constant-rate circuits ⬜ (tunneling itself becomes hidden)
+Why it matters: even with a perfect handshake, censors confirm tunnels by their steady-state size/timing
+signature — a constant-shape flow removes the single most reliable passive discriminator.
+- Plan: compose two shipped primitives at the circuit cell boundary. `neo-mix` already emits
+  `MixOut::Cover` at Poisson intervals scaled by `PrivacyLevel` and `neo-transport` already buckets to
+  fixed sizes; wire both into `CircuitSink::send` / `exit_splice` (`circuit.rs`) so every cell is padded
+  to a fixed bucket (a length tag inside the MAC'd body) and clocked on a timer, injecting cover cells
+  when idle. This closes the `circuit.rs:31-33` "length hiding is punted" gap and builds directly on the
+  M25 real-frame-padding fix.
+- Why a game-changer: it turns "the payload is hidden" into "the fact that you are tunneling is hidden" —
+  a constant-rate carrier breaks end-to-end flow correlation, the attack the anonymity trilemma otherwise
+  leaves open. Tor added padding machines only after years; neo composes it from primitives it already has.
+- Boundary/risk: constant-rate cover is a direct bandwidth/battery tax and a non-starter on
+  mobile/cellular (ARCHITECTURE constraint 5) — it must be a top-dial-only mode that degrades hard on
+  battery. A naive constant rate is itself a fingerprint unless the profile imitates a plausible app (a
+  video call), not a metronome; and cover that starts/stops with the session still leaks session boundaries
+  unless warmed.
+
+### M31 — Enforced exit policy + reduced-harm default ⬜ (the exit-supply unlock)
+Why it matters: abuse complaints and legal exposure are *the* reason exit supply never materializes;
+right now `exit=true` is maximally unsafe.
+- Plan: build the operator-facing half on top of the M25 SSRF/enforcement fix. Add a curated
+  **reduced-harm** default policy (443/DoH/messaging only; SMTP/25, file-sharing, known-abuse ports
+  blocked), per-destination and global rate limits, and an allowlist mode to `ExitPolicy`
+  (`neo-routing::exit`), exposed as `neo run --exit-policy {reduced|web|custom}` with the safe policy as
+  the one-flag default. The trust-diffusion machinery (rotating exits, disjoint routes, `RouteRegistry`)
+  already exists to spread residual exposure.
+- Why a game-changer: it converts "nobody sane runs an exit" into "a cautious person can run a 443-only
+  exit and sleep at night" — a correctness fix *and* a supply unlock for the same low effort.
+- Boundary/risk: must be paired with the honest ARCHITECTURE framing — clearnet exit is diffused and
+  rotated (statistical), never zero-responsibility; a reduced policy lowers complaint volume, it does not
+  grant legal immunity. Blocking too much by default hurts usefulness, so the reduced-harm port set needs
+  care.
+
+### M32 — Relaykit: the unlinkable earn↔spend credit economy ⬜
+Why it matters: overlays starve from the free-rider and Sybil traps; a token-free, unlinkable
+"relay-to-earn, spend-to-browse" loop is a third path Tor's altruism and crypto-VPNs' coins cannot take.
+- Plan: wire the tested but unwired earn side into the relay runtime. `neo-credits` has VOPRF
+  blind-issue/redeem with a double-spend set (`lib.rs:63-153`) and `earn.rs` has `RelayReceipt` +
+  `EarnLedger` (M17) — but issuance is currently ungated (see M25). Build: the client signs a
+  `RelayReceipt` at circuit teardown (`neo-node::circuit`), the relay accumulates them in an `EarnLedger`,
+  `issue()` atomically consumes a proven earning before blind-evaluating, and a **localhost-only** status
+  dashboard (reusing `neo-seed`'s axum stack) shows credits earned / bytes relayed / circuits served so
+  "leave it on" becomes felt.
+- Why a game-changer: contribution funds your own anonymity, and earn↔spend are cryptographically
+  unlinkable (the issuer only ever sees a blinded serial) — a self-bootstrapping incentive loop that
+  attacks the Sybil *and* free-rider problems with one Privacy-Pass primitive, no wallet, no KYC, no coin.
+- Boundary/risk: `earn.rs` receipts are **client-attested**, not a trustless bandwidth measurement — a
+  colluding client+relay can fabricate capped receipts per nonce, so this bounds Sybil to the cost of
+  running clients, not to zero. The dashboard must frame credits as anti-free-riding utility, not a
+  payout, and must bind to localhost only (a metrics port on `0.0.0.0` is itself a fingerprint).
+  Bilateral co-signed receipts + the M25 epoch/rotation fix are prerequisites before any
+  "proof-of-bandwidth" language.
+
+### M33 — Attestor: cryptographic proofs about a private TLS session ⬜ (north-star, research-grade)
+Why it matters: no VPN, Tor, or mixnet can produce a verifiable fact-proof about a TLS session because
+they all terminate or relay plaintext somewhere — neo's 2PC-TLS is the only stack where the record key
+and plaintext are provably never assembled at one party.
+- Plan: finish the two explicitly-deferred steps of the M24 2PC-TLS core (`neo-mpc::mpc_tls`, which
+  already seals a ChaCha20-Poly1305 record under 2PC verified against a reference, with DECO-style
+  additively-shared ECDHE): the **EC point→bit share conversion** that feeds the shared ECDHE secret into
+  the SHA-256 key-schedule circuit, and **live HKDF/AEAD wiring** to a real TLS socket on the server's
+  actual curve. Then a selective-opening circuit proves one fact ("balance > X", "account age > 2y")
+  while the session bytes are never assembled anywhere. Also delivers the real distrusted-exit browsing
+  mode and the plaintext-free forward leg M28 needs.
+- Why a game-changer: TLSNotary/DECO-grade oracle attestation delivered as an anonymity-network-native
+  capability — portable KYC / proof-of-income / proof-of-humanity / whistleblower evidence that is
+  provably from the real site, a category normal privacy tools structurally cannot enter.
+- Boundary/risk: **research-grade — the largest remaining crypto build.** The EC share-conversion
+  sub-protocol, full malicious security (authenticated garbling removes dual-execution's ≤1-bit leak,
+  which is not on the session path today per M25), and live socket framing are each substantial; 2PC-TLS
+  is slow and only viable for small, sensitive requests, not general browsing. This **must not** ship
+  before the external audit gate and must be labeled clearly as the low-bandwidth paranoid mode.
+
+### M34 — Self-healing bootstrap control loop ⬜ ("it just reconnects")
+Why it matters: "they blocked my bridges and I can't get new ones" is exactly where Tor bridges and
+V2Ray subscriptions fail under an adaptive censor.
+- Plan: pure orchestration of three shipped, tested pieces. On reachability failure, a client-side state
+  machine rotates DoH resolvers and pulls a fresh signed `BootstrapRecord` (`neo-discovery::bootstrap`,
+  M18 — anti-rollback via `not_before`), fetches a new witnessed snapshot from whichever mirror is
+  reachable (integrity separated from distribution, M4.5, so the mirror can be a throwaway on any big
+  CDN), and pays for the new entry point with an unlinkable credit (M10). Sequence:
+  resolver-rotate → mirror-rotate → snapshot-refresh → credit-spend, no human and no new config file.
+  Also wires the not-yet-consumed anti-rollback high-water mark the M18/M4.5 primitives already expose.
+- Why a game-changer: it treats reachability as a control loop rather than a static config; because the
+  mirror is untrusted and the credit is unlinkable, pulling a new entry point neither requires blessed
+  infrastructure nor builds a profile — the "it just reconnects" experience that makes people recommend a
+  tool.
+- Boundary/risk: DoH resolvers themselves get blocked or poisoned (Iran has done this), so it needs a
+  diverse rotating resolver set and eventually Encrypted ClientHello. The first-contact seed problem
+  remains (ARCHITECTURE constraint) — if the very first bootstrap key/mirror is burned before install,
+  the loop has nothing to start from.
+
+### M35 — Enumeration-resistant bridge distribution ⬜ (credit/PoW-gated capabilities)
+Why it matters: the strongest REALITY bridge is worthless if an adversary posing as a client can cheaply
+enumerate and burn the whole fleet — the classic way nation-states kill bridge networks.
+- Plan: a distribution service that trades a **spent unlinkable credit + a proof-of-work** for a bucketed
+  `RealityKey` capability (à la Tor's bridgedb buckets), reusing the `neo-credits` double-spend machinery
+  (M10) and the earn-side proof-of-relay (M17) so enumeration cost scales with bandwidth an attacker must
+  actually earn. Extends `neo-credits` + the M29 capability type.
+- Why a game-changer: it converts "scrape the bridge list" into "run honest bandwidth for every bridge you
+  want to burn" — a structural enumeration defense using the anti-Sybil primitive Tor lacks, not a
+  heuristic.
+- Boundary/risk: bucketing/PoW tuning is a cat-and-mouse economics problem (too cheap and enumeration
+  still works; too expensive and real users can't bootstrap). It ties bootstrap to the credit economy
+  whose earn side is honestly still client-attested (M17/M32 caveat), so it is only worthwhile once M27's
+  wire path and M32's hardened earning land.
+
+---
+
 ## Audit gate ⬜
 External security + cryptography audit **before anyone relies on neo for real safety.** This is a hard
 gate, not a milestone to rush past.

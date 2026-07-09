@@ -88,7 +88,16 @@ impl RealitySecret {
         }
         let eph: [u8; 32] = hello[..EPH_LEN].try_into().expect("checked len");
         let got = &hello[EPH_LEN..HELLO_PREFIX];
-        let shared = self.0.diffie_hellman(&PublicKey::from(eph)).to_bytes();
+        let shared_secret = self.0.diffie_hellman(&PublicKey::from(eph));
+        // Reject low-order / non-contributory ephemerals. A low-order point (e.g.
+        // the identity) yields a shared secret an attacker can also predict —
+        // letting a prober forge an authenticator WITHOUT the capability key. Take
+        // the silent Decoy path (never an error) so the rejection is
+        // indistinguishable from any other non-authenticated peer.
+        if !shared_secret.was_contributory() {
+            return Verdict::Decoy;
+        }
+        let shared = shared_secret.to_bytes();
         // Accept this epoch and the previous one (skew tolerance).
         for ep in [epoch, epoch.wrapping_sub(1)] {
             if ct_eq(&auth_tag(&shared, ep, &eph), got) {
@@ -120,9 +129,13 @@ impl RealityKey {
         getrandom::getrandom(esk.as_mut_slice()).map_err(|e| Error::Rng(e.to_string()))?;
         let ephemeral = StaticSecret::from(*esk);
         let eph_pub = PublicKey::from(&ephemeral).to_bytes();
-        let shared = ephemeral
-            .diffie_hellman(&PublicKey::from(self.0))
-            .to_bytes();
+        let shared_secret = ephemeral.diffie_hellman(&PublicKey::from(self.0));
+        // A low-order capability key would give a predictable shared secret;
+        // refuse it rather than emit a forgeable hello.
+        if !shared_secret.was_contributory() {
+            return Err(Error::Crypto("REALITY capability key is low-order".into()));
+        }
+        let shared = shared_secret.to_bytes();
 
         let tag = auth_tag(&shared, epoch, &eph_pub);
         let seed = session_seed(&shared, &eph_pub);
@@ -196,6 +209,28 @@ mod tests {
 
         // A short/truncated flight: decoy, never an error.
         assert!(matches!(server.classify(&[0u8; 10], epoch), Verdict::Decoy));
+    }
+
+    #[test]
+    fn a_low_order_ephemeral_cannot_forge_authentication() {
+        // The forgery: an attacker without the capability sends the identity point
+        // as its ephemeral. The DH result is the all-zero (non-contributory)
+        // secret, which the attacker can also compute — so it forges the tag from
+        // it. The was_contributory() guard must reject this as Decoy; otherwise the
+        // server would recompute the same zero secret and authenticate the forgery.
+        let server = RealitySecret::generate().unwrap();
+        let epoch = 77;
+        let eph = [0u8; 32]; // identity point
+        let shared = [0u8; 32]; // DH(server_secret, identity) = all-zero encoding
+        let tag = auth_tag(&shared, epoch, &eph);
+        let mut hello = Vec::new();
+        hello.extend_from_slice(&eph);
+        hello.extend_from_slice(&tag);
+        hello.extend_from_slice(&[0u8; MIN_PAD]);
+        assert!(
+            matches!(server.classify(&hello, epoch), Verdict::Decoy),
+            "a low-order ephemeral must never authenticate"
+        );
     }
 
     #[test]
