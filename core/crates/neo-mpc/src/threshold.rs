@@ -7,12 +7,15 @@
 //! the **client** combines the partials into plaintext. So **no committee node
 //! ever holds the key or the plaintext** — the property MPC-TLS is really after.
 //!
-//! It is hashed-ElGamal over Ristretto with **threshold (Lagrange-in-exponent)
-//! decryption**. Each partial carries a **Chaum–Pedersen DLEQ proof** binding it
-//! to the member's public Feldman share (derivable from the same commitments
-//! `vss` already publishes), so a forged partial is caught and attributed —
-//! matching `vss`'s robustness. The joint public key is `commitments[0]` (the
-//! constant-term commitment `s·G`), so this composes directly with a dealt
+//! It is a **KEM-DEM** scheme over Ristretto with **threshold
+//! (Lagrange-in-exponent)** key recovery: the KEM is ElGamal to the joint key, and
+//! the DEM is **authenticated** ChaCha20-Poly1305 (so the ciphertext is not
+//! malleable — integrity, not just secrecy). Each partial carries a **Chaum–
+//! Pedersen DLEQ proof** binding it to the member's public Feldman share
+//! (derivable from the same commitments `vss` already publishes), so a forged
+//! partial is caught and attributed — matching `vss`'s robustness. The joint
+//! public key is `commitments[0]` (the constant-term commitment `s·G`, rejected if
+//! it is the identity), so this composes directly with a dealt
 //! [`CommitteeSession`](crate::vss::CommitteeSession).
 //!
 //! **Honest boundary.** This delivers "plaintext never assembled at a single
@@ -23,21 +26,29 @@
 //! Threshold decryption is a real, verifiable building block toward it, not the
 //! whole of it.
 
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
-use curve25519_dalek::traits::Identity;
+use curve25519_dalek::traits::{Identity, IsIdentity};
 use curve25519_dalek::Scalar;
 use neo_core::{Error, Result};
 
 use crate::vss::{KeyCommitments, KeyShare};
 
-/// Hashed-ElGamal ciphertext under the committee's joint key: `(R, c)` where
-/// `R = r·G` and `c = m ⊕ KDF(r·Y)`.
+/// Fixed AEAD nonce — safe because the DEM key is derived per-message from a fresh
+/// ephemeral `r` (so the key never repeats).
+const NONCE: [u8; 12] = *b"neo-thresh\0\0";
+
+/// KEM-DEM ciphertext under the committee's joint key: `(R, c)` where `R = r·G`
+/// and `c = AEAD_K(m)` with `K = KDF(R, r·Y)`. The DEM is **authenticated**
+/// (ChaCha20-Poly1305), so the ciphertext is not malleable, and the KDF binds `R`
+/// so it cannot be reused under a different ephemeral.
 #[derive(Clone, Debug)]
 pub struct Ciphertext {
     /// Ephemeral point `R = r·G`.
     pub r_point: CompressedRistretto,
-    /// Masked message `c = m ⊕ KDF(r·Y)`.
+    /// AEAD ciphertext (with tag) of the message under `K = KDF(R, r·Y)`.
     pub c: Vec<u8>,
 }
 
@@ -63,8 +74,10 @@ pub fn encrypt(commitments: &KeyCommitments, m: &[u8]) -> Result<Ciphertext> {
     let r = random_scalar()?;
     let r_point = RISTRETTO_BASEPOINT_POINT * r;
     let shared = y * r; // r·Y = r·s·G
-    let mut c = m.to_vec();
-    xor_mask(&mut c, &shared);
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&dem_key(&r_point, &shared)));
+    let c = cipher
+        .encrypt(Nonce::from_slice(&NONCE), m)
+        .map_err(|_| Error::Crypto("threshold AEAD encrypt failed".into()))?;
     Ok(Ciphertext {
         r_point: r_point.compress(),
         c,
@@ -183,21 +196,34 @@ pub fn combine(
         shared += di * lambda;
     }
 
-    let mut m = ct.c.clone();
-    xor_mask(&mut m, &shared);
-    Ok(m)
+    let r_point = ct
+        .r_point
+        .decompress()
+        .ok_or_else(|| Error::Crypto("ciphertext R not a valid point".into()))?;
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&dem_key(&r_point, &shared)));
+    cipher
+        .decrypt(Nonce::from_slice(&NONCE), ct.c.as_slice())
+        .map_err(|_| Error::Crypto("threshold ciphertext failed authentication".into()))
 }
 
 // ---- helpers ---------------------------------------------------------------
 
 /// The joint public key `Y = s·G` — the commitment to the polynomial's constant.
+/// Rejects an identity `Y` (a degenerate committee key), which would collapse the
+/// KEM shared secret to a fixed public value.
 fn joint_public_key(commitments: &KeyCommitments) -> Result<RistrettoPoint> {
-    commitments
+    let y = commitments
         .0
         .first()
         .ok_or_else(|| Error::Crypto("empty commitments".into()))?
         .decompress()
-        .ok_or_else(|| Error::Crypto("joint public key not a valid point".into()))
+        .ok_or_else(|| Error::Crypto("joint public key not a valid point".into()))?;
+    if y.is_identity() {
+        return Err(Error::Crypto(
+            "joint public key is the identity point".into(),
+        ));
+    }
+    Ok(y)
 }
 
 /// A member's public share point `Y_i = Σ_j c_j·i^j` from the Feldman commitments.
@@ -217,16 +243,14 @@ fn public_share(commitments: &KeyCommitments, member: u8) -> Option<RistrettoPoi
     Some(acc)
 }
 
-/// XOR `data` with a keystream derived from a shared point `s·R`.
-fn xor_mask(data: &mut [u8], shared: &RistrettoPoint) {
-    let mut hasher = blake3::Hasher::new_derive_key("neo-mpc-threshold-mask-v1");
+/// Derive the 32-byte DEM key from the ephemeral point `R` and shared point `r·Y`
+/// (`= s·R`). Binding `R` prevents a ciphertext's key from being reused under a
+/// different ephemeral.
+fn dem_key(r_point: &RistrettoPoint, shared: &RistrettoPoint) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key("neo-mpc-threshold-key-v1");
+    hasher.update(r_point.compress().as_bytes());
     hasher.update(shared.compress().as_bytes());
-    let mut reader = hasher.finalize_xof();
-    let mut ks = vec![0u8; data.len()];
-    reader.fill(&mut ks);
-    for (b, k) in data.iter_mut().zip(&ks) {
-        *b ^= k;
-    }
+    *hasher.finalize().as_bytes()
 }
 
 fn dleq_challenge(
@@ -292,6 +316,28 @@ mod tests {
             combine(&session.commitments, 3, &ct, &partials2).unwrap(),
             secret_msg
         );
+    }
+
+    #[test]
+    fn a_tampered_ciphertext_is_rejected_by_the_aead() {
+        let session = dealt();
+        let mut ct = encrypt(&session.commitments, b"authenticated payload").unwrap();
+        ct.c[0] ^= 0xff; // maul the AEAD ciphertext
+        let partials = partials_from(&session, &[0, 1, 2], &ct);
+        assert!(
+            combine(&session.commitments, 3, &ct, &partials).is_err(),
+            "a mauled ciphertext must fail authentication, not decrypt to garbage"
+        );
+    }
+
+    #[test]
+    fn an_identity_joint_key_is_rejected() {
+        // A degenerate committee whose constant-term commitment is the identity
+        // must not be usable to encrypt (its KEM secret would be public).
+        use curve25519_dalek::ristretto::RistrettoPoint;
+        use curve25519_dalek::traits::Identity;
+        let bad = KeyCommitments(vec![RistrettoPoint::identity().compress()]);
+        assert!(encrypt(&bad, b"x").is_err());
     }
 
     #[test]
