@@ -385,13 +385,6 @@ fn parse_roster(path: &Path) -> Result<Vec<neo_node::committee::CommitteeMemberI
     Ok(members)
 }
 
-/// The committee exit handler for this role: echo. A real clearnet-fetching exit
-/// (async request + response chunking) is the documented refinement — the M28
-/// send path (no member seeing the request plaintext) is M33.
-fn committee_echo(request: &[u8]) -> Vec<u8> {
-    request.to_vec()
-}
-
 /// `neo committee serve`: join a committee (run DKG so no party holds the key),
 /// publish the descriptor, and serve committee-exit circuits — the M28 role.
 pub async fn run_committee_serve(
@@ -457,7 +450,11 @@ pub async fn run_committee_serve(
             };
             let serving = neo_node::serve::CommitteeServing {
                 share: share.as_ref(),
-                exit: committee_echo,
+                // A production committee exit fetches the real clearnet
+                // destination (SSRF-guarded; no loopback).
+                exit: neo_node::committee::ExitBehavior::Clearnet {
+                    allow_loopback: false,
+                },
             };
             if let Err(e) = neo_node::serve::serve_connection(
                 &identity,
@@ -478,7 +475,11 @@ pub async fn run_committee_serve(
 
 /// `neo committee send`: route a request through a committee (from its published
 /// descriptor) and print the response the client recovers by combining partials.
-pub async fn run_committee_send(descriptor_path: &Path, message: &str) -> Result<()> {
+pub async fn run_committee_send(
+    descriptor_path: &Path,
+    destination: &str,
+    message: &str,
+) -> Result<()> {
     let hexs = std::fs::read_to_string(descriptor_path)
         .with_context(|| format!("reading descriptor {}", descriptor_path.display()))?;
     let bytes = hex::decode(hexs.trim()).context("descriptor hex")?;
@@ -495,6 +496,7 @@ pub async fn run_committee_send(descriptor_path: &Path, message: &str) -> Result
         &circuit,
         &descriptor.commitments,
         descriptor.threshold(),
+        destination,
         message.as_bytes(),
     )
     .await?;

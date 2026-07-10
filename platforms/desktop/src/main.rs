@@ -201,7 +201,10 @@ enum CommitteeAction {
         /// The committee descriptor file (hex), as written by `committee serve`.
         #[arg(long)]
         descriptor: PathBuf,
-        /// The request to send to the committee exit.
+        /// The clearnet destination `host:port` the exit fetches.
+        #[arg(long)]
+        destination: String,
+        /// The request bytes to send to `destination` through the committee.
         #[arg(long)]
         message: String,
     },
@@ -334,8 +337,9 @@ async fn main() -> anyhow::Result<()> {
             }
             CommitteeAction::Send {
                 descriptor,
+                destination,
                 message,
-            } => roles::run_committee_send(&descriptor, &message).await?,
+            } => roles::run_committee_send(&descriptor, &destination, &message).await?,
         },
     }
     Ok(())

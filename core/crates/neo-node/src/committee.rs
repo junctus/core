@@ -110,27 +110,112 @@ pub fn open_partial(return_secret: &[u8; 32], sealed: &[u8]) -> Result<Partial> 
     Partial::from_bytes(&plain)
 }
 
-/// The response a committee circuit returns to the client: the exit's threshold
-/// [`Ciphertext`] plus one sealed partial per committee member on the path.
+/// The plaintext the exit encrypts per chunk — bounded so each threshold
+/// ciphertext stays under [`neo_mpc::threshold::MAX_CIPHERTEXT`] (the AEAD tag
+/// adds 16 bytes), so a large response is split across many chunks.
+const CHUNK_PLAINTEXT: usize = neo_mpc::threshold::MAX_CIPHERTEXT - 16;
+/// Bound on chunks in one response (a parse-time memory bound).
+const MAX_CHUNKS: usize = 4096;
+
+/// One chunk of a committee response: a slice of the plaintext (≤ [`CHUNK_PLAINTEXT`])
+/// encrypted to the joint key, plus each committee member's partial for it, sealed
+/// to the client.
 #[derive(Clone, Debug)]
-pub struct CommitteeResponse {
-    /// The response encrypted to the committee's joint key (only a quorum decrypts).
+pub struct CommitteeChunk {
+    /// This chunk's plaintext, encrypted to the committee's joint key.
     pub ciphertext: Ciphertext,
-    /// Each member's partial, sealed to the client.
+    /// Each member's partial for this chunk, sealed to the client.
     pub sealed_partials: Vec<Vec<u8>>,
 }
 
-impl CommitteeResponse {
-    /// Serialize as `ct_len (u32) || ct || count (u16) || count × sealed partials`.
-    pub fn to_bytes(&self) -> Vec<u8> {
+impl CommitteeChunk {
+    fn encode(&self, out: &mut Vec<u8>) {
         let ct = self.ciphertext.to_bytes();
-        let mut out =
-            Vec::with_capacity(6 + ct.len() + self.sealed_partials.len() * SEALED_PARTIAL_LEN);
         out.extend_from_slice(&(ct.len() as u32).to_be_bytes());
         out.extend_from_slice(&ct);
         out.extend_from_slice(&(self.sealed_partials.len() as u16).to_be_bytes());
         for sealed in &self.sealed_partials {
             out.extend_from_slice(sealed);
+        }
+    }
+
+    fn decode(cur: &mut &[u8]) -> Result<Self> {
+        let ct_len = u32::from_be_bytes(take(cur, 4)?.try_into().expect("4 bytes")) as usize;
+        let ciphertext = Ciphertext::from_bytes(take(cur, ct_len)?)?;
+        let count = u16::from_be_bytes(take(cur, 2)?.try_into().expect("2 bytes")) as usize;
+        if count > MAX_SEALED_PARTIALS {
+            return Err(Error::Decode("too many sealed partials in a chunk".into()));
+        }
+        let mut sealed_partials = Vec::with_capacity(count.min(64));
+        for _ in 0..count {
+            sealed_partials.push(take(cur, SEALED_PARTIAL_LEN)?.to_vec());
+        }
+        Ok(Self {
+            ciphertext,
+            sealed_partials,
+        })
+    }
+
+    fn add_partial(&mut self, return_secret: &[u8; 32], share: &KeyShare) -> Result<()> {
+        self.sealed_partials
+            .push(seal_partial(return_secret, share, &self.ciphertext)?);
+        Ok(())
+    }
+}
+
+/// The response a committee circuit returns to the client: the exit's response
+/// split into chunks (each ≤ [`CHUNK_PLAINTEXT`]), each threshold-encrypted with
+/// the members' sealed partials. The client decrypts each chunk and concatenates.
+#[derive(Clone, Debug)]
+pub struct CommitteeResponse {
+    /// The response chunks, in order.
+    pub chunks: Vec<CommitteeChunk>,
+}
+
+impl CommitteeResponse {
+    /// The **exit** builds the initial response: encrypt `response` in chunks to
+    /// the committee key and seal the exit's own partial for each — the plaintext
+    /// is not retained past this. An empty response still yields one empty chunk.
+    pub fn seal_at_exit(
+        commitments: &KeyCommitments,
+        response: &[u8],
+        return_secret: &[u8; 32],
+        share: &KeyShare,
+    ) -> Result<Self> {
+        let mut chunks = Vec::new();
+        for piece in response.chunks(CHUNK_PLAINTEXT.max(1)) {
+            let mut chunk = CommitteeChunk {
+                ciphertext: threshold::encrypt(commitments, piece)?,
+                sealed_partials: Vec::new(),
+            };
+            chunk.add_partial(return_secret, share)?;
+            chunks.push(chunk);
+        }
+        if chunks.is_empty() {
+            let mut chunk = CommitteeChunk {
+                ciphertext: threshold::encrypt(commitments, &[])?,
+                sealed_partials: Vec::new(),
+            };
+            chunk.add_partial(return_secret, share)?;
+            chunks.push(chunk);
+        }
+        Ok(Self { chunks })
+    }
+
+    /// A **forwarding** member adds its sealed partial to every chunk.
+    pub fn add_member(&mut self, return_secret: &[u8; 32], share: &KeyShare) -> Result<()> {
+        for chunk in &mut self.chunks {
+            chunk.add_partial(return_secret, share)?;
+        }
+        Ok(())
+    }
+
+    /// Serialize as `chunk_count (u16) || chunks`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(self.chunks.len() as u16).to_be_bytes());
+        for chunk in &self.chunks {
+            chunk.encode(&mut out);
         }
         out
     }
@@ -138,51 +223,55 @@ impl CommitteeResponse {
     /// Parse [`to_bytes`](Self::to_bytes). Bounds-checked; never panics.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let mut cur = bytes;
-        let ct_len = u32::from_be_bytes(take(&mut cur, 4)?.try_into().expect("4 bytes")) as usize;
-        let ct = Ciphertext::from_bytes(take(&mut cur, ct_len)?)?;
         let count = u16::from_be_bytes(take(&mut cur, 2)?.try_into().expect("2 bytes")) as usize;
-        if count > MAX_SEALED_PARTIALS {
-            return Err(Error::Decode("too many sealed partials".into()));
+        if count > MAX_CHUNKS {
+            return Err(Error::Decode("too many committee response chunks".into()));
         }
-        let mut sealed_partials = Vec::with_capacity(count.min(64));
+        let mut chunks = Vec::with_capacity(count.min(64));
         for _ in 0..count {
-            sealed_partials.push(take(&mut cur, SEALED_PARTIAL_LEN)?.to_vec());
+            chunks.push(CommitteeChunk::decode(&mut cur)?);
         }
         if !cur.is_empty() {
             return Err(Error::Decode(
                 "trailing bytes after committee response".into(),
             ));
         }
-        Ok(Self {
-            ciphertext: ct,
-            sealed_partials,
-        })
+        Ok(Self { chunks })
     }
 }
 
-/// The client recovers the response plaintext: open each sealed partial with a
-/// matching return secret (the MAC identifies the right one), de-duplicate by
-/// member, and combine a threshold quorum. Returns an error — never garbage — if
-/// fewer than `threshold_k` partials open and verify.
+/// The client recovers the full response: for each chunk, open the members'
+/// sealed partials with the return secrets (the MAC picks the right one),
+/// de-duplicate by member, combine a threshold quorum, then concatenate. Errors
+/// — never garbage — if any chunk lacks a quorum.
 pub fn open_response(
     commitments: &KeyCommitments,
     threshold_k: usize,
     response: &CommitteeResponse,
     return_secrets: &[[u8; 32]],
 ) -> Result<Vec<u8>> {
-    let mut partials = Vec::new();
-    let mut seen = HashSet::new();
-    for sealed in &response.sealed_partials {
-        for secret in return_secrets {
-            if let Ok(p) = open_partial(secret, sealed) {
-                if seen.insert(p.member()) {
-                    partials.push(p);
+    let mut out = Vec::new();
+    for chunk in &response.chunks {
+        let mut partials = Vec::new();
+        let mut seen = HashSet::new();
+        for sealed in &chunk.sealed_partials {
+            for secret in return_secrets {
+                if let Ok(p) = open_partial(secret, sealed) {
+                    if seen.insert(p.member()) {
+                        partials.push(p);
+                    }
+                    break;
                 }
-                break;
             }
         }
+        out.extend_from_slice(&threshold::combine(
+            commitments,
+            threshold_k,
+            &chunk.ciphertext,
+            &partials,
+        )?);
     }
-    threshold::combine(commitments, threshold_k, &response.ciphertext, &partials)
+    Ok(out)
 }
 
 /// Split `n` bytes off the front of `cur`, erroring (not panicking) if short.
@@ -197,21 +286,81 @@ fn take<'a>(cur: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
 
 // ---- live circuit transport -----------------------------------------------
 
-/// A committee circuit's exit handler: turn a request into a response (a real
-/// exit performs the request; tests echo).
-pub type ExitHandler = fn(&[u8]) -> Vec<u8>;
+/// How a committee exit turns a request into a response.
+#[derive(Clone, Copy, Debug)]
+pub enum ExitBehavior {
+    /// Echo the request back — for demos and tests (no destination dialed).
+    Echo,
+    /// Fetch a real clearnet destination over TCP: connect, send the request,
+    /// read the (bounded) response. SSRF-guarded via
+    /// [`neo_core::net::is_safe_dial_target`]; `allow_loopback` relaxes that for
+    /// local dev/test only.
+    Clearnet {
+        /// Permit loopback/private destinations (dev/test). Production: `false`.
+        allow_loopback: bool,
+    },
+}
 
-/// Client: send `request` through a committee `circuit` — each hop a committee
-/// member holding a share of `commitments` — and recover the response the exit
-/// encrypted to the committee's joint key, combining the members' sealed partials
-/// gathered on the return path. Only this client ever sees the response
-/// plaintext; no committee member does (bar the egress at the moment it fetches
-/// the destination — the documented M33 send-path gap).
+/// Max bytes an exit reads from a destination before stopping.
+const EXIT_MAX_RESPONSE: usize = 4 * 1024 * 1024;
+/// How long an exit waits on a destination fetch.
+const EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Fetch `request` from a clearnet `destination` (`host:port`) over TCP: connect,
+/// write the request, half-close, and read the response to EOF — bounded by
+/// [`EXIT_MAX_RESPONSE`] and [`EXIT_TIMEOUT`], SSRF-guarded. A simple
+/// send-then-read exit; a protocol-aware (keep-alive HTTP) exit is a refinement,
+/// and hiding the request from the egress member is the M33 send path.
+async fn fetch_clearnet(
+    destination: &str,
+    request: &[u8],
+    allow_loopback: bool,
+) -> Result<Vec<u8>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    if !neo_core::net::is_safe_dial_target(destination, allow_loopback) {
+        return Err(Error::Config(format!(
+            "committee exit refuses unsafe destination {destination}"
+        )));
+    }
+    let fetch = async {
+        let mut stream = tokio::net::TcpStream::connect(destination)
+            .await
+            .map_err(|e| Error::Config(format!("exit connect {destination}: {e}")))?;
+        stream
+            .write_all(request)
+            .await
+            .map_err(|e| Error::Config(format!("exit write: {e}")))?;
+        let _ = stream.shutdown().await; // half-close: signal end of request
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            let n = stream
+                .read(&mut chunk)
+                .await
+                .map_err(|e| Error::Config(format!("exit read: {e}")))?;
+            if n == 0 || buf.len() >= EXIT_MAX_RESPONSE {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        Ok::<_, Error>(buf)
+    };
+    tokio::time::timeout(EXIT_TIMEOUT, fetch)
+        .await
+        .map_err(|_| Error::Config("committee exit fetch timed out".into()))?
+}
+
+/// Client: send `request` to `destination` through a committee `circuit` — each
+/// hop a committee member holding a share of `commitments` — and recover the
+/// response the exit encrypted to the joint key, combining the members' sealed
+/// partials from the return path. Only this client sees the response plaintext;
+/// no committee member does (bar the egress at fetch time — the M33 send-path gap).
 pub async fn committee_request_response(
     identity: &NodeIdentity,
     circuit: &[Hop],
     commitments: &KeyCommitments,
     threshold_k: usize,
+    destination: &str,
     request: &[u8],
 ) -> Result<Vec<u8>> {
     if circuit.is_empty() {
@@ -226,38 +375,31 @@ pub async fn committee_request_response(
             public: h.sphinx,
         })
         .collect();
-    // The exit must know the committee key to encrypt its response to; carry it
-    // in the exit-only Sphinx payload, ahead of the request itself.
-    let mut payload = Vec::with_capacity(2 + commitments.to_bytes().len() + request.len());
-    let cbytes = commitments.to_bytes();
-    payload.extend_from_slice(&(cbytes.len() as u16).to_be_bytes());
-    payload.extend_from_slice(&cbytes);
-    payload.extend_from_slice(request);
+    // Exit-only Sphinx payload: the committee key (to encrypt to) + destination
+    // (to fetch) + request.
+    let payload = encode_exit_payload(commitments, destination, request);
 
     let (packet, secrets) = create_packet_keyed(&hops, &payload)?;
     let (mut stream, mut result) =
         connect_verified(&circuit[0].addr, identity, &circuit[0].id).await?;
-    // Declare the committee-circuit mode, then hand over the onion.
     write_frame(
         &mut stream,
         &result.session.seal(&[crate::run::FRAME_COMMITTEE])?,
     )
     .await?;
-    let framed = result.session.seal(&packet.to_bytes())?;
-    write_frame(&mut stream, &framed).await?;
+    write_frame(&mut stream, &result.session.seal(&packet.to_bytes())?).await?;
 
-    let sealed = read_frame(&mut stream).await?;
-    let bytes = result.session.open(&sealed)?;
+    let bytes = result.session.open(&read_frame(&mut stream).await?)?;
     let response = CommitteeResponse::from_bytes(&bytes)?;
     open_response(commitments, threshold_k, &response, &secrets)
 }
 
 /// Relay/exit: handle one committee-circuit connection. Peels one Sphinx layer,
-/// then either forwards to the next hop and, on the returning
-/// [`CommitteeResponse`], appends **this** member's sealed partial; or, at the
-/// exit, runs `exit`, encrypts the response to the committee key from the
-/// payload, discards the plaintext, and seals its own partial. `share` is this
-/// member's DKG share of the committee key.
+/// then either forwards to the next hop and adds **this** member's sealed partial
+/// to every chunk of the returning [`CommitteeResponse`]; or, at the exit, runs
+/// `exit` on the request (fetching the destination), splits the response into
+/// chunks encrypted to the committee key, discards the plaintext, and seals its
+/// own partial per chunk. `share` is this member's DKG share.
 pub async fn handle_committee_circuit<S, R>(
     identity: &NodeIdentity,
     share: &KeyShare,
@@ -265,7 +407,7 @@ pub async fn handle_committee_circuit<S, R>(
     prev_session: &mut Session,
     resolver: &R,
     replay: &Mutex<ReplayCache>,
-    exit: ExitHandler,
+    exit: ExitBehavior,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -274,8 +416,6 @@ where
     let sealed = read_frame(prev).await?;
     let packet_bytes = prev_session.open(&sealed)?;
     let packet = SphinxPacket::from_bytes(&packet_bytes)?;
-    // This member's return secret — the client re-derives the same value (from
-    // create_packet_keyed) and uses it to open this member's sealed partial.
     let secret = identity.sphinx_shared(packet.alpha())?;
 
     let processed = {
@@ -285,16 +425,16 @@ where
 
     let response = match processed {
         Processed::Deliver { payload } => {
-            // Exit: payload is [commitments || request]. Encrypt the response to
-            // the committee key and discard the plaintext after sealing.
-            let (commitments, request) = parse_exit_payload(&payload)?;
-            let response_plaintext = exit(&request);
-            let ciphertext = threshold::encrypt(&commitments, &response_plaintext)?;
-            let sealed_partial = seal_partial(&secret, share, &ciphertext)?;
-            CommitteeResponse {
-                ciphertext,
-                sealed_partials: vec![sealed_partial],
-            }
+            let (commitments, destination, request) = decode_exit_payload(&payload)?;
+            let response_plaintext = match exit {
+                ExitBehavior::Echo => request,
+                ExitBehavior::Clearnet { allow_loopback } => {
+                    fetch_clearnet(&destination, &request, allow_loopback).await?
+                }
+            };
+            // Chunk + encrypt to the joint key; the plaintext is not retained past
+            // this point (the exit saw it — the documented M33 boundary).
+            CommitteeResponse::seal_at_exit(&commitments, &response_plaintext, &secret, share)?
         }
         Processed::Forward { next, packet } => {
             let next_id = NodeId::from_bytes(next);
@@ -303,36 +443,52 @@ where
                 .ok_or_else(|| Error::Config(format!("no address for next hop {next_id}")))?;
             let (mut next_stream, mut next_result) =
                 connect_verified(&addr, identity, &next_id).await?;
-            // Propagate the committee mode to the next hop, then the peeled packet.
             write_frame(
                 &mut next_stream,
                 &next_result.session.seal(&[crate::run::FRAME_COMMITTEE])?,
             )
             .await?;
-            let framed = next_result.session.seal(&packet.to_bytes())?;
-            write_frame(&mut next_stream, &framed).await?;
-            let sealed = read_frame(&mut next_stream).await?;
-            let bytes = next_result.session.open(&sealed)?;
+            write_frame(
+                &mut next_stream,
+                &next_result.session.seal(&packet.to_bytes())?,
+            )
+            .await?;
+            let bytes = next_result
+                .session
+                .open(&read_frame(&mut next_stream).await?)?;
             let mut response = CommitteeResponse::from_bytes(&bytes)?;
-            // Add this member's sealed partial for the exit's ciphertext.
-            response
-                .sealed_partials
-                .push(seal_partial(&secret, share, &response.ciphertext)?);
+            response.add_member(&secret, share)?;
             response
         }
     };
 
-    let out = prev_session.seal(&response.to_bytes())?;
-    write_frame(prev, &out).await?;
+    write_frame(prev, &prev_session.seal(&response.to_bytes())?).await?;
     Ok(())
 }
 
-/// Parse an exit payload `[commitments_len (u16) || commitments || request]`.
-fn parse_exit_payload(payload: &[u8]) -> Result<(KeyCommitments, Vec<u8>)> {
+/// Encode an exit payload `[commitments_len (u16) || commitments || dest_len (u16)
+/// || destination || request]`.
+fn encode_exit_payload(commitments: &KeyCommitments, destination: &str, request: &[u8]) -> Vec<u8> {
+    let cbytes = commitments.to_bytes();
+    let mut out = Vec::with_capacity(4 + cbytes.len() + destination.len() + request.len());
+    out.extend_from_slice(&(cbytes.len() as u16).to_be_bytes());
+    out.extend_from_slice(&cbytes);
+    out.extend_from_slice(&(destination.len() as u16).to_be_bytes());
+    out.extend_from_slice(destination.as_bytes());
+    out.extend_from_slice(request);
+    out
+}
+
+/// Parse [`encode_exit_payload`] into `(commitments, destination, request)`.
+fn decode_exit_payload(payload: &[u8]) -> Result<(KeyCommitments, String, Vec<u8>)> {
     let mut cur = payload;
     let clen = u16::from_be_bytes(take(&mut cur, 2)?.try_into().expect("2 bytes")) as usize;
     let commitments = KeyCommitments::from_bytes(take(&mut cur, clen)?)?;
-    Ok((commitments, cur.to_vec()))
+    let dlen = u16::from_be_bytes(take(&mut cur, 2)?.try_into().expect("2 bytes")) as usize;
+    let destination = std::str::from_utf8(take(&mut cur, dlen)?)
+        .map_err(|_| Error::Decode("exit destination not UTF-8".into()))?
+        .to_string();
+    Ok((commitments, destination, cur.to_vec()))
 }
 
 // ---- networked distributed key generation ---------------------------------
@@ -737,16 +893,17 @@ mod tests {
         let secrets = [secret(11), secret(22), secret(33)];
         let response_plaintext = b"HTTP/1.1 200 OK\r\n\r\ntop secret body";
 
-        // Exit encrypts the response to the joint key.
-        let ct = threshold::encrypt(&commitments, response_plaintext).unwrap();
-        // Each hop seals its partial under its own return secret.
-        let sealed: Vec<Vec<u8>> = (0..3)
-            .map(|i| seal_partial(&secrets[i], &shares[i], &ct).unwrap())
-            .collect();
-        let response = CommitteeResponse {
-            ciphertext: ct,
-            sealed_partials: sealed,
-        };
+        // Exit (member 0) chunks + encrypts the response and seals its partial;
+        // members 1 and 2 add theirs on the return path.
+        let mut response = CommitteeResponse::seal_at_exit(
+            &commitments,
+            response_plaintext,
+            &secrets[0],
+            &shares[0],
+        )
+        .unwrap();
+        response.add_member(&secrets[1], &shares[1]).unwrap();
+        response.add_member(&secrets[2], &shares[2]).unwrap();
 
         // The client, holding every return secret, recovers the plaintext.
         assert_eq!(
@@ -780,22 +937,37 @@ mod tests {
     #[test]
     fn committee_response_roundtrips_on_the_wire() {
         let (commitments, shares) = committee(4, 3);
-        let ct = threshold::encrypt(&commitments, b"a response").unwrap();
         let secrets: Vec<[u8; 32]> = (0..4).map(|i| secret(i as u8 + 1)).collect();
-        let sealed: Vec<Vec<u8>> = (0..4)
-            .map(|i| seal_partial(&secrets[i], &shares[i], &ct).unwrap())
-            .collect();
-        let response = CommitteeResponse {
-            ciphertext: ct,
-            sealed_partials: sealed,
-        };
+        let mut response =
+            CommitteeResponse::seal_at_exit(&commitments, b"a response", &secrets[0], &shares[0])
+                .unwrap();
+        for i in 1..4 {
+            response.add_member(&secrets[i], &shares[i]).unwrap();
+        }
         let parsed = CommitteeResponse::from_bytes(&response.to_bytes()).unwrap();
         assert_eq!(
             open_response(&commitments, 3, &parsed, &secrets).unwrap(),
             b"a response"
         );
         // A truncated buffer is rejected, not panicked.
-        assert!(CommitteeResponse::from_bytes(&response.to_bytes()[..5]).is_err());
+        assert!(CommitteeResponse::from_bytes(&response.to_bytes()[..3]).is_err());
+    }
+
+    #[test]
+    fn a_large_response_is_chunked_and_reassembled() {
+        // A response bigger than one threshold ciphertext is split into chunks,
+        // each with its members' partials; the client reassembles the whole.
+        let (commitments, shares) = committee(3, 2);
+        let secrets = [secret(1), secret(2), secret(3)];
+        let big = vec![0xABu8; CHUNK_PLAINTEXT + 12_345]; // > one chunk
+        let mut response =
+            CommitteeResponse::seal_at_exit(&commitments, &big, &secrets[0], &shares[0]).unwrap();
+        response.add_member(&secrets[1], &shares[1]).unwrap();
+        assert!(response.chunks.len() >= 2, "a large response spans chunks");
+        assert_eq!(
+            open_response(&commitments, 2, &response, &secrets).unwrap(),
+            big
+        );
     }
 
     #[tokio::test]
@@ -966,10 +1138,6 @@ mod tests {
         assert_eq!(parsed.circuit().unwrap().len(), 3);
     }
 
-    fn echo(request: &[u8]) -> Vec<u8> {
-        request.to_vec()
-    }
-
     fn hop_of(identity: &NodeIdentity, addr: &str) -> Hop {
         let p = identity.public();
         Hop {
@@ -1001,7 +1169,7 @@ mod tests {
                 crate::circuit::ExitPolicy::default(),
                 Some(crate::serve::CommitteeServing {
                     share: &share,
-                    exit: echo,
+                    exit: ExitBehavior::Echo,
                 }),
             )
             .await
@@ -1039,9 +1207,11 @@ mod tests {
             hop_of(&m[2], &exit_addr),
         ];
         let request = b"GET /secret HTTP/1.1";
-        let response = committee_request_response(&client, &circuit, &commitments, 2, request)
-            .await
-            .unwrap();
+        // Echo exit: the destination is ignored, so any placeholder works.
+        let response =
+            committee_request_response(&client, &circuit, &commitments, 2, "ignored:0", request)
+                .await
+                .unwrap();
         assert_eq!(response, request, "the client recovers the echoed response");
 
         entry_task.await.unwrap().unwrap();

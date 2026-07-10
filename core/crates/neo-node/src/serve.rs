@@ -14,7 +14,7 @@ use neo_mpc::vss::KeyShare;
 use tokio::net::TcpStream;
 
 use crate::circuit::{serve_circuit, ExitPolicy};
-use crate::committee::{handle_committee_circuit, ExitHandler};
+use crate::committee::{handle_committee_circuit, ExitBehavior};
 use crate::forward::{handle_onion_shared, NextHop, Outcome};
 use crate::run::{read_frame, FRAME_CIRCUIT, FRAME_COMMITTEE, FRAME_MESSAGE};
 
@@ -25,9 +25,8 @@ use crate::run::{read_frame, FRAME_CIRCUIT, FRAME_COMMITTEE, FRAME_MESSAGE};
 pub struct CommitteeServing<'a> {
     /// This node's share of the committee's joint key.
     pub share: &'a KeyShare,
-    /// What an exit does with a request to produce a response (a real exit
-    /// fetches the destination; a demo echoes).
-    pub exit: ExitHandler,
+    /// How an exit produces a response (fetch the real destination, or echo).
+    pub exit: ExitBehavior,
 }
 
 /// What a served connection turned out to be, for the caller to log.
