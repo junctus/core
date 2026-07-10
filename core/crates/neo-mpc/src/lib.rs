@@ -44,6 +44,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod attestation;
 pub mod dkg;
 pub mod mpc_tls;
 pub mod threshold;
