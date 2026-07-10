@@ -545,10 +545,18 @@ a trust model Tor and commercial VPNs structurally cannot offer.
   artifact a client routes with. **CLI**: `neo committee serve` (DKG + serve) and `neo committee send`.
   Tested over real sockets: a committee circuit round-trips a response only the client can read, and 3
   members establish a shared key no party holds.
-- Remaining refinements (honest): the committee exit currently **echoes** — a real clearnet-fetching exit
-  (async request + response chunking across `MAX_CIPHERTEXT`) is deferred; DKG requires all members online
-  (a complaint/disqualification round for active-fault liveness, and `n>k` over-provisioning + timeout on the
-  circuit, are deferred); and the descriptor is published by-file, not yet via a seed endpoint.
+- Done (production refinements): **real clearnet exit** — `ExitBehavior::Clearnet` does an SSRF-guarded TCP
+  fetch and **chunks** the response across `MAX_CIPHERTEXT` (`CommitteeResponse` is multi-chunk, each
+  threshold-encrypted with its own partials); **crash-fault-tolerant DKG** — `run_dkg` completes over a
+  *qualified set* (two timeout-bounded rounds, accept-set intersection) so offline members don't stall it;
+  **circuit liveness** — `committee_request` retries `k`-member subsets with a per-attempt timeout, so an
+  over-provisioned `n>k` committee routes around unavailable members; **seed discovery** — `GET|POST
+  /committee` publishes/serves descriptors, `committee serve` auto-publishes and `committee send` discovers.
+  Tested: chunk reassembly, DKG with a member offline, retry around a closed port, seed publish/list.
+- Remaining (honest): DKG tolerates *crash* faults under synchrony, not a *Byzantine* member reporting
+  inconsistent accept-sets (safe — circuits fail — but a liveness regression); the clearnet exit is a simple
+  send-then-read (keep-alive HTTP awareness deferred); committee descriptors are served by the seed but not
+  yet witness-attested (a bogus committee fails to decrypt rather than being rejected up front).
 - Why a game-changer: "no responsible exit" stops being a statistical hope and becomes a checkable
   cryptographic fact — a new trust story a journalist can give a source ("even the exit can't rat you
   out, and here is the DLEQ proof"), and a near-zero-liability role for altruistic operators in strict
