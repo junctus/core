@@ -40,6 +40,11 @@ use crate::vss::{KeyCommitments, KeyShare};
 /// ephemeral `r` (so the key never repeats).
 const NONCE: [u8; 12] = *b"neo-thresh\0\0";
 
+/// Upper bound on a threshold ciphertext's AEAD body — a response is chunked into
+/// pieces no larger than this before encryption, so a forged length prefix cannot
+/// trigger an unbounded allocation on parse.
+pub const MAX_CIPHERTEXT: usize = 64 * 1024;
+
 /// KEM-DEM ciphertext under the committee's joint key: `(R, c)` where `R = r·G`
 /// and `c = AEAD_K(m)` with `K = KDF(R, r·Y)`. The DEM is **authenticated**
 /// (ChaCha20-Poly1305), so the ciphertext is not malleable, and the KDF binds `R`
@@ -64,6 +69,72 @@ pub struct Partial {
     e: Scalar,
     /// Chaum–Pedersen response.
     z: Scalar,
+}
+
+impl Ciphertext {
+    /// Serialize as `R (32) || len (u32 BE) || AEAD body`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(36 + self.c.len());
+        out.extend_from_slice(self.r_point.as_bytes());
+        out.extend_from_slice(&(self.c.len() as u32).to_be_bytes());
+        out.extend_from_slice(&self.c);
+        out
+    }
+
+    /// Parse [`to_bytes`](Self::to_bytes). Bounds-checked so it never panics on
+    /// arbitrary input; point/scalar validity is enforced by the crypto ops.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut cur = bytes;
+        let r = take(&mut cur, 32)?;
+        let len = u32::from_be_bytes(take(&mut cur, 4)?.try_into().expect("4 bytes")) as usize;
+        if len > MAX_CIPHERTEXT {
+            return Err(Error::Decode("threshold ciphertext too large".into()));
+        }
+        let c = take(&mut cur, len)?.to_vec();
+        if !cur.is_empty() {
+            return Err(Error::Decode(
+                "trailing bytes after threshold ciphertext".into(),
+            ));
+        }
+        Ok(Ciphertext {
+            r_point: CompressedRistretto(r.try_into().expect("32 bytes")),
+            c,
+        })
+    }
+}
+
+impl Partial {
+    /// The contributing member index (1..=n).
+    pub fn member(&self) -> u8 {
+        self.member
+    }
+
+    /// Serialize as `member (1) || D (32) || e (32) || z (32)` = 97 bytes.
+    pub fn to_bytes(&self) -> [u8; 97] {
+        let mut out = [0u8; 97];
+        out[0] = self.member;
+        out[1..33].copy_from_slice(self.d.as_bytes());
+        out[33..65].copy_from_slice(self.e.as_bytes());
+        out[65..97].copy_from_slice(self.z.as_bytes());
+        out
+    }
+
+    /// Parse [`to_bytes`](Self::to_bytes). Rejects member 0 and non-canonical
+    /// scalars; the DLEQ point is validated when the partial is verified.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut cur = bytes;
+        let member = take(&mut cur, 1)?[0];
+        if member == 0 {
+            return Err(Error::Decode("partial member index 0 is invalid".into()));
+        }
+        let d = CompressedRistretto(take(&mut cur, 32)?.try_into().expect("32 bytes"));
+        let e = scalar_from(take(&mut cur, 32)?)?;
+        let z = scalar_from(take(&mut cur, 32)?)?;
+        if !cur.is_empty() {
+            return Err(Error::Decode("trailing bytes after partial".into()));
+        }
+        Ok(Partial { member, d, e, z })
+    }
 }
 
 /// Encrypt `m` to the committee's joint public key (its `commitments[0]`), so that
@@ -283,6 +354,25 @@ fn random_scalar() -> Result<Scalar> {
     Ok(Scalar::from_bytes_mod_order_wide(&wide))
 }
 
+/// Split `n` bytes off the front of `cur`, erroring (not panicking) if short.
+fn take<'a>(cur: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
+    if cur.len() < n {
+        return Err(Error::Decode("truncated threshold encoding".into()));
+    }
+    let (head, tail) = cur.split_at(n);
+    *cur = tail;
+    Ok(head)
+}
+
+/// Parse a canonical 32-byte scalar, rejecting a non-canonical encoding.
+fn scalar_from(bytes: &[u8]) -> Result<Scalar> {
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| Error::Decode("scalar must be 32 bytes".into()))?;
+    Option::from(Scalar::from_canonical_bytes(arr))
+        .ok_or_else(|| Error::Decode("non-canonical scalar".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,5 +487,40 @@ mod tests {
         let ct = encrypt(&session.commitments, b"secret").unwrap();
         let one = partials_from(&session, &[0], &ct);
         assert!(combine(&session.commitments, 3, &ct, &one).is_err());
+    }
+
+    #[test]
+    fn ciphertext_roundtrips_and_rejects_junk() {
+        let session = dealt();
+        let ct = encrypt(&session.commitments, b"a response chunk").unwrap();
+        let parsed = Ciphertext::from_bytes(&ct.to_bytes()).unwrap();
+        assert_eq!(parsed.r_point, ct.r_point);
+        assert_eq!(parsed.c, ct.c);
+        // A quorum still decrypts the re-parsed ciphertext.
+        let partials = partials_from(&session, &[0, 1, 2], &parsed);
+        assert_eq!(
+            combine(&session.commitments, 3, &parsed, &partials).unwrap(),
+            b"a response chunk"
+        );
+        // Truncated and oversized-length are rejected, not panicked.
+        assert!(Ciphertext::from_bytes(&ct.to_bytes()[..10]).is_err());
+        let mut oversized = ct.to_bytes();
+        oversized[32..36].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(Ciphertext::from_bytes(&oversized).is_err());
+    }
+
+    #[test]
+    fn partial_roundtrips_and_still_verifies() {
+        let session = dealt();
+        let ct = encrypt(&session.commitments, b"x").unwrap();
+        let p = partial_decrypt(session.share_of(0).unwrap(), &ct).unwrap();
+        let parsed = Partial::from_bytes(&p.to_bytes()).unwrap();
+        assert_eq!(parsed.member(), p.member);
+        assert!(verify_partial(&session.commitments, &ct, &parsed));
+        // A member-0 partial and a short buffer are rejected.
+        let mut bad = p.to_bytes();
+        bad[0] = 0;
+        assert!(Partial::from_bytes(&bad).is_err());
+        assert!(Partial::from_bytes(&p.to_bytes()[..50]).is_err());
     }
 }

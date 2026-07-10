@@ -76,6 +76,65 @@ impl KeyShare {
         }
         RISTRETTO_BASEPOINT_POINT * self.value == acc
     }
+
+    /// Serialize as `member (1) || value (32)` = 33 bytes.
+    ///
+    /// The share value is **secret** key material — serialize it only to deliver
+    /// it to its own member over a private/encrypted channel (e.g. the DKG
+    /// dealing round), never in the clear.
+    pub fn to_bytes(&self) -> [u8; 33] {
+        let mut out = [0u8; 33];
+        out[0] = self.member;
+        out[1..33].copy_from_slice(self.value.as_bytes());
+        out
+    }
+
+    /// Parse [`to_bytes`](Self::to_bytes). Rejects member 0 and non-canonical scalars.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut cur = bytes;
+        let member = take(&mut cur, 1)?[0];
+        if member == 0 {
+            return Err(Error::Decode("key share member index 0 is invalid".into()));
+        }
+        let value = scalar_from(take(&mut cur, 32)?)?;
+        if !cur.is_empty() {
+            return Err(Error::Decode("trailing bytes after key share".into()));
+        }
+        Ok(KeyShare { member, value })
+    }
+}
+
+impl KeyCommitments {
+    /// Serialize as `count (u16 BE) || count × 32-byte points`. Public data.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + self.0.len() * 32);
+        out.extend_from_slice(&(self.0.len() as u16).to_be_bytes());
+        for point in &self.0 {
+            out.extend_from_slice(point.as_bytes());
+        }
+        out
+    }
+
+    /// Parse [`to_bytes`](Self::to_bytes). Bounds the commitment count (a degree
+    /// bounded by [`MAX_MEMBERS`](crate::MAX_MEMBERS)) so a forged count can't
+    /// trigger an unbounded allocation; point validity is checked when used.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut cur = bytes;
+        let count = u16::from_be_bytes(take(&mut cur, 2)?.try_into().expect("2 bytes")) as usize;
+        if count == 0 || count > crate::MAX_MEMBERS {
+            return Err(Error::Decode("invalid commitment count".into()));
+        }
+        let mut points = Vec::with_capacity(count);
+        for _ in 0..count {
+            points.push(CompressedRistretto(
+                take(&mut cur, 32)?.try_into().expect("32 bytes"),
+            ));
+        }
+        if !cur.is_empty() {
+            return Err(Error::Decode("trailing bytes after commitments".into()));
+        }
+        Ok(KeyCommitments(points))
+    }
 }
 
 /// A committee session: the encrypted request plus verifiable key shares.
@@ -229,6 +288,25 @@ fn random_scalar() -> Result<Scalar> {
     Ok(Scalar::from_bytes_mod_order_wide(&wide))
 }
 
+/// Split `n` bytes off the front of `cur`, erroring (not panicking) if short.
+fn take<'a>(cur: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
+    if cur.len() < n {
+        return Err(Error::Decode("truncated committee encoding".into()));
+    }
+    let (head, tail) = cur.split_at(n);
+    *cur = tail;
+    Ok(head)
+}
+
+/// Parse a canonical 32-byte scalar, rejecting a non-canonical encoding.
+fn scalar_from(bytes: &[u8]) -> Result<Scalar> {
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| Error::Decode("scalar must be 32 bytes".into()))?;
+    Option::from(Scalar::from_canonical_bytes(arr))
+        .ok_or_else(|| Error::Decode("non-canonical scalar".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,6 +399,27 @@ mod tests {
             !forged.verify(&session.commitments),
             "a share at index 0 must be rejected outright"
         );
+    }
+
+    #[test]
+    fn key_share_and_commitments_roundtrip_and_reject_junk() {
+        let session = CommitteeSession::deal(&request(), cfg()).unwrap();
+        let share = session.share_of(0).unwrap().clone();
+
+        let parsed = KeyShare::from_bytes(&share.to_bytes()).unwrap();
+        assert_eq!(parsed.member, share.member);
+        assert!(parsed.verify(&session.commitments));
+
+        let commitments = KeyCommitments::from_bytes(&session.commitments.to_bytes()).unwrap();
+        assert_eq!(commitments.0, session.commitments.0);
+        assert!(share.verify(&commitments));
+
+        // Rejections: member 0, a short buffer, and a zero commitment count.
+        let mut bad = share.to_bytes();
+        bad[0] = 0;
+        assert!(KeyShare::from_bytes(&bad).is_err());
+        assert!(KeyShare::from_bytes(&share.to_bytes()[..20]).is_err());
+        assert!(KeyCommitments::from_bytes(&[0, 0]).is_err());
     }
 
     #[test]
