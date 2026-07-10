@@ -335,6 +335,114 @@ fn parse_exit_payload(payload: &[u8]) -> Result<(KeyCommitments, Vec<u8>)> {
     Ok((commitments, cur.to_vec()))
 }
 
+// ---- networked distributed key generation ---------------------------------
+
+/// Serialize a DKG exchange message: `[commitment_len (u16) || commitment ||
+/// share (33)]` — this member's public Feldman commitment plus the private share
+/// it deals to the peer. Sent over the authenticated, encrypted M1 session.
+fn encode_dkg_msg(commitment: &KeyCommitments, share_for_peer: &KeyShare) -> Vec<u8> {
+    let cbytes = commitment.to_bytes();
+    let mut out = Vec::with_capacity(2 + cbytes.len() + 33);
+    out.extend_from_slice(&(cbytes.len() as u16).to_be_bytes());
+    out.extend_from_slice(&cbytes);
+    out.extend_from_slice(&share_for_peer.to_bytes());
+    out
+}
+
+fn decode_dkg_msg(bytes: &[u8]) -> Result<(KeyCommitments, KeyShare)> {
+    let mut cur = bytes;
+    let clen = u16::from_be_bytes(take(&mut cur, 2)?.try_into().expect("2 bytes")) as usize;
+    let commitment = KeyCommitments::from_bytes(take(&mut cur, clen)?)?;
+    let share = KeyShare::from_bytes(take(&mut cur, 33)?)?;
+    Ok((commitment, share))
+}
+
+/// Run **networked Joint-Feldman DKG** among the committee `roster` from this
+/// member's viewpoint (`identity`, 1-based `index`, its committee `listener`).
+/// Returns this member's aggregate [`KeyShare`] and the agreed
+/// [`CommitteeDescriptor`]. No party ever holds the joint secret `s`.
+///
+/// Coordination: for each pair `(a, b)` with `a < b`, the **higher** index dials
+/// the lower; the lower accepts. Both sides send their commitment + the private
+/// share dealt to the peer and read the peer's, over the authenticated session —
+/// so shares stay confidential and are attributed to a verified sender. Each
+/// received share is checked against its dealer's commitment (abort on a bad
+/// share). Requires every member online; a complaint/disqualification round for
+/// liveness under active faults is deferred (documented in [`neo_mpc::dkg`]).
+pub async fn run_dkg(
+    identity: &NodeIdentity,
+    index: u8,
+    roster: &[CommitteeMemberInfo],
+    listener: &tokio::net::TcpListener,
+    cfg: neo_mpc::CommitteeConfig,
+) -> Result<(KeyShare, CommitteeDescriptor)> {
+    use neo_mpc::dkg;
+
+    if !roster.iter().any(|m| m.index == index) {
+        return Err(Error::Config(
+            "this node is not in the committee roster".into(),
+        ));
+    }
+    let contribution = dkg::Contribution::generate(index, &cfg)?;
+    let my_commitment = contribution.commitment().clone();
+
+    // Received from each peer: its commitment + the share it dealt to me.
+    let mut received: std::collections::HashMap<u8, (KeyCommitments, KeyShare)> =
+        std::collections::HashMap::new();
+
+    // Accept from higher-indexed peers.
+    let higher = roster.iter().filter(|m| m.index > index).count();
+    for _ in 0..higher {
+        let (mut stream, result) = crate::run::accept(listener, identity).await?;
+        let peer = roster
+            .iter()
+            .find(|m| m.id == result.peer_id)
+            .ok_or_else(|| Error::Crypto("DKG connection from a non-roster peer".into()))?;
+        let mut session = result.session;
+        // Read the peer's message, then reply with ours.
+        let bytes = session.open(&read_frame(&mut stream).await?)?;
+        let (peer_commitment, share_for_me) = decode_dkg_msg(&bytes)?;
+        let msg = encode_dkg_msg(&my_commitment, &contribution.share_for(peer.index)?);
+        write_frame(&mut stream, &session.seal(&msg)?).await?;
+        received.insert(peer.index, (peer_commitment, share_for_me));
+    }
+
+    // Dial lower-indexed peers.
+    for peer in roster.iter().filter(|m| m.index < index) {
+        let (mut stream, mut result) = connect_verified(&peer.addr, identity, &peer.id).await?;
+        let msg = encode_dkg_msg(&my_commitment, &contribution.share_for(peer.index)?);
+        write_frame(&mut stream, &result.session.seal(&msg)?).await?;
+        let bytes = result.session.open(&read_frame(&mut stream).await?)?;
+        let (peer_commitment, share_for_me) = decode_dkg_msg(&bytes)?;
+        received.insert(peer.index, (peer_commitment, share_for_me));
+    }
+
+    // Verify every dealt share against its dealer's commitment, then aggregate.
+    let mut all_commitments = vec![my_commitment];
+    let mut dealt_to_me = vec![contribution.share_for(index)?];
+    for peer in roster.iter().filter(|m| m.index != index) {
+        let (commitment, share) = received
+            .get(&peer.index)
+            .ok_or_else(|| Error::Crypto(format!("no DKG message from member {}", peer.index)))?;
+        if !share.verify(commitment) {
+            return Err(Error::Crypto(format!(
+                "DKG share from member {} failed its commitment",
+                peer.index
+            )));
+        }
+        all_commitments.push(commitment.clone());
+        dealt_to_me.push(share.clone());
+    }
+
+    let commitments = dkg::joint_commitments(&all_commitments)?;
+    let my_share = dkg::aggregate_share(index, &dealt_to_me)?;
+    let descriptor = CommitteeDescriptor {
+        commitments,
+        members: roster.to_vec(),
+    };
+    Ok((my_share, descriptor))
+}
+
 // ---- discovery: the committee descriptor ----------------------------------
 
 /// A committee member's routing identity in a [`CommitteeDescriptor`]: its
@@ -549,6 +657,70 @@ mod tests {
         );
         // A truncated buffer is rejected, not panicked.
         assert!(CommitteeResponse::from_bytes(&response.to_bytes()[..5]).is_err());
+    }
+
+    #[tokio::test]
+    async fn networked_dkg_establishes_a_shared_key_no_party_holds() {
+        // Three members run Joint-Feldman DKG over real sockets; each ends with a
+        // share of a joint key nobody dealt, and they agree on the descriptor.
+        let cfg = neo_mpc::CommitteeConfig {
+            members: 3,
+            threshold: 2,
+        };
+        let ids: Vec<NodeIdentity> = (0..3).map(|_| NodeIdentity::generate().unwrap()).collect();
+
+        // Bind each member's listener first so the roster addresses are known.
+        let mut listeners = Vec::new();
+        let mut roster = Vec::new();
+        for (i, id) in ids.iter().enumerate() {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap().to_string();
+            roster.push(CommitteeMemberInfo {
+                index: (i + 1) as u8,
+                id: id.id(),
+                sphinx: id.public().sphinx,
+                addr,
+            });
+            listeners.push(l);
+        }
+
+        // Run DKG concurrently for all members.
+        let mut tasks = Vec::new();
+        for (id, listener) in ids.iter().zip(listeners) {
+            let idb = id.to_bytes();
+            let roster_c = roster.clone();
+            let index = roster.iter().find(|m| m.id == id.id()).unwrap().index;
+            tasks.push(tokio::spawn(async move {
+                let identity = NodeIdentity::from_bytes(&idb).unwrap();
+                run_dkg(&identity, index, &roster_c, &listener, cfg).await
+            }));
+        }
+        let mut results = Vec::new();
+        for t in tasks {
+            results.push(t.await.unwrap().unwrap());
+        }
+
+        // Every member agrees on the joint key, and each share verifies against it.
+        let commitments = results[0].1.commitments.clone();
+        for (share, desc) in &results {
+            assert_eq!(
+                desc.commitments, commitments,
+                "members agree on the joint key"
+            );
+            assert!(share.verify(&commitments), "each aggregate share verifies");
+        }
+
+        // The shares actually threshold-decrypt — proving a usable key that no
+        // single party holds (a quorum of 2 recovers; the run had no dealer).
+        let ct = threshold::encrypt(&commitments, b"secret").unwrap();
+        let partials: Vec<_> = results[..2]
+            .iter()
+            .map(|(s, _)| threshold::partial_decrypt(s, &ct).unwrap())
+            .collect();
+        assert_eq!(
+            threshold::combine(&commitments, 2, &ct, &partials).unwrap(),
+            b"secret"
+        );
     }
 
     #[test]
