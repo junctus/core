@@ -394,6 +394,103 @@ pub async fn committee_request_response(
     open_response(commitments, threshold_k, &response, &secrets)
 }
 
+/// Fisher–Yates shuffle of `v` using the system RNG.
+fn shuffle(v: &mut [usize]) -> Result<()> {
+    for i in (1..v.len()).rev() {
+        let mut b = [0u8; 8];
+        getrandom::getrandom(&mut b).map_err(|e| Error::Rng(e.to_string()))?;
+        v.swap(i, (u64::from_le_bytes(b) % (i as u64 + 1)) as usize);
+    }
+    Ok(())
+}
+
+/// Up to `max` distinct size-`k` combinations of `0..n`, in lexicographic order.
+fn some_k_subsets(n: usize, k: usize, max: usize) -> Vec<Vec<usize>> {
+    let mut out = Vec::new();
+    if k == 0 || k > n || max == 0 {
+        return out;
+    }
+    let mut idx: Vec<usize> = (0..k).collect();
+    loop {
+        out.push(idx.clone());
+        if out.len() >= max {
+            return out;
+        }
+        let mut i = k;
+        loop {
+            if i == 0 {
+                return out;
+            }
+            i -= 1;
+            if idx[i] != i + n - k {
+                break;
+            }
+        }
+        idx[i] += 1;
+        for j in i + 1..k {
+            idx[j] = idx[j - 1] + 1;
+        }
+    }
+}
+
+/// Route a request through a committee **with liveness**: because on-circuit
+/// fan-in needs every hop up, this picks a `k`-member subset (a fresh circuit),
+/// bounds each attempt by `per_attempt`, and retries a *different* subset if a
+/// hop is offline or slow — so a committee that over-provisions `n > k` tolerates
+/// up to `n - k` unavailable members. Members are tried in a randomized order so
+/// load spreads; up to `max_attempts` distinct subsets are tried.
+pub async fn committee_request(
+    identity: &NodeIdentity,
+    descriptor: &CommitteeDescriptor,
+    destination: &str,
+    request: &[u8],
+    per_attempt: std::time::Duration,
+    max_attempts: usize,
+) -> Result<Vec<u8>> {
+    let k = descriptor.threshold();
+    let n = descriptor.members.len();
+    if n < k {
+        return Err(Error::Config(
+            "committee is smaller than its threshold".into(),
+        ));
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    shuffle(&mut order)?;
+
+    let mut last = Error::Config("no committee attempt was made".into());
+    for combo in some_k_subsets(n, k, max_attempts) {
+        let circuit: Vec<Hop> = combo
+            .iter()
+            .map(|&pos| {
+                let m = &descriptor.members[order[pos]];
+                Hop {
+                    id: m.id,
+                    sphinx: m.sphinx,
+                    addr: m.addr.clone(),
+                }
+            })
+            .collect();
+        match tokio::time::timeout(
+            per_attempt,
+            committee_request_response(
+                identity,
+                &circuit,
+                &descriptor.commitments,
+                k,
+                destination,
+                request,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(response)) => return Ok(response),
+            Ok(Err(e)) => last = e,
+            Err(_) => last = Error::Config("committee circuit attempt timed out".into()),
+        }
+    }
+    Err(last)
+}
+
 /// Relay/exit: handle one committee-circuit connection. Peels one Sphinx layer,
 /// then either forwards to the next hop and adds **this** member's sealed partial
 /// to every chunk of the returning [`CommitteeResponse`]; or, at the exit, runs
@@ -1217,5 +1314,105 @@ mod tests {
         entry_task.await.unwrap().unwrap();
         mid_task.await.unwrap().unwrap();
         exit_task.await.unwrap().unwrap();
+    }
+
+    /// Serve committee circuits in a loop until the runtime shuts down (test only).
+    fn serve_committee_loop(
+        listener: tokio::net::TcpListener,
+        identity_bytes: Vec<u8>,
+        share: KeyShare,
+        resolver: HashMap<NodeId, String>,
+    ) {
+        tokio::spawn(async move {
+            let identity = NodeIdentity::from_bytes(&identity_bytes).unwrap();
+            let replay = Mutex::new(ReplayCache::new());
+            while let Ok((stream, _)) = listener.accept().await {
+                let (stream, result) =
+                    match crate::run::responder_handshake(stream, &identity).await {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                let _ = crate::serve::serve_connection(
+                    &identity,
+                    stream,
+                    result.session,
+                    &resolver,
+                    &replay,
+                    crate::circuit::ExitPolicy::default(),
+                    Some(crate::serve::CommitteeServing {
+                        share: &share,
+                        exit: ExitBehavior::Echo,
+                    }),
+                )
+                .await;
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn committee_request_retries_around_an_offline_member() {
+        // 3-member committee, threshold 2; member 3's port is closed (offline).
+        // The client's k-subset retry finds the working pair and succeeds.
+        let (commitments, shares) = committee(3, 2);
+        let m: Vec<NodeIdentity> = (0..3).map(|_| NodeIdentity::generate().unwrap()).collect();
+        let client = NodeIdentity::generate().unwrap();
+
+        let l0 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a0 = l0.local_addr().unwrap().to_string();
+        let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a1 = l1.local_addr().unwrap().to_string();
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a2 = dead.local_addr().unwrap().to_string();
+        drop(dead); // member 3's port now refuses connections
+
+        let members = vec![
+            CommitteeMemberInfo {
+                index: 1,
+                id: m[0].id(),
+                sphinx: m[0].public().sphinx,
+                addr: a0.clone(),
+            },
+            CommitteeMemberInfo {
+                index: 2,
+                id: m[1].id(),
+                sphinx: m[1].public().sphinx,
+                addr: a1.clone(),
+            },
+            CommitteeMemberInfo {
+                index: 3,
+                id: m[2].id(),
+                sphinx: m[2].public().sphinx,
+                addr: a2.clone(),
+            },
+        ];
+        let descriptor = CommitteeDescriptor {
+            commitments: commitments.clone(),
+            members,
+        };
+
+        // Full resolver so either online member can be entry and forward to the other.
+        let mut resolver = HashMap::new();
+        resolver.insert(m[0].id(), a0.clone());
+        resolver.insert(m[1].id(), a1.clone());
+        resolver.insert(m[2].id(), a2.clone());
+
+        serve_committee_loop(l0, m[0].to_bytes(), shares[0].clone(), resolver.clone());
+        serve_committee_loop(l1, m[1].to_bytes(), shares[1].clone(), resolver.clone());
+
+        let request = b"GET / HTTP/1.0";
+        let response = committee_request(
+            &client,
+            &descriptor,
+            "ignored:0",
+            request,
+            std::time::Duration::from_secs(3),
+            6,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response, request,
+            "the client routes around the offline member"
+        );
     }
 }

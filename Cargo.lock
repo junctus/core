@@ -2718,6 +2718,7 @@ name = "neo-node"
 version = "0.0.0"
 dependencies = [
  "blake3",
+ "getrandom 0.2.17",
  "neo-core",
  "neo-credits",
  "neo-crypto",

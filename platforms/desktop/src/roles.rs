@@ -484,20 +484,21 @@ pub async fn run_committee_send(
         .with_context(|| format!("reading descriptor {}", descriptor_path.display()))?;
     let bytes = hex::decode(hexs.trim()).context("descriptor hex")?;
     let descriptor = neo_node::committee::CommitteeDescriptor::from_bytes(&bytes)?;
-    let circuit = descriptor.circuit()?;
     let identity = NodeIdentity::generate()?;
     println!(
         "routing through a {}-member committee (threshold {}) …",
         descriptor.members.len(),
         descriptor.threshold()
     );
-    let response = neo_node::committee::committee_request_response(
+    // Liveness: try k-member subsets with a per-attempt timeout, so an offline
+    // member is retried around (needs an over-provisioned n > k committee).
+    let response = neo_node::committee::committee_request(
         &identity,
-        &circuit,
-        &descriptor.commitments,
-        descriptor.threshold(),
+        &descriptor,
         destination,
         message.as_bytes(),
+        std::time::Duration::from_secs(30),
+        8,
     )
     .await?;
     println!(
