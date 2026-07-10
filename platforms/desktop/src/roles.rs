@@ -407,12 +407,22 @@ pub async fn run_committee_serve(
         .await
         .with_context(|| format!("binding {listen}"))?;
     println!(
-        "committee member {index}: running DKG with {} members (all must be up) …",
+        "committee member {index}: running DKG with up to {} members …",
         roster.len()
     );
-    let (share, descriptor) =
-        neo_node::committee::run_dkg(&identity, index, &roster, &listener, threshold).await?;
-    println!("DKG complete — joint key established; no single party holds the secret.");
+    let (share, descriptor) = neo_node::committee::run_dkg(
+        &identity,
+        index,
+        &roster,
+        &listener,
+        threshold,
+        std::time::Duration::from_secs(30),
+    )
+    .await?;
+    println!(
+        "DKG complete — joint key established over {} qualified members; no single party holds it.",
+        descriptor.members.len()
+    );
     if let Some(path) = out_descriptor {
         std::fs::write(&path, hex::encode(descriptor.to_bytes()))
             .with_context(|| format!("writing descriptor {}", path.display()))?;

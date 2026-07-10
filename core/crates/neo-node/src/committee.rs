@@ -357,26 +357,137 @@ fn decode_dkg_msg(bytes: &[u8]) -> Result<(KeyCommitments, KeyShare)> {
     Ok((commitment, share))
 }
 
+/// Encode a set of member indices: `[count (u8) || indices...]`.
+fn encode_index_set(set: &std::collections::BTreeSet<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + set.len());
+    out.push(set.len().min(255) as u8);
+    out.extend(set.iter().copied().take(255));
+    out
+}
+
+fn decode_index_set(bytes: &[u8]) -> Result<std::collections::BTreeSet<u8>> {
+    let mut cur = bytes;
+    let count = take(&mut cur, 1)?[0] as usize;
+    Ok(take(&mut cur, count)?.iter().copied().collect())
+}
+
+/// A timeout-bounded pairwise exchange among the `roster`: this member sends
+/// `msg_for(peer)` to every reachable peer and collects each peer's reply,
+/// returning `peer index -> reply bytes`. The higher index dials the lower; both
+/// send and read on the one connection (dialer writes then reads; accepter reads
+/// then writes). A peer unreachable by `deadline` (offline / slow) is simply
+/// absent from the result, so a crash-faulty member cannot stall the run.
+async fn pairwise_exchange(
+    identity: &NodeIdentity,
+    index: u8,
+    roster: &[CommitteeMemberInfo],
+    listener: &tokio::net::TcpListener,
+    msg_for: &(dyn Fn(u8) -> Result<Vec<u8>> + Send + Sync),
+    deadline: std::time::Instant,
+) -> std::collections::HashMap<u8, Vec<u8>> {
+    let collected = std::sync::Mutex::new(std::collections::HashMap::<u8, Vec<u8>>::new());
+    let higher = roster.iter().filter(|m| m.index > index).count();
+
+    let accept = async {
+        let mut got = 0;
+        while got < higher {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok(Ok((mut stream, result))) =
+                tokio::time::timeout(remaining, crate::run::accept(listener, identity)).await
+            else {
+                break;
+            };
+            let Some(peer) = roster.iter().find(|m| m.id == result.peer_id) else {
+                continue;
+            };
+            let mut session = result.session;
+            let their = match read_frame(&mut stream).await.and_then(|f| session.open(&f)) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let Ok(mine) = msg_for(peer.index) else {
+                continue;
+            };
+            let Ok(sealed) = session.seal(&mine) else {
+                continue;
+            };
+            if write_frame(&mut stream, &sealed).await.is_err() {
+                continue;
+            }
+            collected.lock().expect("dkg map").insert(peer.index, their);
+            got += 1;
+        }
+    };
+
+    let dial = async {
+        for peer in roster.iter().filter(|m| m.index < index) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok(mine) = msg_for(peer.index) else {
+                continue;
+            };
+            let Ok(Ok((mut stream, mut result))) =
+                tokio::time::timeout(remaining, connect_verified(&peer.addr, identity, &peer.id))
+                    .await
+            else {
+                continue;
+            };
+            let Ok(sealed) = result.session.seal(&mine) else {
+                continue;
+            };
+            if write_frame(&mut stream, &sealed).await.is_err() {
+                continue;
+            }
+            let their = match read_frame(&mut stream)
+                .await
+                .and_then(|f| result.session.open(&f))
+            {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            collected.lock().expect("dkg map").insert(peer.index, their);
+        }
+    };
+
+    tokio::join!(accept, dial);
+    collected.into_inner().expect("dkg map")
+}
+
 /// Run **networked Joint-Feldman DKG** among the committee `roster` from this
-/// member's viewpoint (`identity`, 1-based `index`, its committee `listener`).
-/// Returns this member's aggregate [`KeyShare`] and the agreed
-/// [`CommitteeDescriptor`]. No party ever holds the joint secret `s`.
+/// member's viewpoint (`identity`, 1-based `index`, its committee `listener`),
+/// tolerating **crash faults**: the run completes over a *qualified set* even if
+/// some members are offline, as long as at least `threshold` remain. Returns this
+/// member's aggregate [`KeyShare`] and the agreed [`CommitteeDescriptor`] (whose
+/// roster is the qualified set). No party ever holds the joint secret.
 ///
-/// Coordination: for each pair `(a, b)` with `a < b`, the **higher** index dials
-/// the lower; the lower accepts. Both sides send their commitment + the private
-/// share dealt to the peer and read the peer's, over the authenticated session —
-/// so shares stay confidential and are attributed to a verified sender. Each
-/// received share is checked against its dealer's commitment (abort on a bad
-/// share). Requires every member online; a complaint/disqualification round for
-/// liveness under active faults is deferred (documented in [`neo_mpc::dkg`]).
+/// Two timeout-bounded rounds (each up to `round_timeout`): (1) every reachable
+/// pair exchanges its Feldman commitment + the private share dealt to the peer,
+/// over the authenticated session, and each verifies the share against the
+/// dealer's commitment; (2) members exchange their *accept sets* and take the
+/// **intersection** as the qualified set `QUAL`, so all honest, mutually-reachable
+/// members derive the same joint key. The key is formed over `QUAL` only.
+///
+/// **Honest boundary.** This tolerates *crash* faults under synchrony with full
+/// connectivity among honest members. It does **not** yet tolerate a *Byzantine*
+/// member that reports inconsistent accept sets to different peers (which could
+/// split honest members onto different keys — a safe failure, circuits just fail,
+/// but a liveness regression): full asynchronous Byzantine-robust DKG (a
+/// broadcast/agreement primitive over `QUAL`) is the deferred hardening.
 pub async fn run_dkg(
     identity: &NodeIdentity,
     index: u8,
     roster: &[CommitteeMemberInfo],
     listener: &tokio::net::TcpListener,
     threshold: usize,
+    round_timeout: std::time::Duration,
 ) -> Result<(KeyShare, CommitteeDescriptor)> {
     use neo_mpc::dkg;
+    use std::collections::BTreeSet;
 
     if !roster.iter().any(|m| m.index == index) {
         return Err(Error::Config(
@@ -390,61 +501,85 @@ pub async fn run_dkg(
     let contribution = dkg::Contribution::generate(index, &cfg)?;
     let my_commitment = contribution.commitment().clone();
 
-    // Received from each peer: its commitment + the share it dealt to me.
+    // Round 1: exchange commitments + shares with every reachable peer.
+    let share_msg = |peer: u8| -> Result<Vec<u8>> {
+        Ok(encode_dkg_msg(
+            &my_commitment,
+            &contribution.share_for(peer)?,
+        ))
+    };
+    let deadline1 = std::time::Instant::now() + round_timeout;
+    let raw = pairwise_exchange(identity, index, roster, listener, &share_msg, deadline1).await;
+
+    // Keep only peers whose share is well-formed and verifies against its
+    // dealer's commitment. Our accept set is those peers plus ourselves.
     let mut received: std::collections::HashMap<u8, (KeyCommitments, KeyShare)> =
         std::collections::HashMap::new();
-
-    // Accept from higher-indexed peers.
-    let higher = roster.iter().filter(|m| m.index > index).count();
-    for _ in 0..higher {
-        let (mut stream, result) = crate::run::accept(listener, identity).await?;
-        let peer = roster
-            .iter()
-            .find(|m| m.id == result.peer_id)
-            .ok_or_else(|| Error::Crypto("DKG connection from a non-roster peer".into()))?;
-        let mut session = result.session;
-        // Read the peer's message, then reply with ours.
-        let bytes = session.open(&read_frame(&mut stream).await?)?;
-        let (peer_commitment, share_for_me) = decode_dkg_msg(&bytes)?;
-        let msg = encode_dkg_msg(&my_commitment, &contribution.share_for(peer.index)?);
-        write_frame(&mut stream, &session.seal(&msg)?).await?;
-        received.insert(peer.index, (peer_commitment, share_for_me));
-    }
-
-    // Dial lower-indexed peers.
-    for peer in roster.iter().filter(|m| m.index < index) {
-        let (mut stream, mut result) = connect_verified(&peer.addr, identity, &peer.id).await?;
-        let msg = encode_dkg_msg(&my_commitment, &contribution.share_for(peer.index)?);
-        write_frame(&mut stream, &result.session.seal(&msg)?).await?;
-        let bytes = result.session.open(&read_frame(&mut stream).await?)?;
-        let (peer_commitment, share_for_me) = decode_dkg_msg(&bytes)?;
-        received.insert(peer.index, (peer_commitment, share_for_me));
-    }
-
-    // Verify every dealt share against its dealer's commitment, then aggregate.
-    let mut all_commitments = vec![my_commitment];
-    let mut dealt_to_me = vec![contribution.share_for(index)?];
-    for peer in roster.iter().filter(|m| m.index != index) {
-        let (commitment, share) = received
-            .get(&peer.index)
-            .ok_or_else(|| Error::Crypto(format!("no DKG message from member {}", peer.index)))?;
-        if !share.verify(commitment) {
-            return Err(Error::Crypto(format!(
-                "DKG share from member {} failed its commitment",
-                peer.index
-            )));
+    let mut accepted: BTreeSet<u8> = BTreeSet::from([index]);
+    for (peer, bytes) in &raw {
+        if let Ok((commitment, share)) = decode_dkg_msg(bytes) {
+            if share.member == index && share.verify(&commitment) {
+                accepted.insert(*peer);
+                received.insert(*peer, (commitment, share));
+            }
         }
-        all_commitments.push(commitment.clone());
-        dealt_to_me.push(share.clone());
     }
 
+    // Round 2: agree on the qualified set. Everyone sends its accept set; QUAL is
+    // the intersection over the peers we accepted — the members every honest,
+    // reachable participant accepted — so all derive the same joint key.
+    let accepted_bytes = encode_index_set(&accepted);
+    let set_msg = |_peer: u8| -> Result<Vec<u8>> { Ok(accepted_bytes.clone()) };
+    let deadline2 = std::time::Instant::now() + round_timeout;
+    let views = pairwise_exchange(identity, index, roster, listener, &set_msg, deadline2).await;
+
+    let mut qual = accepted.clone();
+    for (peer, bytes) in &views {
+        if !accepted.contains(peer) {
+            continue; // only accepted members' views count
+        }
+        if let Ok(their_set) = decode_index_set(bytes) {
+            qual = qual.intersection(&their_set).copied().collect();
+        }
+    }
+    // We can only aggregate members we actually hold a verified share from.
+    qual.retain(|j| *j == index || received.contains_key(j));
+    if !qual.contains(&index) || qual.len() < threshold {
+        return Err(Error::Crypto(format!(
+            "DKG qualified set too small ({} members, need >= {threshold}); too many offline or faulty",
+            qual.len()
+        )));
+    }
+
+    // Aggregate over QUAL only — the key is defined by the qualified dealers.
+    let mut all_commitments = Vec::with_capacity(qual.len());
+    let mut dealt_to_me = Vec::with_capacity(qual.len());
+    for &j in &qual {
+        if j == index {
+            all_commitments.push(my_commitment.clone());
+            dealt_to_me.push(contribution.share_for(index)?);
+        } else {
+            let (commitment, share) = received
+                .get(&j)
+                .ok_or_else(|| Error::Crypto(format!("missing share from qualified member {j}")))?;
+            all_commitments.push(commitment.clone());
+            dealt_to_me.push(share.clone());
+        }
+    }
     let commitments = dkg::joint_commitments(&all_commitments)?;
     let my_share = dkg::aggregate_share(index, &dealt_to_me)?;
-    let descriptor = CommitteeDescriptor {
-        commitments,
-        members: roster.to_vec(),
-    };
-    Ok((my_share, descriptor))
+    let members: Vec<CommitteeMemberInfo> = roster
+        .iter()
+        .filter(|m| qual.contains(&m.index))
+        .cloned()
+        .collect();
+    Ok((
+        my_share,
+        CommitteeDescriptor {
+            commitments,
+            members,
+        },
+    ))
 }
 
 // ---- discovery: the committee descriptor ----------------------------------
@@ -692,7 +827,15 @@ mod tests {
             let index = roster.iter().find(|m| m.id == id.id()).unwrap().index;
             tasks.push(tokio::spawn(async move {
                 let identity = NodeIdentity::from_bytes(&idb).unwrap();
-                run_dkg(&identity, index, &roster_c, &listener, 2).await
+                run_dkg(
+                    &identity,
+                    index,
+                    &roster_c,
+                    &listener,
+                    2,
+                    std::time::Duration::from_secs(5),
+                )
+                .await
             }));
         }
         let mut results = Vec::new();
@@ -712,6 +855,82 @@ mod tests {
 
         // The shares actually threshold-decrypt — proving a usable key that no
         // single party holds (a quorum of 2 recovers; the run had no dealer).
+        let ct = threshold::encrypt(&commitments, b"secret").unwrap();
+        let partials: Vec<_> = results[..2]
+            .iter()
+            .map(|(s, _)| threshold::partial_decrypt(s, &ct).unwrap())
+            .collect();
+        assert_eq!(
+            threshold::combine(&commitments, 2, &ct, &partials).unwrap(),
+            b"secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn dkg_completes_over_a_qualified_set_when_a_member_is_offline() {
+        // 4-member roster, threshold 2, but member 4 never comes up. The three
+        // online members still establish a joint key over the qualified set.
+        let ids: Vec<NodeIdentity> = (0..4).map(|_| NodeIdentity::generate().unwrap()).collect();
+        let mut listeners = Vec::new();
+        let mut roster = Vec::new();
+        for (i, id) in ids.iter().enumerate() {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap().to_string();
+            roster.push(CommitteeMemberInfo {
+                index: (i + 1) as u8,
+                id: id.id(),
+                sphinx: id.public().sphinx,
+                addr,
+            });
+            listeners.push(l);
+        }
+
+        // Run DKG only for members 1..3; member 4's listener stays idle (offline).
+        let mut tasks = Vec::new();
+        for _ in 0..3 {
+            let listener = listeners.remove(0);
+            let id = &ids[tasks.len()];
+            let idb = id.to_bytes();
+            let roster_c = roster.clone();
+            let index = roster.iter().find(|m| m.id == id.id()).unwrap().index;
+            tasks.push(tokio::spawn(async move {
+                let identity = NodeIdentity::from_bytes(&idb).unwrap();
+                run_dkg(
+                    &identity,
+                    index,
+                    &roster_c,
+                    &listener,
+                    2,
+                    std::time::Duration::from_secs(3),
+                )
+                .await
+            }));
+        }
+        let _member4_listener = listeners; // keep member 4's port bound but idle
+
+        let mut results = Vec::new();
+        for t in tasks {
+            results.push(t.await.unwrap().unwrap());
+        }
+
+        let commitments = results[0].1.commitments.clone();
+        for (share, desc) in &results {
+            assert_eq!(
+                desc.commitments, commitments,
+                "online members agree on the key"
+            );
+            assert!(share.verify(&commitments), "each aggregate share verifies");
+            assert_eq!(
+                desc.members.len(),
+                3,
+                "qualified set excludes the offline member"
+            );
+            assert!(
+                desc.members.iter().all(|m| m.index != 4),
+                "member 4 not in QUAL"
+            );
+        }
+        // A quorum of the qualified members still threshold-decrypts.
         let ct = threshold::encrypt(&commitments, b"secret").unwrap();
         let partials: Vec<_> = results[..2]
             .iter()
