@@ -26,10 +26,18 @@
 //! `neo run --committee` role build on top of it.
 
 use std::collections::HashSet;
+use std::sync::Mutex;
 
-use neo_core::{Error, Result};
+use neo_core::{Error, NodeId, NodeIdentity, Result};
+use neo_crypto::{
+    create_packet_keyed, process, Processed, ReplayCache, Session, SphinxHop, SphinxPacket,
+};
 use neo_mpc::threshold::{self, Ciphertext, Partial};
 use neo_mpc::vss::{KeyCommitments, KeyShare};
+use tokio::io::{AsyncRead, AsyncWrite};
+
+use crate::forward::{Hop, NextHop};
+use crate::run::{connect_verified, read_frame, write_frame};
 
 /// A serialized [`Partial`] is 97 bytes; sealing adds a keyed MAC.
 const PARTIAL_LEN: usize = 97;
@@ -187,11 +195,140 @@ fn take<'a>(cur: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
     Ok(head)
 }
 
+// ---- live circuit transport -----------------------------------------------
+
+/// A committee circuit's exit handler: turn a request into a response (a real
+/// exit performs the request; tests echo).
+pub type ExitHandler = fn(&[u8]) -> Vec<u8>;
+
+/// Client: send `request` through a committee `circuit` — each hop a committee
+/// member holding a share of `commitments` — and recover the response the exit
+/// encrypted to the committee's joint key, combining the members' sealed partials
+/// gathered on the return path. Only this client ever sees the response
+/// plaintext; no committee member does (bar the egress at the moment it fetches
+/// the destination — the documented M33 send-path gap).
+pub async fn committee_request_response(
+    identity: &NodeIdentity,
+    circuit: &[Hop],
+    commitments: &KeyCommitments,
+    threshold_k: usize,
+    request: &[u8],
+) -> Result<Vec<u8>> {
+    if circuit.is_empty() {
+        return Err(Error::Config(
+            "a committee circuit needs at least one hop".into(),
+        ));
+    }
+    let hops: Vec<SphinxHop> = circuit
+        .iter()
+        .map(|h| SphinxHop {
+            id: *h.id.as_bytes(),
+            public: h.sphinx,
+        })
+        .collect();
+    // The exit must know the committee key to encrypt its response to; carry it
+    // in the exit-only Sphinx payload, ahead of the request itself.
+    let mut payload = Vec::with_capacity(2 + commitments.to_bytes().len() + request.len());
+    let cbytes = commitments.to_bytes();
+    payload.extend_from_slice(&(cbytes.len() as u16).to_be_bytes());
+    payload.extend_from_slice(&cbytes);
+    payload.extend_from_slice(request);
+
+    let (packet, secrets) = create_packet_keyed(&hops, &payload)?;
+    let (mut stream, mut result) =
+        connect_verified(&circuit[0].addr, identity, &circuit[0].id).await?;
+    let framed = result.session.seal(&packet.to_bytes())?;
+    write_frame(&mut stream, &framed).await?;
+
+    let sealed = read_frame(&mut stream).await?;
+    let bytes = result.session.open(&sealed)?;
+    let response = CommitteeResponse::from_bytes(&bytes)?;
+    open_response(commitments, threshold_k, &response, &secrets)
+}
+
+/// Relay/exit: handle one committee-circuit connection. Peels one Sphinx layer,
+/// then either forwards to the next hop and, on the returning
+/// [`CommitteeResponse`], appends **this** member's sealed partial; or, at the
+/// exit, runs `exit`, encrypts the response to the committee key from the
+/// payload, discards the plaintext, and seals its own partial. `share` is this
+/// member's DKG share of the committee key.
+pub async fn handle_committee_circuit<S, R>(
+    identity: &NodeIdentity,
+    share: &KeyShare,
+    prev: &mut S,
+    prev_session: &mut Session,
+    resolver: &R,
+    replay: &Mutex<ReplayCache>,
+    exit: ExitHandler,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    R: NextHop,
+{
+    let sealed = read_frame(prev).await?;
+    let packet_bytes = prev_session.open(&sealed)?;
+    let packet = SphinxPacket::from_bytes(&packet_bytes)?;
+    // This member's return secret — the client re-derives the same value (from
+    // create_packet_keyed) and uses it to open this member's sealed partial.
+    let secret = identity.sphinx_shared(packet.alpha())?;
+
+    let processed = {
+        let mut cache = replay.lock().expect("replay cache poisoned");
+        process(identity, &mut cache, &packet)?
+    };
+
+    let response = match processed {
+        Processed::Deliver { payload } => {
+            // Exit: payload is [commitments || request]. Encrypt the response to
+            // the committee key and discard the plaintext after sealing.
+            let (commitments, request) = parse_exit_payload(&payload)?;
+            let response_plaintext = exit(&request);
+            let ciphertext = threshold::encrypt(&commitments, &response_plaintext)?;
+            let sealed_partial = seal_partial(&secret, share, &ciphertext)?;
+            CommitteeResponse {
+                ciphertext,
+                sealed_partials: vec![sealed_partial],
+            }
+        }
+        Processed::Forward { next, packet } => {
+            let next_id = NodeId::from_bytes(next);
+            let addr = resolver
+                .addr_of(&next_id)
+                .ok_or_else(|| Error::Config(format!("no address for next hop {next_id}")))?;
+            let (mut next_stream, mut next_result) =
+                connect_verified(&addr, identity, &next_id).await?;
+            let framed = next_result.session.seal(&packet.to_bytes())?;
+            write_frame(&mut next_stream, &framed).await?;
+            let sealed = read_frame(&mut next_stream).await?;
+            let bytes = next_result.session.open(&sealed)?;
+            let mut response = CommitteeResponse::from_bytes(&bytes)?;
+            // Add this member's sealed partial for the exit's ciphertext.
+            response
+                .sealed_partials
+                .push(seal_partial(&secret, share, &response.ciphertext)?);
+            response
+        }
+    };
+
+    let out = prev_session.seal(&response.to_bytes())?;
+    write_frame(prev, &out).await?;
+    Ok(())
+}
+
+/// Parse an exit payload `[commitments_len (u16) || commitments || request]`.
+fn parse_exit_payload(payload: &[u8]) -> Result<(KeyCommitments, Vec<u8>)> {
+    let mut cur = payload;
+    let clen = u16::from_be_bytes(take(&mut cur, 2)?.try_into().expect("2 bytes")) as usize;
+    let commitments = KeyCommitments::from_bytes(take(&mut cur, clen)?)?;
+    Ok((commitments, cur.to_vec()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use neo_mpc::dkg;
     use neo_mpc::CommitteeConfig;
+    use std::collections::HashMap;
 
     /// A DKG committee (no party holds `s`) plus a fresh return secret per hop.
     fn committee(members: usize, threshold: usize) -> (KeyCommitments, Vec<KeyShare>) {
@@ -287,5 +424,82 @@ mod tests {
         );
         // A truncated buffer is rejected, not panicked.
         assert!(CommitteeResponse::from_bytes(&response.to_bytes()[..5]).is_err());
+    }
+
+    fn echo(request: &[u8]) -> Vec<u8> {
+        request.to_vec()
+    }
+
+    fn hop_of(identity: &NodeIdentity, addr: &str) -> Hop {
+        let p = identity.public();
+        Hop {
+            id: p.id,
+            sphinx: p.sphinx,
+            addr: addr.to_string(),
+        }
+    }
+
+    async fn spawn_committee_hop(
+        identity_bytes: Vec<u8>,
+        share: KeyShare,
+        resolver: HashMap<NodeId, String>,
+    ) -> (String, tokio::task::JoinHandle<Result<()>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let handle = tokio::spawn(async move {
+            let identity = NodeIdentity::from_bytes(&identity_bytes).unwrap();
+            let (mut stream, mut result) = crate::run::accept(&listener, &identity).await.unwrap();
+            let replay = Mutex::new(ReplayCache::new());
+            handle_committee_circuit(
+                &identity,
+                &share,
+                &mut stream,
+                &mut result.session,
+                &resolver,
+                &replay,
+                echo,
+            )
+            .await
+        });
+        (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn committee_circuit_returns_a_response_only_the_client_can_read() {
+        // A live 3-hop circuit whose hops are a 3-member DKG committee (threshold
+        // 2). The exit encrypts the echoed response to the joint key; each hop
+        // seals its partial with its live Sphinx return secret; the client
+        // combines them. No single hop can decrypt (proven in the unit tests);
+        // here the full round trip runs over real sockets.
+        let (commitments, shares) = committee(3, 2);
+        let m: Vec<NodeIdentity> = (0..3).map(|_| NodeIdentity::generate().unwrap()).collect();
+        let client = NodeIdentity::generate().unwrap();
+
+        // Spawn exit → middle → entry, wiring each relay's resolver to its next hop.
+        let (exit_addr, exit_task) =
+            spawn_committee_hop(m[2].to_bytes(), shares[2].clone(), HashMap::new()).await;
+        let mut r1 = HashMap::new();
+        r1.insert(m[2].id(), exit_addr.clone());
+        let (mid_addr, mid_task) =
+            spawn_committee_hop(m[1].to_bytes(), shares[1].clone(), r1).await;
+        let mut r0 = HashMap::new();
+        r0.insert(m[1].id(), mid_addr.clone());
+        let (entry_addr, entry_task) =
+            spawn_committee_hop(m[0].to_bytes(), shares[0].clone(), r0).await;
+
+        let circuit = vec![
+            hop_of(&m[0], &entry_addr),
+            hop_of(&m[1], &mid_addr),
+            hop_of(&m[2], &exit_addr),
+        ];
+        let request = b"GET /secret HTTP/1.1";
+        let response = committee_request_response(&client, &circuit, &commitments, 2, request)
+            .await
+            .unwrap();
+        assert_eq!(response, request, "the client recovers the echoed response");
+
+        entry_task.await.unwrap().unwrap();
+        mid_task.await.unwrap().unwrap();
+        exit_task.await.unwrap().unwrap();
     }
 }
