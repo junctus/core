@@ -262,6 +262,67 @@ pub async fn register_with_seeds(cfg: &DiscoveryConfig, record: &PeerRecord) -> 
     Ok(accepted)
 }
 
+/// Publish a committee descriptor (opaque bytes) to every configured mirror
+/// (M28). Returns how many accepted it. The seed is a bulletin board here, not a
+/// trust root — the client that later fetches it parses and verifies it.
+pub async fn publish_committee(cfg: &DiscoveryConfig, descriptor: &[u8]) -> Result<usize> {
+    let client = http_client()?;
+    let mut accepted = 0;
+    for mirror in &cfg.mirrors {
+        match client
+            .post(format!("{mirror}/committee"))
+            .body(descriptor.to_vec())
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => accepted += 1,
+            Ok(r) => {
+                tracing::warn!(mirror = %mirror, status = %r.status(), "seed rejected committee")
+            }
+            Err(e) => tracing::warn!(mirror = %mirror, "could not reach seed: {e}"),
+        }
+    }
+    Ok(accepted)
+}
+
+/// Fetch published committee descriptors (opaque bytes) from the mirrors; returns
+/// the first mirror's list. The caller parses each into a `CommitteeDescriptor`.
+pub async fn fetch_committees(cfg: &DiscoveryConfig) -> Result<Vec<Vec<u8>>> {
+    let client = http_client()?;
+    for mirror in &cfg.mirrors {
+        if let Ok(bytes) = fetch_one(&client, &format!("{mirror}/committee")).await {
+            if let Some(list) = parse_committee_list(&bytes) {
+                return Ok(list);
+            }
+        }
+    }
+    Ok(Vec::new())
+}
+
+/// Parse `count (u16) || [len (u32) || bytes]…` into opaque descriptor blobs.
+fn parse_committee_list(bytes: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let mut cur = bytes;
+    if cur.len() < 2 {
+        return None;
+    }
+    let count = u16::from_be_bytes([cur[0], cur[1]]) as usize;
+    cur = &cur[2..];
+    let mut out = Vec::with_capacity(count.min(64));
+    for _ in 0..count {
+        if cur.len() < 4 {
+            return None;
+        }
+        let len = u32::from_be_bytes([cur[0], cur[1], cur[2], cur[3]]) as usize;
+        cur = &cur[4..];
+        if cur.len() < len {
+            return None;
+        }
+        out.push(cur[..len].to_vec());
+        cur = &cur[len..];
+    }
+    Some(out)
+}
+
 /// Choose one relay uniformly at random from a verified list.
 pub fn pick_relay(relays: &[&PeerRecord]) -> Option<PeerRecord> {
     if relays.is_empty() {

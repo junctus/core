@@ -8,6 +8,8 @@
 //!   clients as a trusted witness.
 //! - `POST /register` — a relay submits its signed [`PeerRecord`]; the seed
 //!   verifies it, then a background dial-back decides whether to attest it.
+//! - `GET|POST /committee` — a bulletin board for M28 committee descriptors
+//!   (opaque bytes): members publish, clients fetch and verify. Not a trust root.
 //!
 //! The service is designed to sit behind a TLS-terminating reverse proxy
 //! (Caddy at `discovery.junctus.org`), so it binds plain HTTP on localhost and
@@ -34,6 +36,10 @@ use crate::registry::Registry;
 
 /// Maximum accepted `POST /register` body (a record is ~1.4 KB).
 const MAX_REGISTER_BODY: usize = 8 * 1024;
+/// Maximum accepted `POST /committee` descriptor body.
+const MAX_COMMITTEE_BODY: usize = 64 * 1024;
+/// Maximum published committee descriptors the seed retains (flood bound).
+const MAX_COMMITTEES: usize = 1024;
 /// How many recent **distinct** relay sets the seed remembers so it can answer
 /// `GET /snapshot/diff` with a delta. A client whose base set is older than this
 /// (or otherwise unrecognized) is served a full snapshot instead.
@@ -142,6 +148,11 @@ struct AppState {
     trusted_proxies: Vec<IpAddr>,
     /// Whether dial-back may target loopback (dev/test).
     allow_loopback: bool,
+    /// Published committee descriptors (M28), stored as opaque bytes — the seed
+    /// is a bulletin board here, not a trust root: a client parses and verifies
+    /// each (its members are witness-attested relays; a bogus committee just
+    /// fails to decrypt). Bounded in count and size against flooding.
+    committees: RwLock<Vec<Vec<u8>>>,
 }
 
 impl AppState {
@@ -256,6 +267,7 @@ impl Seed {
             cooldown: config.register_cooldown,
             trusted_proxies: config.trusted_proxies.clone(),
             allow_loopback: config.allow_loopback,
+            committees: RwLock::new(Vec::new()),
         });
         // Publish an initial (empty) signed snapshot immediately.
         state.resign_snapshot();
@@ -295,6 +307,12 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/healthz", get(get_healthz))
         .route("/witness", get(get_witness))
         .route("/register", post(post_register))
+        .route(
+            "/committee",
+            get(get_committees)
+                .post(post_committee)
+                .layer(DefaultBodyLimit::max(MAX_COMMITTEE_BODY)),
+        )
         .layer(DefaultBodyLimit::max(MAX_REGISTER_BODY))
         .with_state(state)
 }
@@ -348,6 +366,41 @@ async fn get_witness(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         StatusCode::OK,
         hex::encode(state.witness.public().signing.to_bytes()),
     )
+}
+
+/// `POST /committee` — publish an opaque committee descriptor (M28). The seed
+/// stores it as a bulletin board entry; it does not parse or vouch for it (the
+/// client does, and its members are witness-attested relays), so this is not a
+/// trust root. De-duplicated, size- and count-bounded against flooding.
+async fn post_committee(
+    State(state): State<Arc<AppState>>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    if body.is_empty() || body.len() > MAX_COMMITTEE_BODY {
+        return (StatusCode::BAD_REQUEST, "bad descriptor size\n");
+    }
+    let mut guard = state.committees.write().expect("committees");
+    if guard.iter().any(|d| d.as_slice() == body.as_ref()) {
+        return (StatusCode::OK, "already published\n");
+    }
+    if guard.len() >= MAX_COMMITTEES {
+        return (StatusCode::TOO_MANY_REQUESTS, "committee list full\n");
+    }
+    guard.push(body.to_vec());
+    (StatusCode::ACCEPTED, "committee published\n")
+}
+
+/// `GET /committee` — the published committee descriptors as
+/// `count (u16) || [len (u32) || descriptor bytes]…`. Clients parse and verify.
+async fn get_committees(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let guard = state.committees.read().expect("committees");
+    let mut out = Vec::new();
+    out.extend_from_slice(&(guard.len() as u16).to_be_bytes());
+    for d in guard.iter() {
+        out.extend_from_slice(&(d.len() as u32).to_be_bytes());
+        out.extend_from_slice(d);
+    }
+    ([(header::CONTENT_TYPE, "application/octet-stream")], out)
 }
 
 async fn post_register(
@@ -504,6 +557,7 @@ mod tests {
             cooldown: Duration::from_secs(30),
             trusted_proxies: vec!["127.0.0.1".parse().unwrap()],
             allow_loopback: true,
+            committees: RwLock::new(Vec::new()),
         });
         state.resign_snapshot();
         state
@@ -681,5 +735,52 @@ mod tests {
         assert!(!state.check_and_stamp_cooldown(ip));
         // A different IP is unaffected.
         assert!(state.check_and_stamp_cooldown("203.0.113.8".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn committee_descriptors_publish_and_list() {
+        let state = test_state();
+        let app = router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let base = format!("http://{addr}");
+        let client = reqwest::Client::new();
+
+        // Publish a descriptor; a duplicate is accepted idempotently.
+        let resp = client
+            .post(format!("{base}/committee"))
+            .body(b"committee-descriptor-bytes".to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 202);
+        let resp = client
+            .post(format!("{base}/committee"))
+            .body(b"committee-descriptor-bytes".to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        // List returns `count(u16) || [len(u32) || bytes]`.
+        let bytes = client
+            .get(format!("{base}/committee"))
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(u16::from_be_bytes([bytes[0], bytes[1]]), 1);
+        let len = u32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]) as usize;
+        assert_eq!(&bytes[6..6 + len], b"committee-descriptor-bytes");
     }
 }

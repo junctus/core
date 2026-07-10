@@ -194,19 +194,32 @@ enum CommitteeAction {
         /// Where to write the committee descriptor (hex) after DKG.
         #[arg(long = "out-descriptor")]
         out_descriptor: Option<PathBuf>,
+        /// Seed mirrors to publish the committee descriptor to (else baked defaults).
+        #[arg(long = "mirror")]
+        mirrors: Vec<String>,
+        /// Trusted witness keys, hex (else baked defaults).
+        #[arg(long = "witness")]
+        witnesses: Vec<String>,
     },
-    /// Route a request through a committee (from its descriptor) and print the
-    /// response — recovered by combining partials, unreadable by any member.
+    /// Route a request through a committee and print the response — recovered by
+    /// combining partials, unreadable by any member. The committee comes from a
+    /// `--descriptor` file, else it is discovered from the seeds.
     Send {
-        /// The committee descriptor file (hex), as written by `committee serve`.
+        /// A committee descriptor file (hex); if omitted, discover from the seeds.
         #[arg(long)]
-        descriptor: PathBuf,
+        descriptor: Option<PathBuf>,
         /// The clearnet destination `host:port` the exit fetches.
         #[arg(long)]
         destination: String,
         /// The request bytes to send to `destination` through the committee.
         #[arg(long)]
         message: String,
+        /// Seed mirrors to discover committees from (else baked defaults).
+        #[arg(long = "mirror")]
+        mirrors: Vec<String>,
+        /// Trusted witness keys, hex (else baked defaults).
+        #[arg(long = "witness")]
+        witnesses: Vec<String>,
     },
 }
 
@@ -330,16 +343,32 @@ async fn main() -> anyhow::Result<()> {
                 roster,
                 threshold,
                 out_descriptor,
+                mirrors,
+                witnesses,
             } => {
                 let id = roles::load_or_create_identity(&identity)?;
-                roles::run_committee_serve(id, index, &listen, &roster, threshold, out_descriptor)
-                    .await?
+                let cfg = defaults::DiscoveryConfig::resolve(&mirrors, &witnesses, None)?;
+                roles::run_committee_serve(
+                    id,
+                    index,
+                    &listen,
+                    &roster,
+                    threshold,
+                    out_descriptor,
+                    cfg,
+                )
+                .await?
             }
             CommitteeAction::Send {
                 descriptor,
                 destination,
                 message,
-            } => roles::run_committee_send(&descriptor, &destination, &message).await?,
+                mirrors,
+                witnesses,
+            } => {
+                let cfg = defaults::DiscoveryConfig::resolve(&mirrors, &witnesses, None)?;
+                roles::run_committee_send(descriptor, &destination, &message, cfg).await?
+            }
         },
     }
     Ok(())

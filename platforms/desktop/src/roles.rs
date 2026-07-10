@@ -387,6 +387,7 @@ fn parse_roster(path: &Path) -> Result<Vec<neo_node::committee::CommitteeMemberI
 
 /// `neo committee serve`: join a committee (run DKG so no party holds the key),
 /// publish the descriptor, and serve committee-exit circuits — the M28 role.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_committee_serve(
     identity: NodeIdentity,
     index: u8,
@@ -394,6 +395,7 @@ pub async fn run_committee_serve(
     roster_path: &Path,
     threshold: usize,
     out_descriptor: Option<std::path::PathBuf>,
+    cfg: DiscoveryConfig,
 ) -> Result<()> {
     let roster = parse_roster(roster_path)?;
     let listener = tokio::net::TcpListener::bind(listen)
@@ -420,6 +422,11 @@ pub async fn run_committee_serve(
         std::fs::write(&path, hex::encode(descriptor.to_bytes()))
             .with_context(|| format!("writing descriptor {}", path.display()))?;
         println!("wrote committee descriptor to {}", path.display());
+    }
+    // Publish the descriptor to the seeds so clients can discover this committee.
+    match discovery::publish_committee(&cfg, &descriptor.to_bytes()).await {
+        Ok(n) => println!("published committee descriptor to {n} seed(s)"),
+        Err(e) => tracing::warn!("could not publish committee: {e}"),
     }
 
     // Resolve next-hop ids to addresses from the roster.
@@ -476,14 +483,26 @@ pub async fn run_committee_serve(
 /// `neo committee send`: route a request through a committee (from its published
 /// descriptor) and print the response the client recovers by combining partials.
 pub async fn run_committee_send(
-    descriptor_path: &Path,
+    descriptor_path: Option<std::path::PathBuf>,
     destination: &str,
     message: &str,
+    cfg: DiscoveryConfig,
 ) -> Result<()> {
-    let hexs = std::fs::read_to_string(descriptor_path)
-        .with_context(|| format!("reading descriptor {}", descriptor_path.display()))?;
-    let bytes = hex::decode(hexs.trim()).context("descriptor hex")?;
-    let descriptor = neo_node::committee::CommitteeDescriptor::from_bytes(&bytes)?;
+    let descriptor = match descriptor_path {
+        Some(path) => {
+            let hexs = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading descriptor {}", path.display()))?;
+            let bytes = hex::decode(hexs.trim()).context("descriptor hex")?;
+            neo_node::committee::CommitteeDescriptor::from_bytes(&bytes)?
+        }
+        None => {
+            // Discover a committee from the seeds and use the first that parses.
+            let list = discovery::fetch_committees(&cfg).await?;
+            list.iter()
+                .find_map(|b| neo_node::committee::CommitteeDescriptor::from_bytes(b).ok())
+                .context("no committee available from the seeds (or pass --descriptor)")?
+        }
+    };
     let identity = NodeIdentity::generate()?;
     println!(
         "routing through a {}-member committee (threshold {}) …",
