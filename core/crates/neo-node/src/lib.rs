@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 
 pub mod circuit;
+pub mod committee;
 pub mod forward;
 pub mod netif;
 pub mod run;
