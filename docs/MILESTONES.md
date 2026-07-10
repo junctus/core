@@ -530,12 +530,18 @@ a trust model Tor and commercial VPNs structurally cannot offer.
   holds only a threshold share and is confined to partial decryption — the publishable "even the exit can't
   read your response" proof. In-process end-to-end test: DKG → egress encrypts response → members emit
   partials → only the client combines; a lone member cannot decrypt.
-- Remaining (live multi-node path): (a) **M26 prerequisite** — relays must run a persistent circuit-serving
-  loop (they currently one-shot `handle_onion_shared`); (b) a **committee descriptor + discovery** so a
-  client learns a committee's roster + published joint `KeyCommitments`; (c) wiring the **egress** to
-  `threshold::encrypt` its response and discard the plaintext, with **response chunking** across
-  `MAX_CIPHERTEXT` pieces; (d) collecting each member's `Partial` back to the client over the return path
-  (fan-in, with over-provisioning `n>k` + timeout for liveness); (e) the **`neo run --committee`** role loop.
+- Done (on-circuit return-path core): `neo-node::committee` — the **sealed-partial return path** for the
+  chosen on-circuit fan-in topology. Each hop seals its `Partial` under its own Sphinx-derived return secret,
+  so the hop nearest the client (which relays every sealed partial) still cannot open them — it never reaches
+  a quorum; only the client, holding all return secrets, opens them and combines. `seal_partial` /
+  `open_partial` / `CommitteeResponse` (bounds-checked) / `open_response`; tested that only the client, never
+  a relaying member, recovers the response.
+- Remaining (live wiring): (a) **M26 prerequisite** — relays run a persistent circuit-serving loop (they
+  currently one-shot `handle_onion_shared`); (b) a **committee descriptor + discovery** so a client learns a
+  committee's roster + published joint `KeyCommitments`; (c) drive `neo-node::committee` over real sockets —
+  the exit `threshold::encrypt`s its response (chunked across `MAX_CIPHERTEXT`) and discards the plaintext,
+  each hop seals its partial with its live Sphinx return secret, the client combines; over-provision `n>k` +
+  timeout for liveness; (d) the **`neo run --committee`** role loop.
 - Why a game-changer: "no responsible exit" stops being a statistical hope and becomes a checkable
   cryptographic fact — a new trust story a journalist can give a source ("even the exit can't rat you
   out, and here is the DLEQ proof"), and a near-zero-liability role for altruistic operators in strict
