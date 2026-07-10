@@ -517,7 +517,7 @@ actual REALITY threat model — a bridge that *is* a real website to any prober.
   use "undetectable" language until this and M25's replay-cache fix both land; keep the honest-boundary
   note current.
 
-### M28 — Verdict: the committee exit no one can subpoena 🚧 (flagship trust story; crypto foundation done, live path pending)
+### M28 — Verdict: the committee exit no one can subpoena ✅ (decrypt-direction, runnable end-to-end; real clearnet exit + DKG liveness deferred)
 Why it matters: an exit whose operators are *cryptographically incapable* of complying with a wiretap is
 a trust model Tor and commercial VPNs structurally cannot offer.
 - Done (crypto foundation, no party holds the key): **DKG** (`neo-mpc::dkg`) — Joint-Feldman distributed
@@ -536,12 +536,19 @@ a trust model Tor and commercial VPNs structurally cannot offer.
   a quorum; only the client, holding all return secrets, opens them and combines. `seal_partial` /
   `open_partial` / `CommitteeResponse` (bounds-checked) / `open_response`; tested that only the client, never
   a relaying member, recovers the response.
-- Remaining (live wiring): (a) **M26 prerequisite** — relays run a persistent circuit-serving loop (they
-  currently one-shot `handle_onion_shared`); (b) a **committee descriptor + discovery** so a client learns a
-  committee's roster + published joint `KeyCommitments`; (c) drive `neo-node::committee` over real sockets —
-  the exit `threshold::encrypt`s its response (chunked across `MAX_CIPHERTEXT`) and discards the plaintext,
-  each hop seals its partial with its live Sphinx return secret, the client combines; over-provision `n>k` +
-  timeout for liveness; (d) the **`neo run --committee`** role loop.
+- Done (live path over real sockets): `committee_request_response` (client) + `handle_committee_circuit`
+  (member/exit) drive the on-circuit fan-in over real connections; the exit `threshold::encrypt`s its
+  response and discards the plaintext, each hop seals its partial with its live Sphinx return secret, the
+  client combines. Committee circuits ride the shared relay dispatcher (`FRAME_COMMITTEE` in
+  `serve_connection`; a plain relay refuses them). **Networked Joint-Feldman DKG** (`run_dkg`) establishes
+  the key over the authenticated handshake channel with no dealer; **`CommitteeDescriptor`** is the discovery
+  artifact a client routes with. **CLI**: `neo committee serve` (DKG + serve) and `neo committee send`.
+  Tested over real sockets: a committee circuit round-trips a response only the client can read, and 3
+  members establish a shared key no party holds.
+- Remaining refinements (honest): the committee exit currently **echoes** — a real clearnet-fetching exit
+  (async request + response chunking across `MAX_CIPHERTEXT`) is deferred; DKG requires all members online
+  (a complaint/disqualification round for active-fault liveness, and `n>k` over-provisioning + timeout on the
+  circuit, are deferred); and the descriptor is published by-file, not yet via a seed endpoint.
 - Why a game-changer: "no responsible exit" stops being a statistical hope and becomes a checkable
   cryptographic fact — a new trust story a journalist can give a source ("even the exit can't rat you
   out, and here is the DLEQ proof"), and a near-zero-liability role for altruistic operators in strict
