@@ -517,24 +517,37 @@ actual REALITY threat model — a bridge that *is* a real website to any prober.
   use "undetectable" language until this and M25's replay-cache fix both land; keep the honest-boundary
   note current.
 
-### M28 — Verdict: the committee exit no one can subpoena ⬜ (flagship trust story)
+### M28 — Verdict: the committee exit no one can subpoena 🚧 (flagship trust story; crypto foundation done, live path pending)
 Why it matters: an exit whose operators are *cryptographically incapable* of complying with a wiretap is
 a trust model Tor and commercial VPNs structurally cannot offer.
-- Plan: wire the tested threshold-decryption core (`neo-mpc::threshold`, M22 — client-combined `D_i = y_i·R`
-  partials with Chaum–Pedersen DLEQ, `s` never formed) to the circuit exit path. The response from the
-  destination is encrypted to the committee's joint public key and decrypted only by client-combined
-  partials, so **no committee member ever holds the key or the plaintext**. Extends `neo-mpc` + the
-  `neo-node::circuit` exit; a `neo run --committee` role joins as a custody/decrypt member. Publish the
-  DLEQ verification as the operator's "verifiable non-custody" artifact.
+- Done (crypto foundation, no party holds the key): **DKG** (`neo-mpc::dkg`) — Joint-Feldman distributed
+  key generation over Ristretto, so the committee's joint key has **no dealer**: `s = Σ_j s_j`, and no
+  single party — not even the client — ever holds `s`. Its aggregate `KeyCommitments` + per-member
+  `KeyShare` plug straight into the M22 threshold core. **Wire serialization** for `Ciphertext`, `Partial`,
+  `KeyCommitments`, `KeyShare` (bounds-checked, non-canonical scalars rejected) — the encodings the live
+  path sends between egress, members, and client. **Verifiable non-custody artifact** (`neo-mpc::attestation`
+  `NonCustodyProof`): a member proves, via a DLEQ on a fresh challenge bound to its committed share, that it
+  holds only a threshold share and is confined to partial decryption — the publishable "even the exit can't
+  read your response" proof. In-process end-to-end test: DKG → egress encrypts response → members emit
+  partials → only the client combines; a lone member cannot decrypt.
+- Remaining (live multi-node path): (a) **M26 prerequisite** — relays must run a persistent circuit-serving
+  loop (they currently one-shot `handle_onion_shared`); (b) a **committee descriptor + discovery** so a
+  client learns a committee's roster + published joint `KeyCommitments`; (c) wiring the **egress** to
+  `threshold::encrypt` its response and discard the plaintext, with **response chunking** across
+  `MAX_CIPHERTEXT` pieces; (d) collecting each member's `Partial` back to the client over the return path
+  (fan-in, with over-provisioning `n>k` + timeout for liveness); (e) the **`neo run --committee`** role loop.
 - Why a game-changer: "no responsible exit" stops being a statistical hope and becomes a checkable
   cryptographic fact — a new trust story a journalist can give a source ("even the exit can't rat you
   out, and here is the DLEQ proof"), and a near-zero-liability role for altruistic operators in strict
   jurisdictions who would never run a clearnet exit.
-- Boundary/risk: M22 delivers the property for the **decrypt** (committee → client) direction only. A full
+- Boundary/risk: delivers the property for the **decrypt** (committee → client) direction only. A full
   wiretap-proof exit that *also* speaks to the real upstream with no member seeing plaintext needs the
-  M33 2PC-TLS send-path, which remains research — so this must ship as "the committee cannot read the
-  response," not "plaintext never exists end-to-end." Requires the M25 threshold-malleability (KEM-DEM)
-  and identity-key fixes first. Committee liveness/DoS and Sybil member selection are operational risks.
+  M33 2PC-TLS send-path, which remains research — so this ships as "the committee cannot read the
+  response," **not** "plaintext never exists end-to-end" (the egress member sees plaintext at send).
+  Prerequisites M22 threshold core + M25 KEM-DEM/identity-key fixes are in place. DKG is Joint-Feldman
+  (a rushing adversary can bias `Y`'s distribution — GJKR99 — which reveals neither `s` nor plaintext; the
+  Pedersen "New-DKG" hardening is a deferred refinement). Committee liveness/DoS and Sybil member selection
+  remain operational risks.
 
 ### M29 — Bridge-in-a-QR: pre-shared REALITY capabilities as unblockable private bridges ⬜
 Why it matters: every unblockable-networking product eventually loses its bridges to enumeration and
