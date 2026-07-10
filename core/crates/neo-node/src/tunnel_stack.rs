@@ -258,6 +258,7 @@ mod tests {
                     allow_loopback: true,
                     offer_exit: true,
                 },
+                None,
             )
             .await;
         });

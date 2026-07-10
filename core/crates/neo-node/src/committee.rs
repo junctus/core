@@ -237,6 +237,12 @@ pub async fn committee_request_response(
     let (packet, secrets) = create_packet_keyed(&hops, &payload)?;
     let (mut stream, mut result) =
         connect_verified(&circuit[0].addr, identity, &circuit[0].id).await?;
+    // Declare the committee-circuit mode, then hand over the onion.
+    write_frame(
+        &mut stream,
+        &result.session.seal(&[crate::run::FRAME_COMMITTEE])?,
+    )
+    .await?;
     let framed = result.session.seal(&packet.to_bytes())?;
     write_frame(&mut stream, &framed).await?;
 
@@ -297,6 +303,12 @@ where
                 .ok_or_else(|| Error::Config(format!("no address for next hop {next_id}")))?;
             let (mut next_stream, mut next_result) =
                 connect_verified(&addr, identity, &next_id).await?;
+            // Propagate the committee mode to the next hop, then the peeled packet.
+            write_frame(
+                &mut next_stream,
+                &next_result.session.seal(&[crate::run::FRAME_COMMITTEE])?,
+            )
+            .await?;
             let framed = next_result.session.seal(&packet.to_bytes())?;
             write_frame(&mut next_stream, &framed).await?;
             let sealed = read_frame(&mut next_stream).await?;
@@ -448,18 +460,24 @@ mod tests {
         let addr = listener.local_addr().unwrap().to_string();
         let handle = tokio::spawn(async move {
             let identity = NodeIdentity::from_bytes(&identity_bytes).unwrap();
-            let (mut stream, mut result) = crate::run::accept(&listener, &identity).await.unwrap();
+            let (stream, result) = crate::run::accept(&listener, &identity).await.unwrap();
             let replay = Mutex::new(ReplayCache::new());
-            handle_committee_circuit(
+            // Route through the real serve dispatcher so the FRAME_COMMITTEE mode
+            // byte is exercised end to end, exactly as a live relay does.
+            crate::serve::serve_connection(
                 &identity,
-                &share,
-                &mut stream,
-                &mut result.session,
+                stream,
+                result.session,
                 &resolver,
                 &replay,
-                echo,
+                crate::circuit::ExitPolicy::default(),
+                Some(crate::serve::CommitteeServing {
+                    share: &share,
+                    exit: echo,
+                }),
             )
             .await
+            .map(|_| ())
         });
         (addr, handle)
     }

@@ -36,6 +36,10 @@ pub const FRAME_MESSAGE: u8 = 1;
 /// A persistent TCP-over-onion circuit (setup packet, then streamed cells; the
 /// exit splices a real TCP connection).
 pub const FRAME_CIRCUIT: u8 = 2;
+/// A committee-exit circuit (M28): the exit encrypts its response to the
+/// committee's joint key and each hop seals a threshold partial on the return
+/// path, so only the client recovers the response. See [`crate::committee`].
+pub const FRAME_COMMITTEE: u8 = 3;
 
 /// Write a length-prefixed frame to any writer (a stream or a split write half).
 pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, data: &[u8]) -> Result<()> {

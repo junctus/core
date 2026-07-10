@@ -165,7 +165,19 @@ pub async fn run_relay(
             };
             // Snapshot the address book so the borrow doesn't cross await.
             let addrs = resolver.read().expect("resolver lock").clone();
-            match serve_connection(&identity, stream, result.session, &addrs, &replay, policy).await
+            // A plain relay is not a committee member (no share), so it refuses
+            // committee circuits — passes `None`. The `neo run --committee` role
+            // supplies its share here.
+            match serve_connection(
+                &identity,
+                stream,
+                result.session,
+                &addrs,
+                &replay,
+                policy,
+                None,
+            )
+            .await
             {
                 Ok(Served::Message(Outcome::Delivered { payload })) => {
                     println!(
@@ -178,6 +190,7 @@ pub async fn run_relay(
                     tracing::info!("forwarded onion to {next}");
                 }
                 Ok(Served::Circuit) => tracing::info!("circuit connection closed"),
+                Ok(Served::Committee) => tracing::info!("committee circuit handled"),
                 Err(e) => tracing::warn!("connection handling failed: {e}"),
             }
         });
