@@ -374,7 +374,7 @@ pub async fn run_dkg(
     index: u8,
     roster: &[CommitteeMemberInfo],
     listener: &tokio::net::TcpListener,
-    cfg: neo_mpc::CommitteeConfig,
+    threshold: usize,
 ) -> Result<(KeyShare, CommitteeDescriptor)> {
     use neo_mpc::dkg;
 
@@ -383,6 +383,10 @@ pub async fn run_dkg(
             "this node is not in the committee roster".into(),
         ));
     }
+    let cfg = neo_mpc::CommitteeConfig {
+        members: roster.len(),
+        threshold,
+    };
     let contribution = dkg::Contribution::generate(index, &cfg)?;
     let my_commitment = contribution.commitment().clone();
 
@@ -663,10 +667,6 @@ mod tests {
     async fn networked_dkg_establishes_a_shared_key_no_party_holds() {
         // Three members run Joint-Feldman DKG over real sockets; each ends with a
         // share of a joint key nobody dealt, and they agree on the descriptor.
-        let cfg = neo_mpc::CommitteeConfig {
-            members: 3,
-            threshold: 2,
-        };
         let ids: Vec<NodeIdentity> = (0..3).map(|_| NodeIdentity::generate().unwrap()).collect();
 
         // Bind each member's listener first so the roster addresses are known.
@@ -692,7 +692,7 @@ mod tests {
             let index = roster.iter().find(|m| m.id == id.id()).unwrap().index;
             tasks.push(tokio::spawn(async move {
                 let identity = NodeIdentity::from_bytes(&idb).unwrap();
-                run_dkg(&identity, index, &roster_c, &listener, cfg).await
+                run_dkg(&identity, index, &roster_c, &listener, 2).await
             }));
         }
         let mut results = Vec::new();

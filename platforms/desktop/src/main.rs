@@ -163,6 +163,48 @@ enum Command {
         #[arg(long = "key", required = true)]
         keys: Vec<String>,
     },
+    /// Committee exit (M28): a subpoena-proof exit committee no member can wiretap.
+    Committee {
+        #[command(subcommand)]
+        action: CommitteeAction,
+    },
+}
+
+/// Committee-exit actions (M28).
+#[derive(Subcommand)]
+enum CommitteeAction {
+    /// Join a committee: run DKG (no party holds the key), publish the committee
+    /// descriptor, and serve committee-exit circuits. All members must be up.
+    Serve {
+        /// This member's identity file (a stable id; created if absent).
+        #[arg(long, default_value = "committee.key")]
+        identity: PathBuf,
+        /// This member's 1-based committee index (must match the roster).
+        #[arg(long)]
+        index: u8,
+        /// Address to bind and serve committee circuits on.
+        #[arg(long)]
+        listen: String,
+        /// Roster file: one member per line, `index node_id_hex sphinx_hex addr`.
+        #[arg(long)]
+        roster: PathBuf,
+        /// Reconstruction threshold k (>= 2).
+        #[arg(long)]
+        threshold: usize,
+        /// Where to write the committee descriptor (hex) after DKG.
+        #[arg(long = "out-descriptor")]
+        out_descriptor: Option<PathBuf>,
+    },
+    /// Route a request through a committee (from its descriptor) and print the
+    /// response — recovered by combining partials, unreadable by any member.
+    Send {
+        /// The committee descriptor file (hex), as written by `committee serve`.
+        #[arg(long)]
+        descriptor: PathBuf,
+        /// The request to send to the committee exit.
+        #[arg(long)]
+        message: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -277,6 +319,24 @@ async fn main() -> anyhow::Result<()> {
             name,
             keys,
         } => bootstrap_resolve(&resolver, &name, &keys).await?,
+        Command::Committee { action } => match action {
+            CommitteeAction::Serve {
+                identity,
+                index,
+                listen,
+                roster,
+                threshold,
+                out_descriptor,
+            } => {
+                let id = roles::load_or_create_identity(&identity)?;
+                roles::run_committee_serve(id, index, &listen, &roster, threshold, out_descriptor)
+                    .await?
+            }
+            CommitteeAction::Send {
+                descriptor,
+                message,
+            } => roles::run_committee_send(&descriptor, &message).await?,
+        },
     }
     Ok(())
 }

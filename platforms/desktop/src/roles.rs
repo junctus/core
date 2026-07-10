@@ -351,6 +351,154 @@ fn pick_circuit(relays: &[&PeerRecord], hops: usize) -> Result<Vec<Hop>> {
         .collect()
 }
 
+/// Parse a committee roster file: one member per line,
+/// `index node_id_hex sphinx_hex addr` (blank lines and `#` comments ignored).
+fn parse_roster(path: &Path) -> Result<Vec<neo_node::committee::CommitteeMemberInfo>> {
+    use neo_node::committee::CommitteeMemberInfo;
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading roster {}", path.display()))?;
+    let mut members = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() != 4 {
+            bail!("roster line must be `index node_id_hex sphinx_hex addr`: {line:?}");
+        }
+        let index: u8 = parts[0].parse().context("roster member index")?;
+        let mut id = [0u8; 32];
+        hex::decode_to_slice(parts[1], &mut id).context("roster node id hex")?;
+        let mut sphinx = [0u8; 32];
+        hex::decode_to_slice(parts[2], &mut sphinx).context("roster sphinx hex")?;
+        members.push(CommitteeMemberInfo {
+            index,
+            id: NodeId::from_bytes(id),
+            sphinx,
+            addr: parts[3].to_string(),
+        });
+    }
+    if members.is_empty() {
+        bail!("committee roster is empty");
+    }
+    Ok(members)
+}
+
+/// The committee exit handler for this role: echo. A real clearnet-fetching exit
+/// (async request + response chunking) is the documented refinement — the M28
+/// send path (no member seeing the request plaintext) is M33.
+fn committee_echo(request: &[u8]) -> Vec<u8> {
+    request.to_vec()
+}
+
+/// `neo committee serve`: join a committee (run DKG so no party holds the key),
+/// publish the descriptor, and serve committee-exit circuits — the M28 role.
+pub async fn run_committee_serve(
+    identity: NodeIdentity,
+    index: u8,
+    listen: &str,
+    roster_path: &Path,
+    threshold: usize,
+    out_descriptor: Option<std::path::PathBuf>,
+) -> Result<()> {
+    let roster = parse_roster(roster_path)?;
+    let listener = tokio::net::TcpListener::bind(listen)
+        .await
+        .with_context(|| format!("binding {listen}"))?;
+    println!(
+        "committee member {index}: running DKG with {} members (all must be up) …",
+        roster.len()
+    );
+    let (share, descriptor) =
+        neo_node::committee::run_dkg(&identity, index, &roster, &listener, threshold).await?;
+    println!("DKG complete — joint key established; no single party holds the secret.");
+    if let Some(path) = out_descriptor {
+        std::fs::write(&path, hex::encode(descriptor.to_bytes()))
+            .with_context(|| format!("writing descriptor {}", path.display()))?;
+        println!("wrote committee descriptor to {}", path.display());
+    }
+
+    // Resolve next-hop ids to addresses from the roster.
+    let mut addrs: HashMap<NodeId, String> = HashMap::new();
+    for m in &descriptor.members {
+        addrs.insert(m.id, m.addr.clone());
+    }
+
+    println!("serving committee-exit circuits on {listen} — the committee cannot read responses.");
+    let identity = Arc::new(identity);
+    let share = Arc::new(share);
+    let addrs = Arc::new(addrs);
+    let replay = Arc::new(std::sync::Mutex::new(ReplayCache::new()));
+    loop {
+        let (stream, _peer) = listener.accept().await?;
+        let identity = identity.clone();
+        let share = share.clone();
+        let addrs = addrs.clone();
+        let replay = replay.clone();
+        tokio::spawn(async move {
+            let (stream, result) = match neo_node::run::responder_handshake(stream, &identity).await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("committee handshake failed: {e}");
+                    return;
+                }
+            };
+            let serving = neo_node::serve::CommitteeServing {
+                share: share.as_ref(),
+                exit: committee_echo,
+            };
+            if let Err(e) = neo_node::serve::serve_connection(
+                &identity,
+                stream,
+                result.session,
+                addrs.as_ref(),
+                &replay,
+                ExitPolicy::default(),
+                Some(serving),
+            )
+            .await
+            {
+                tracing::warn!("committee circuit failed: {e}");
+            }
+        });
+    }
+}
+
+/// `neo committee send`: route a request through a committee (from its published
+/// descriptor) and print the response the client recovers by combining partials.
+pub async fn run_committee_send(descriptor_path: &Path, message: &str) -> Result<()> {
+    let hexs = std::fs::read_to_string(descriptor_path)
+        .with_context(|| format!("reading descriptor {}", descriptor_path.display()))?;
+    let bytes = hex::decode(hexs.trim()).context("descriptor hex")?;
+    let descriptor = neo_node::committee::CommitteeDescriptor::from_bytes(&bytes)?;
+    let circuit = descriptor.circuit()?;
+    let identity = NodeIdentity::generate()?;
+    println!(
+        "routing through a {}-member committee (threshold {}) …",
+        descriptor.members.len(),
+        descriptor.threshold()
+    );
+    let response = neo_node::committee::committee_request_response(
+        &identity,
+        &circuit,
+        &descriptor.commitments,
+        descriptor.threshold(),
+        message.as_bytes(),
+    )
+    .await?;
+    println!(
+        "response ({} bytes): {}",
+        response.len(),
+        String::from_utf8_lossy(&response)
+    );
+    println!(
+        "recovered by combining the committee's threshold partials — no member could read it."
+    );
+    Ok(())
+}
+
 /// Load an identity from `path`, generating and persisting one if absent.
 /// Relays need a stable id, so unlike the ephemeral client default this writes
 /// the key back to disk.
