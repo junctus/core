@@ -46,7 +46,7 @@ pub struct KeyShare {
 
 /// Public Feldman commitments to the sharing polynomial's coefficients. Every
 /// member checks its share against these — no trusted channel required.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyCommitments(pub Vec<CompressedRistretto>);
 
 impl KeyShare {

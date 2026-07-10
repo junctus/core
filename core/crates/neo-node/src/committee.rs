@@ -335,6 +335,119 @@ fn parse_exit_payload(payload: &[u8]) -> Result<(KeyCommitments, Vec<u8>)> {
     Ok((commitments, cur.to_vec()))
 }
 
+// ---- discovery: the committee descriptor ----------------------------------
+
+/// A committee member's routing identity in a [`CommitteeDescriptor`]: its
+/// committee index (matching its [`KeyShare`]'s `member`) plus how to reach and
+/// onion-route to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitteeMemberInfo {
+    /// 1-based committee index (equals this member's `KeyShare::member`).
+    pub index: u8,
+    /// The member's node id (authenticated at dial via `connect_verified`).
+    pub id: NodeId,
+    /// The member's Ristretto routing key, for the Sphinx layer to it.
+    pub sphinx: [u8; 32],
+    /// A dialable address for the member.
+    pub addr: String,
+}
+
+/// The published identity of a committee: its joint key (and threshold, = the
+/// commitment count), plus the member roster. A client fetches this — like a
+/// relay snapshot, it is only trusted once its members and joint key are — and
+/// routes a committee circuit through the roster to reach the exit. The exit is
+/// the last member on the built circuit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitteeDescriptor {
+    /// Joint key `commitments[0]` and threshold `= commitments.len()`.
+    pub commitments: KeyCommitments,
+    /// The committee members, in index order.
+    pub members: Vec<CommitteeMemberInfo>,
+}
+
+impl CommitteeDescriptor {
+    /// The reconstruction threshold `k` (the committed polynomial degree + 1).
+    pub fn threshold(&self) -> usize {
+        self.commitments.0.len()
+    }
+
+    /// Build a committee circuit routing through every member in index order
+    /// (the last is the exit). Every hop contributes a partial, so the client
+    /// gathers `members.len()` partials and needs [`threshold`](Self::threshold).
+    pub fn circuit(&self) -> Result<Vec<Hop>> {
+        if self.members.len() < self.threshold() {
+            return Err(Error::Config(
+                "committee has fewer members than its threshold".into(),
+            ));
+        }
+        Ok(self
+            .members
+            .iter()
+            .map(|m| Hop {
+                id: m.id,
+                sphinx: m.sphinx,
+                addr: m.addr.clone(),
+            })
+            .collect())
+    }
+
+    /// Serialize for publication.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let cbytes = self.commitments.to_bytes();
+        let mut out = Vec::new();
+        out.extend_from_slice(&(cbytes.len() as u16).to_be_bytes());
+        out.extend_from_slice(&cbytes);
+        out.extend_from_slice(&(self.members.len() as u16).to_be_bytes());
+        for m in &self.members {
+            out.push(m.index);
+            out.extend_from_slice(m.id.as_bytes());
+            out.extend_from_slice(&m.sphinx);
+            out.extend_from_slice(&(m.addr.len() as u16).to_be_bytes());
+            out.extend_from_slice(m.addr.as_bytes());
+        }
+        out
+    }
+
+    /// Parse [`to_bytes`](Self::to_bytes). Bounds-checked; never panics.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut cur = bytes;
+        let clen = u16::from_be_bytes(take(&mut cur, 2)?.try_into().expect("2 bytes")) as usize;
+        let commitments = KeyCommitments::from_bytes(take(&mut cur, clen)?)?;
+        let count = u16::from_be_bytes(take(&mut cur, 2)?.try_into().expect("2 bytes")) as usize;
+        if count > neo_mpc::MAX_MEMBERS {
+            return Err(Error::Decode("too many committee members".into()));
+        }
+        let mut members = Vec::with_capacity(count.min(64));
+        for _ in 0..count {
+            let index = take(&mut cur, 1)?[0];
+            let id = NodeId::from_bytes(take(&mut cur, 32)?.try_into().expect("32 bytes"));
+            let sphinx: [u8; 32] = take(&mut cur, 32)?.try_into().expect("32 bytes");
+            let alen = u16::from_be_bytes(take(&mut cur, 2)?.try_into().expect("2 bytes")) as usize;
+            if alen > 256 {
+                return Err(Error::Decode("committee member address too long".into()));
+            }
+            let addr = std::str::from_utf8(take(&mut cur, alen)?)
+                .map_err(|_| Error::Decode("committee member address not UTF-8".into()))?
+                .to_string();
+            members.push(CommitteeMemberInfo {
+                index,
+                id,
+                sphinx,
+                addr,
+            });
+        }
+        if !cur.is_empty() {
+            return Err(Error::Decode(
+                "trailing bytes after committee descriptor".into(),
+            ));
+        }
+        Ok(Self {
+            commitments,
+            members,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,6 +549,30 @@ mod tests {
         );
         // A truncated buffer is rejected, not panicked.
         assert!(CommitteeResponse::from_bytes(&response.to_bytes()[..5]).is_err());
+    }
+
+    #[test]
+    fn committee_descriptor_roundtrips_and_builds_a_circuit() {
+        let (commitments, _shares) = committee(3, 2);
+        let members: Vec<CommitteeMemberInfo> = (1..=3u8)
+            .map(|i| {
+                let id = NodeIdentity::generate().unwrap();
+                CommitteeMemberInfo {
+                    index: i,
+                    id: id.id(),
+                    sphinx: id.public().sphinx,
+                    addr: format!("10.0.0.{i}:9000"),
+                }
+            })
+            .collect();
+        let desc = CommitteeDescriptor {
+            commitments,
+            members,
+        };
+        assert_eq!(desc.threshold(), 2);
+        let parsed = CommitteeDescriptor::from_bytes(&desc.to_bytes()).unwrap();
+        assert_eq!(parsed, desc);
+        assert_eq!(parsed.circuit().unwrap().len(), 3);
     }
 
     fn echo(request: &[u8]) -> Vec<u8> {
