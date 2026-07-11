@@ -56,6 +56,13 @@ struct Entry {
     /// keeps the earliest-registered relays, so a freshly-ground low node-id can't
     /// displace an established incumbent that shares its subnet.
     registered_at: u64,
+    /// When the relay became *continuously* healthy (unix seconds), reset to `None`
+    /// on any dial-back failure. Drives the optional maturation gate (M36): a relay
+    /// isn't attested until it has stayed reachable for `min_maturity`, so a Sybil
+    /// must keep N relays alive over time — an unforgeable, seed-measured cost — not
+    /// just spin them up for an instant. Seed-measured, so unlike a receipt it can't
+    /// be forged by the relay.
+    healthy_since: Option<u64>,
 }
 
 /// A verified, health-tracked set of relay records.
@@ -65,6 +72,9 @@ pub struct Registry {
     /// Optional IP→ASN table enabling the per-ASN attestation cap (M36). `None`
     /// (the default) means subnet-only capping.
     asn_db: Option<Arc<AsnDb>>,
+    /// Seconds a relay must stay continuously healthy before it is attested (M36
+    /// maturation gate). `0` (the default) disables it. See [`Entry::healthy_since`].
+    min_maturity: u64,
 }
 
 impl Registry {
@@ -76,6 +86,12 @@ impl Registry {
     /// Attach (or clear) the IP→ASN table used for the per-ASN attestation cap.
     pub fn set_asn_db(&mut self, asn_db: Option<Arc<AsnDb>>) {
         self.asn_db = asn_db;
+    }
+
+    /// Set the maturation window: seconds a relay must stay continuously healthy
+    /// before it is attested (`0` disables it).
+    pub fn set_min_maturity(&mut self, secs: u64) {
+        self.min_maturity = secs;
     }
 
     /// Number of known relays (healthy or not).
@@ -116,6 +132,7 @@ impl Registry {
                     .verified_addr
                     .clone()
                     .filter(|a| record.addrs.contains(a));
+                let healthy_since = existing.healthy_since;
                 self.entries.insert(
                     record.id,
                     Entry {
@@ -124,6 +141,7 @@ impl Registry {
                         strikes: 0,
                         verified_addr,
                         registered_at,
+                        healthy_since,
                     },
                 );
                 Ok(true)
@@ -142,6 +160,7 @@ impl Registry {
                         strikes: 0,
                         verified_addr: None,
                         registered_at: now_unix(),
+                        healthy_since: None,
                     },
                 );
                 Ok(true)
@@ -169,12 +188,18 @@ impl Registry {
         if let Some(entry) = self.entries.get_mut(id) {
             match verified_addr {
                 Some(addr) => {
+                    // Start the maturation clock when a relay first goes healthy;
+                    // leave it running while it stays healthy.
+                    if entry.healthy_since.is_none() {
+                        entry.healthy_since = Some(now_unix());
+                    }
                     entry.healthy = true;
                     entry.strikes = 0;
                     entry.verified_addr = Some(addr);
                 }
                 None => {
                     entry.healthy = false;
+                    entry.healthy_since = None; // a failure resets maturity
                     entry.strikes += 1;
                     if entry.strikes >= MAX_STRIKES {
                         self.entries.remove(id);
@@ -205,10 +230,11 @@ impl Registry {
     pub fn attestable(&self) -> Vec<PeerRecord> {
         let now = now_unix();
         let asn_db = self.asn_db.as_deref();
+        let min_maturity = self.min_maturity;
         let mut healthy: Vec<(u64, PeerRecord, Option<SubnetKey>, Option<AsnKey>)> = self
             .entries
             .values()
-            .filter(|e| e.healthy && !e.record.is_expired(now))
+            .filter(|e| e.healthy && !e.record.is_expired(now) && is_matured(e, now, min_maturity))
             .map(|e| {
                 let subnet = verified_subnet(e);
                 let asn = asn_db.and_then(|db| verified_asn(e, db));
@@ -274,6 +300,15 @@ impl Registry {
 /// verified yet. Crucially this is *not* derived from all advertised addresses —
 /// only the proven one — so a record can't pad its `addrs` with a victim's /24 to
 /// consume that subnet's cap slots (M36, review finding C1).
+/// Whether an entry has been continuously healthy for at least `min_maturity`
+/// seconds (the maturation gate). Always true when `min_maturity` is 0.
+fn is_matured(entry: &Entry, now: u64, min_maturity: u64) -> bool {
+    match entry.healthy_since {
+        Some(since) => now.saturating_sub(since) >= min_maturity,
+        None => min_maturity == 0,
+    }
+}
+
 fn verified_subnet(entry: &Entry) -> Option<SubnetKey> {
     let addr = entry.verified_addr.as_ref()?;
     if !neo_core::net::is_safe_dial_target(addr, false) {
@@ -480,6 +515,28 @@ mod tests {
             MAX_ATTESTED_PER_ASN,
             "the per-ASN cap bounds one autonomous system's attested relays"
         );
+    }
+
+    #[test]
+    fn maturation_gate_holds_back_fresh_relays() {
+        let addr = "45.33.32.10:443";
+        // With a maturation window, a just-healthy relay is not yet attested.
+        let mut gated = Registry::new();
+        gated.set_min_maturity(3600);
+        let id = NodeIdentity::generate().unwrap();
+        gated.admit(relay_record_at(&id, addr, 1)).unwrap();
+        gated.record_health(&id.id(), Some(addr.into()));
+        assert!(
+            gated.attestable().is_empty(),
+            "a fresh relay is held back until it matures"
+        );
+
+        // With the gate off (the default), the same relay attests immediately.
+        let mut open = Registry::new();
+        let id2 = NodeIdentity::generate().unwrap();
+        open.admit(relay_record_at(&id2, addr, 1)).unwrap();
+        open.record_health(&id2.id(), Some(addr.into()));
+        assert_eq!(open.attestable().len(), 1, "no gate → attested at once");
     }
 
     #[test]

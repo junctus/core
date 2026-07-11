@@ -111,6 +111,12 @@ enum Command {
         /// attestation cap (M36). Without it, only the per-/24 subnet cap applies.
         #[arg(long)]
         asn_db: Option<PathBuf>,
+        /// Seconds a relay must stay continuously healthy before it is attested
+        /// (M36 maturation gate; 0 disables). Raises the Sybil time cost, but blanks
+        /// the snapshot for this window after a seed restart — enable once several
+        /// independent seeds exist.
+        #[arg(long, default_value_t = 0)]
+        min_maturity: u64,
     },
     /// Fetch, verify, and print the current relay snapshot (diagnostics).
     Snapshot {
@@ -308,6 +314,7 @@ async fn main() -> anyhow::Result<()> {
             allow_loopback,
             no_registration_pow,
             asn_db,
+            min_maturity,
         } => {
             run_seed(
                 &bind,
@@ -318,6 +325,7 @@ async fn main() -> anyhow::Result<()> {
                 allow_loopback,
                 !no_registration_pow,
                 asn_db.as_deref(),
+                min_maturity,
             )
             .await?
         }
@@ -527,6 +535,7 @@ async fn run_seed(
     allow_loopback: bool,
     require_registration_pow: bool,
     asn_db_path: Option<&Path>,
+    min_attestation_maturity: u64,
 ) -> anyhow::Result<()> {
     use std::sync::Arc;
     use std::time::Duration;
@@ -565,6 +574,7 @@ async fn run_seed(
         allow_loopback,
         require_registration_pow,
         asn_db,
+        min_attestation_maturity,
         ..SeedConfig::default()
     };
     let seed = Seed::new(witness, prober, config);

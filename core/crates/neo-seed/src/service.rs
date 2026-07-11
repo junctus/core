@@ -121,6 +121,12 @@ pub struct SeedConfig {
     /// default) leaves subnet-only capping; supply an `ip2asn` dataset to also cap
     /// per autonomous system.
     pub asn_db: Option<Arc<AsnDb>>,
+    /// Seconds a relay must stay continuously healthy before it is attested (M36
+    /// maturation gate). `0` (the default) disables it. A non-zero value raises the
+    /// Sybil *time* cost but, because the seed's state is in-memory, blanks the
+    /// snapshot for this window after a seed restart — enable it once multiple
+    /// independent seeds exist so no single restart empties the network.
+    pub min_attestation_maturity: u64,
 }
 
 impl Default for SeedConfig {
@@ -139,6 +145,7 @@ impl Default for SeedConfig {
             require_registration_pow: true,
             registration_pow_bits: neo_core::pow::REGISTRATION_POW_BITS,
             asn_db: None,
+            min_attestation_maturity: 0,
         }
     }
 }
@@ -278,6 +285,7 @@ impl Seed {
     pub fn new(witness: NodeIdentity, prober: NodeIdentity, config: SeedConfig) -> Self {
         let mut registry = Registry::new();
         registry.set_asn_db(config.asn_db.clone());
+        registry.set_min_maturity(config.min_attestation_maturity);
         let state = Arc::new(AppState {
             registry: Mutex::new(registry),
             witness,
