@@ -8,8 +8,9 @@
 //! durable user state.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use neo_core::net::SubnetKey;
+use neo_core::net::{AsnDb, AsnKey, SubnetKey};
 use neo_core::{NodeId, NodeIdentity, Result};
 use neo_discovery::snapshot::{SignedSnapshot, Snapshot};
 use neo_discovery::{now_unix, PeerRecord};
@@ -30,6 +31,13 @@ pub const MAX_ENTRIES: usize = 100_000;
 /// it. Loopback / internal addresses (dev/test only; never dial-back-attestable in
 /// production) are exempt so they aren't collapsed into one subnet.
 pub const MAX_ATTESTED_PER_SUBNET: usize = 2;
+/// Maximum relays the seed will attest per autonomous system (M36), applied only
+/// when an [`AsnDb`] is loaded. An ASN is a better "operator" proxy than a /24, but
+/// a cloud provider is one AS hosting many unrelated customers, so this is kept
+/// **lenient** — it catches an egregious single-provider flood without choking a
+/// legitimately cloud-hosted early network. Best-effort selection diversity remains
+/// the non-censoring safety net.
+pub const MAX_ATTESTED_PER_ASN: usize = 8;
 
 /// A registry entry: the record plus this seed's health accounting.
 #[derive(Clone, Debug)]
@@ -54,12 +62,20 @@ struct Entry {
 #[derive(Default)]
 pub struct Registry {
     entries: HashMap<NodeId, Entry>,
+    /// Optional IP→ASN table enabling the per-ASN attestation cap (M36). `None`
+    /// (the default) means subnet-only capping.
+    asn_db: Option<Arc<AsnDb>>,
 }
 
 impl Registry {
     /// An empty registry.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Attach (or clear) the IP→ASN table used for the per-ASN attestation cap.
+    pub fn set_asn_db(&mut self, asn_db: Option<Arc<AsnDb>>) {
+        self.asn_db = asn_db;
     }
 
     /// Number of known relays (healthy or not).
@@ -188,34 +204,47 @@ impl Registry {
     /// low node-id can't displace an established incumbent sharing its subnet.
     pub fn attestable(&self) -> Vec<PeerRecord> {
         let now = now_unix();
-        let mut healthy: Vec<(u64, PeerRecord, Option<SubnetKey>)> = self
+        let asn_db = self.asn_db.as_deref();
+        let mut healthy: Vec<(u64, PeerRecord, Option<SubnetKey>, Option<AsnKey>)> = self
             .entries
             .values()
             .filter(|e| e.healthy && !e.record.is_expired(now))
-            .map(|e| (e.registered_at, e.record.clone(), verified_subnet(e)))
+            .map(|e| {
+                let subnet = verified_subnet(e);
+                let asn = asn_db.and_then(|db| verified_asn(e, db));
+                (e.registered_at, e.record.clone(), subnet, asn)
+            })
             .collect();
         // Process oldest-first (id as a stable tiebreak) so incumbents keep the
-        // scarce per-subnet slots.
+        // scarce per-subnet / per-ASN slots.
         healthy.sort_by(|a, b| {
             a.0.cmp(&b.0)
                 .then_with(|| a.1.id.as_bytes().cmp(b.1.id.as_bytes()))
         });
         let mut per_subnet: HashMap<SubnetKey, usize> = HashMap::new();
+        let mut per_asn: HashMap<AsnKey, usize> = HashMap::new();
         let mut kept: Vec<PeerRecord> = healthy
             .into_iter()
-            .filter_map(|(_, record, subnet)| match subnet {
-                // No verified *public* subnet (loopback/dev, or not yet re-verified
-                // after an address change) → not counted against any subnet.
-                None => Some(record),
-                Some(s) => {
-                    let count = per_subnet.entry(s).or_insert(0);
-                    if *count >= MAX_ATTESTED_PER_SUBNET {
-                        None
-                    } else {
-                        *count += 1;
-                        Some(record)
-                    }
+            .filter_map(|(_, record, subnet, asn)| {
+                // A relay is kept only if *both* its verified subnet and its
+                // verified ASN have room. `None` on either dimension (no public
+                // literal, or no ASN dataset / unrouted address) exempts it there.
+                let subnet_full = subnet.as_ref().is_some_and(|s| {
+                    per_subnet.get(s).copied().unwrap_or(0) >= MAX_ATTESTED_PER_SUBNET
+                });
+                let asn_full = asn
+                    .as_ref()
+                    .is_some_and(|a| per_asn.get(a).copied().unwrap_or(0) >= MAX_ATTESTED_PER_ASN);
+                if subnet_full || asn_full {
+                    return None;
                 }
+                if let Some(s) = subnet {
+                    *per_subnet.entry(s).or_insert(0) += 1;
+                }
+                if let Some(a) = asn {
+                    *per_asn.entry(a).or_insert(0) += 1;
+                }
+                Some(record)
             })
             .collect();
         // Canonical ascending-id order for deterministic snapshot bytes.
@@ -251,6 +280,18 @@ fn verified_subnet(entry: &Entry) -> Option<SubnetKey> {
         return None;
     }
     SubnetKey::from_addr(addr)
+}
+
+/// The ASN an entry counts against for the per-ASN cap: the ASN of its
+/// **dial-back-verified** public address, or `None` if unverified, non-public, or
+/// absent from the dataset. Like [`verified_subnet`], it is derived only from the
+/// proven address so padded `addrs` can't consume a victim AS's cap slots.
+fn verified_asn(entry: &Entry, db: &AsnDb) -> Option<AsnKey> {
+    let addr = entry.verified_addr.as_ref()?;
+    if !neo_core::net::is_safe_dial_target(addr, false) {
+        return None;
+    }
+    db.asn_of_addr(addr)
 }
 
 #[cfg(test)]
@@ -419,6 +460,39 @@ mod tests {
         assert!(attested.iter().any(|r| r.addrs[0] == "45.33.32.11:443"));
         assert!(attested.iter().any(|r| r.addrs[0] == "9.9.9.9:443"));
         assert_eq!(attested.len(), 3);
+    }
+
+    #[test]
+    fn attestation_is_capped_per_asn() {
+        // One AS spanning a /16, so many distinct /24s share it. The subnet cap
+        // never triggers (one relay per /24) but the ASN cap does.
+        let db = AsnDb::from_tsv("45.33.0.0\t45.33.255.255\t64500\tXX\tTEST\n");
+        let mut reg = Registry::new();
+        reg.set_asn_db(Some(Arc::new(db)));
+        for i in 1..=(MAX_ATTESTED_PER_ASN + 1) {
+            let id = NodeIdentity::generate().unwrap();
+            let addr = format!("45.33.{i}.1:443");
+            reg.admit(relay_record_at(&id, &addr, 1)).unwrap();
+            reg.record_health(&id.id(), Some(addr));
+        }
+        assert_eq!(
+            reg.attestable().len(),
+            MAX_ATTESTED_PER_ASN,
+            "the per-ASN cap bounds one autonomous system's attested relays"
+        );
+    }
+
+    #[test]
+    fn without_an_asn_db_only_the_subnet_cap_applies() {
+        // Same relays, no dataset: all attest (each in its own /24, ASN cap off).
+        let mut reg = Registry::new();
+        for i in 1..=(MAX_ATTESTED_PER_ASN + 1) {
+            let id = NodeIdentity::generate().unwrap();
+            let addr = format!("45.33.{i}.1:443");
+            reg.admit(relay_record_at(&id, &addr, 1)).unwrap();
+            reg.record_health(&id.id(), Some(addr));
+        }
+        assert_eq!(reg.attestable().len(), MAX_ATTESTED_PER_ASN + 1);
     }
 
     #[test]

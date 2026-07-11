@@ -107,6 +107,10 @@ enum Command {
         /// that doesn't send `X-Neo-Pow`, then drop it once they're updated.
         #[arg(long, default_value_t = false)]
         no_registration_pow: bool,
+        /// Optional `ip2asn` TSV (e.g. from iptoasn.com) enabling the per-ASN
+        /// attestation cap (M36). Without it, only the per-/24 subnet cap applies.
+        #[arg(long)]
+        asn_db: Option<PathBuf>,
     },
     /// Fetch, verify, and print the current relay snapshot (diagnostics).
     Snapshot {
@@ -303,6 +307,7 @@ async fn main() -> anyhow::Result<()> {
             register_cooldown,
             allow_loopback,
             no_registration_pow,
+            asn_db,
         } => {
             run_seed(
                 &bind,
@@ -312,6 +317,7 @@ async fn main() -> anyhow::Result<()> {
                 register_cooldown,
                 allow_loopback,
                 !no_registration_pow,
+                asn_db.as_deref(),
             )
             .await?
         }
@@ -511,6 +517,7 @@ async fn run_command(args: RunArgs) -> anyhow::Result<()> {
     roles::run_client(identity, cfg?).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_seed(
     bind: &str,
     witness_path: &Path,
@@ -519,15 +526,35 @@ async fn run_seed(
     register_cooldown: u64,
     allow_loopback: bool,
     require_registration_pow: bool,
+    asn_db_path: Option<&Path>,
 ) -> anyhow::Result<()> {
+    use std::sync::Arc;
     use std::time::Duration;
 
+    use neo_core::net::AsnDb;
     use neo_seed::{Seed, SeedConfig};
 
     let witness = roles::load_or_create_identity(witness_path)?;
     // The dial-back prober is ephemeral: relays only care that *someone*
     // completed the handshake as them, not who probed.
     let prober = NodeIdentity::generate()?;
+    // Load the optional IP→ASN dataset for the per-ASN attestation cap (M36).
+    let asn_db = match asn_db_path {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("reading ASN dataset {}", path.display()))?;
+            let db = AsnDb::from_tsv(&text);
+            if db.is_empty() {
+                anyhow::bail!("ASN dataset {} parsed to zero ranges", path.display());
+            }
+            println!(
+                "loaded ASN dataset from {} (per-ASN cap active)",
+                path.display()
+            );
+            Some(Arc::new(db))
+        }
+        None => None,
+    };
     let config = SeedConfig {
         bind: bind
             .parse()
@@ -537,6 +564,7 @@ async fn run_seed(
         register_cooldown: Duration::from_secs(register_cooldown),
         allow_loopback,
         require_registration_pow,
+        asn_db,
         ..SeedConfig::default()
     };
     let seed = Seed::new(witness, prober, config);

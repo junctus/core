@@ -27,6 +27,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use neo_core::net::AsnDb;
 use neo_core::{NodeId, NodeIdentity};
 use neo_discovery::snapshot::{manifest_digest, SignedSnapshot, Snapshot, SnapshotDelta};
 use neo_discovery::PeerRecord;
@@ -116,6 +117,10 @@ pub struct SeedConfig {
     pub require_registration_pow: bool,
     /// Difficulty (leading zero bits) for the registration PoW when required.
     pub registration_pow_bits: u32,
+    /// Optional IP→ASN table for the per-ASN attestation cap (M36). `None` (the
+    /// default) leaves subnet-only capping; supply an `ip2asn` dataset to also cap
+    /// per autonomous system.
+    pub asn_db: Option<Arc<AsnDb>>,
 }
 
 impl Default for SeedConfig {
@@ -133,6 +138,7 @@ impl Default for SeedConfig {
             allow_loopback: false,
             require_registration_pow: true,
             registration_pow_bits: neo_core::pow::REGISTRATION_POW_BITS,
+            asn_db: None,
         }
     }
 }
@@ -270,8 +276,10 @@ pub struct Seed {
 impl Seed {
     /// Create a seed with a distinct witness identity and dial-back prober.
     pub fn new(witness: NodeIdentity, prober: NodeIdentity, config: SeedConfig) -> Self {
+        let mut registry = Registry::new();
+        registry.set_asn_db(config.asn_db.clone());
         let state = Arc::new(AppState {
-            registry: Mutex::new(Registry::new()),
+            registry: Mutex::new(registry),
             witness,
             prober,
             snapshot: RwLock::new(SnapshotCache::empty()),

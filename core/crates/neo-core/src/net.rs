@@ -161,6 +161,92 @@ where
     buckets.into_iter().flatten().collect()
 }
 
+/// An autonomous-system number — a coarser "operator" proxy than [`SubnetKey`]
+/// (M36). Two relays in the same AS are the same network operator far more often
+/// than two in the same /24, so an ASN cap is the better admission-diversity
+/// control where an IP→ASN dataset is available. It is still imperfect: a cloud
+/// provider is one AS hosting thousands of unrelated customers, so an ASN cap can
+/// over-group them — best-effort *selection* diversity ([`prioritize_distinct_subnets`])
+/// remains the non-censoring safety net.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AsnKey(pub u32);
+
+/// An IP→ASN lookup table built from the standard `ip2asn` TSV
+/// (<https://iptoasn.com>): tab-separated `range_start range_end AS_number
+/// country AS_description`, one route per line, IPv4 and IPv6 mixed. Ranges are
+/// stored as inclusive `u128` intervals (IPv4 mapped into IPv6 space so the two
+/// families share one sorted table) and looked up by binary search.
+///
+/// This is an **optional** dependency with its own freshness/trust surface — a
+/// seed with no dataset simply doesn't apply ASN caps. It performs no I/O; the
+/// caller reads the file and hands over the text.
+#[derive(Clone, Debug, Default)]
+pub struct AsnDb {
+    /// `(start, end, asn)` inclusive ranges, sorted by `start`, non-overlapping.
+    ranges: Vec<(u128, u128, u32)>,
+}
+
+impl AsnDb {
+    /// Parse an `ip2asn` TSV. Lines that are blank, malformed, or map to AS0 (the
+    /// dataset's "not routed" marker) are skipped. Ranges are sorted for lookup.
+    pub fn from_tsv(text: &str) -> Self {
+        let mut ranges = Vec::new();
+        for line in text.lines() {
+            let mut cols = line.split('\t');
+            let (Some(start), Some(end), Some(asn)) = (cols.next(), cols.next(), cols.next())
+            else {
+                continue;
+            };
+            let (Ok(start), Ok(end), Ok(asn)) = (
+                start.parse::<IpAddr>(),
+                end.parse::<IpAddr>(),
+                asn.parse::<u32>(),
+            ) else {
+                continue;
+            };
+            if asn == 0 {
+                continue; // "not routed" sentinel
+            }
+            ranges.push((ip_to_u128(start), ip_to_u128(end), asn));
+        }
+        ranges.sort_unstable_by_key(|&(start, _, _)| start);
+        Self { ranges }
+    }
+
+    /// Whether the table is empty (no usable ranges parsed).
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    /// The ASN owning `ip`, or `None` if no range covers it.
+    pub fn lookup(&self, ip: IpAddr) -> Option<AsnKey> {
+        let v = ip_to_u128(ip);
+        // Largest range whose start is <= v; then confirm v is within its end.
+        let idx = self.ranges.partition_point(|&(start, _, _)| start <= v);
+        if idx == 0 {
+            return None;
+        }
+        let (_, end, asn) = self.ranges[idx - 1];
+        (v <= end).then_some(AsnKey(asn))
+    }
+
+    /// The ASN of a `host:port` string, or `None` if it is not an IP literal or no
+    /// range covers it.
+    pub fn asn_of_addr(&self, addr: &str) -> Option<AsnKey> {
+        let ip = addr.parse::<SocketAddr>().ok()?.ip();
+        self.lookup(ip)
+    }
+}
+
+/// Map any IP into a single `u128` ordering: IPv4 into the IPv4-mapped IPv6 space
+/// so v4 and v6 ranges never collide in one sorted table.
+fn ip_to_u128(ip: IpAddr) -> u128 {
+    match ip {
+        IpAddr::V4(v4) => u128::from(v4.to_ipv6_mapped()),
+        IpAddr::V6(v6) => u128::from(v6),
+    }
+}
+
 fn is_cgnat(v4: &Ipv4Addr) -> bool {
     // 100.64.0.0/10 carrier-grade NAT.
     let o = v4.octets();
@@ -294,5 +380,33 @@ mod tests {
             1,
             "exactly one subnet straddles"
         );
+    }
+
+    #[test]
+    fn asn_db_parses_and_looks_up_v4_and_v6() {
+        // A tiny ip2asn-style table: two v4 ranges (one AS0 = skipped) and a v6 one.
+        let tsv = "\
+1.0.0.0\t1.0.0.255\t13335\tUS\tCLOUDFLARE\n\
+8.8.8.0\t8.8.8.255\t15169\tUS\tGOOGLE\n\
+9.9.9.0\t9.9.9.255\t0\tNONE\tNot routed\n\
+2606:4700::\t2606:4700:ffff:ffff:ffff:ffff:ffff:ffff\t13335\tUS\tCLOUDFLARE\n";
+        let db = AsnDb::from_tsv(tsv);
+        assert!(!db.is_empty());
+        assert_eq!(db.asn_of_addr("1.0.0.42:443"), Some(AsnKey(13335)));
+        assert_eq!(db.asn_of_addr("8.8.8.8:53"), Some(AsnKey(15169)));
+        // Cloudflare v4 and v6 map to the same AS.
+        assert_eq!(db.asn_of_addr("[2606:4700::1111]:443"), Some(AsnKey(13335)));
+        // AS0 range is dropped; a gap has no ASN; a hostname isn't an IP literal.
+        assert_eq!(db.asn_of_addr("9.9.9.9:443"), None);
+        assert_eq!(db.asn_of_addr("5.5.5.5:443"), None);
+        assert_eq!(db.asn_of_addr("example.com:443"), None);
+    }
+
+    #[test]
+    fn asn_db_boundaries_are_inclusive() {
+        let db = AsnDb::from_tsv("10.0.0.0\t10.0.0.10\t64500\tXX\tTEST\n");
+        assert_eq!(db.asn_of_addr("10.0.0.0:1"), Some(AsnKey(64500))); // start
+        assert_eq!(db.asn_of_addr("10.0.0.10:1"), Some(AsnKey(64500))); // end
+        assert_eq!(db.asn_of_addr("10.0.0.11:1"), None); // just past the end
     }
 }
