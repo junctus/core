@@ -51,6 +51,40 @@ pub fn is_safe_dial_target(addr: &str, allow_loopback: bool) -> bool {
     }
 }
 
+/// A coarse network identifier for Sybil-resistance checks (M36): the IPv4 **/24**
+/// or IPv6 **/64** an address sits in. Two relays with the same `SubnetKey` are
+/// treated as the same network (a proxy for "same operator"), so the seed caps how
+/// many it attests per subnet and clients never place two circuit hops in one. It
+/// is a coarse heuristic, not identity — an adversary spanning many /24s defeats
+/// it (that is the honest limit of subnet diversity; ASN-level caps are a
+/// follow-on needing a BGP dataset).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SubnetKey {
+    /// IPv4 /24 — the first three octets.
+    V4([u8; 3]),
+    /// IPv6 /64 — the first four 16-bit segments.
+    V6([u16; 4]),
+}
+
+impl SubnetKey {
+    /// The subnet of a `host:port` string, or `None` if it is not an IP literal
+    /// (a hostname or malformed input has no checkable subnet). The port is
+    /// irrelevant, so `1.2.3.4:9000` and `1.2.3.4:9001` share a key.
+    pub fn from_addr(addr: &str) -> Option<Self> {
+        let ip = addr.parse::<SocketAddr>().ok()?.ip();
+        Some(match ip {
+            IpAddr::V4(v4) => {
+                let o = v4.octets();
+                SubnetKey::V4([o[0], o[1], o[2]])
+            }
+            IpAddr::V6(v6) => {
+                let s = v6.segments();
+                SubnetKey::V6([s[0], s[1], s[2], s[3]])
+            }
+        })
+    }
+}
+
 fn is_cgnat(v4: &Ipv4Addr) -> bool {
     // 100.64.0.0/10 carrier-grade NAT.
     let o = v4.octets();
@@ -99,5 +133,23 @@ mod tests {
         // Loopback only when explicitly allowed (dev/test).
         assert!(!is_safe_dial_target("127.0.0.1:9000", false));
         assert!(is_safe_dial_target("127.0.0.1:9000", true));
+    }
+
+    #[test]
+    fn subnet_key_groups_a_24_and_a_64() {
+        // IPv4 /24: the port is irrelevant, the 4th octet is ignored.
+        let a = SubnetKey::from_addr("1.2.3.4:9000").unwrap();
+        assert_eq!(a, SubnetKey::V4([1, 2, 3]));
+        assert_eq!(a, SubnetKey::from_addr("1.2.3.4:9001").unwrap()); // same IP, diff port
+        assert_eq!(a, SubnetKey::from_addr("1.2.3.99:443").unwrap()); // same /24
+        assert_ne!(a, SubnetKey::from_addr("1.2.4.4:9000").unwrap()); // different /24
+                                                                      // IPv6 /64: first four segments.
+        let v6 = SubnetKey::from_addr("[2606:4700:4700::1111]:443").unwrap();
+        assert_eq!(v6, SubnetKey::V6([0x2606, 0x4700, 0x4700, 0]));
+        assert_ne!(a, v6);
+        // Non-literals and garbage have no subnet.
+        for bad in ["example.com:443", "not-an-addr", "1.2.3.4", ":9000", ""] {
+            assert_eq!(SubnetKey::from_addr(bad), None, "{bad} has no subnet");
+        }
     }
 }

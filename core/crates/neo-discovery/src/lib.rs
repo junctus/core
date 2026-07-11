@@ -196,6 +196,19 @@ impl PeerRecord {
         self.expires_at <= now
     }
 
+    /// The distinct subnets ([`SubnetKey`](neo_core::net::SubnetKey)) this record
+    /// advertises, for Sybil-diversity checks (M36): the seed caps attested relays
+    /// per subnet, and clients never place two circuit hops in one. Empty if no
+    /// advertised address is an IP literal.
+    pub fn subnet_keys(&self) -> Vec<neo_core::net::SubnetKey> {
+        let mut seen = std::collections::HashSet::new();
+        self.addrs
+            .iter()
+            .filter_map(|a| neo_core::net::SubnetKey::from_addr(a))
+            .filter(|k| seen.insert(*k))
+            .collect()
+    }
+
     /// Whether this record is the compact form (no ML-KEM key). A compact record
     /// carries an empty `kem`; a full record's `kem` is exactly [`KEM_PUBLIC_LEN`].
     pub fn is_compact(&self) -> bool {

@@ -21,6 +21,14 @@ pub const MAX_STRIKES: u32 = 3;
 /// New registrations beyond this are refused until entries age out (strikes /
 /// expiry); already-known relays may still refresh.
 pub const MAX_ENTRIES: usize = 100_000;
+/// Maximum relays the seed will *attest* per public subnet (M36). Registration is
+/// unbounded (up to [`MAX_ENTRIES`]), but only this many relays per IPv4 /24 or
+/// IPv6 /64 are listed in a snapshot, so one network can't flood the set clients
+/// pick circuit hops from. A generous small cluster is allowed; a flood is not.
+/// This is a coarse anti-Sybil measure — an adversary spanning many /24s defeats
+/// it. Loopback / internal addresses (dev/test only; never dial-back-attestable in
+/// production) are exempt so they aren't collapsed into one subnet.
+pub const MAX_ATTESTED_PER_SUBNET: usize = 2;
 
 /// A registry entry: the record plus this seed's health accounting.
 #[derive(Clone, Debug)]
@@ -154,7 +162,7 @@ impl Registry {
             .map(|e| e.record.clone())
             .collect();
         relays.sort_unstable_by(|a, b| a.id.as_bytes().cmp(b.id.as_bytes()));
-        relays
+        cap_per_subnet(relays)
     }
 
     /// Build a snapshot of the attestable relays and sign it as `witness`.
@@ -173,6 +181,50 @@ impl Registry {
     }
 }
 
+/// Keep at most [`MAX_ATTESTED_PER_SUBNET`] relays per public subnet, preserving
+/// input order (so the canonical ascending-id order is retained and the kept
+/// relays are deterministic). A relay is dropped if *any* of its public subnets is
+/// already full — so a multi-homed record can't slip a full subnet past the cap by
+/// also advertising a spare one. Records with no public subnet (loopback / internal
+/// dev addresses) are never capped: they can't be dial-back-attested in production
+/// anyway, and collapsing them into one bucket would break local multi-relay tests.
+fn cap_per_subnet(relays: Vec<PeerRecord>) -> Vec<PeerRecord> {
+    let mut per_subnet: HashMap<neo_core::net::SubnetKey, usize> = HashMap::new();
+    relays
+        .into_iter()
+        .filter(|r| {
+            let subnets = public_subnets(r);
+            if subnets.is_empty() {
+                return true;
+            }
+            if subnets
+                .iter()
+                .any(|s| per_subnet.get(s).copied().unwrap_or(0) >= MAX_ATTESTED_PER_SUBNET)
+            {
+                return false;
+            }
+            for s in subnets {
+                *per_subnet.entry(s).or_insert(0) += 1;
+            }
+            true
+        })
+        .collect()
+}
+
+/// The distinct **public** subnets a record advertises (internal / loopback
+/// addresses excluded from the Sybil cap). Deduped so a record advertising two
+/// addresses in one /24 counts that subnet once.
+fn public_subnets(record: &PeerRecord) -> Vec<neo_core::net::SubnetKey> {
+    let mut seen = std::collections::HashSet::new();
+    record
+        .addrs
+        .iter()
+        .filter(|a| neo_core::net::is_safe_dial_target(a, false))
+        .filter_map(|a| neo_core::net::SubnetKey::from_addr(a))
+        .filter(|k| seen.insert(*k))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,6 +233,18 @@ mod tests {
         PeerRecord::build_signed(
             identity,
             vec!["127.0.0.1:9000".into()],
+            true,
+            false,
+            now_unix() + 3600,
+            seq,
+        )
+        .unwrap()
+    }
+
+    fn relay_record_at(identity: &NodeIdentity, addr: &str, seq: u64) -> PeerRecord {
+        PeerRecord::build_signed(
+            identity,
+            vec![addr.into()],
             true,
             false,
             now_unix() + 3600,
@@ -258,5 +322,45 @@ mod tests {
         signed.verify(&trusted, 1, now_unix()).unwrap();
         assert_eq!(signed.snapshot.relays.len(), 1);
         assert_eq!(signed.snapshot.relays[0].id, healthy.id());
+    }
+
+    #[test]
+    fn attestation_is_capped_per_public_subnet() {
+        let mut reg = Registry::new();
+        // Three healthy relays in one real public /24 (45.33.32.0/24) ...
+        for host in ["45.33.32.10", "45.33.32.11", "45.33.32.12"] {
+            let id = NodeIdentity::generate().unwrap();
+            reg.admit(relay_record_at(&id, &format!("{host}:443"), 1))
+                .unwrap();
+            reg.record_health(&id.id(), true);
+        }
+        // ... plus one in a different /24.
+        let other = NodeIdentity::generate().unwrap();
+        reg.admit(relay_record_at(&other, "9.9.9.7:443", 1))
+            .unwrap();
+        reg.record_health(&other.id(), true);
+
+        let attested = reg.attestable();
+        // Only MAX_ATTESTED_PER_SUBNET from the flooded /24, plus the lone relay.
+        assert_eq!(attested.len(), MAX_ATTESTED_PER_SUBNET + 1);
+        let in_flooded = attested
+            .iter()
+            .filter(|r| r.addrs[0].starts_with("45.33.32."))
+            .count();
+        assert_eq!(in_flooded, MAX_ATTESTED_PER_SUBNET);
+        assert!(attested.iter().any(|r| r.addrs[0] == "9.9.9.7:443"));
+    }
+
+    #[test]
+    fn loopback_relays_are_exempt_from_the_subnet_cap() {
+        // All test relays share 127.0.0.0/24 but must not be capped — loopback is
+        // never a real public subnet and would break local multi-relay setups.
+        let mut reg = Registry::new();
+        for _ in 0..MAX_ATTESTED_PER_SUBNET + 2 {
+            let id = NodeIdentity::generate().unwrap();
+            reg.admit(relay_record(&id, 1)).unwrap();
+            reg.record_health(&id.id(), true);
+        }
+        assert_eq!(reg.attestable().len(), MAX_ATTESTED_PER_SUBNET + 2);
     }
 }
