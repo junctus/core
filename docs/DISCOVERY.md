@@ -125,10 +125,18 @@ dial-back. M36 adds a *concentration* layer (a coarse anti-Sybil measure, **not*
 full Sybil resistance):
 
 - **Admission diversity.** The seed attests at most `MAX_ATTESTED_PER_SUBNET`
-  relays per public subnet (IPv4 `/24`, IPv6 `/64`) — `registry.rs::cap_per_subnet`.
-  Registration stays unbounded (memory-bounded by `MAX_ENTRIES`); only the *listed*
-  set clients pick from is capped, so one network can't flood selection. Loopback /
-  internal addresses are exempt (dev/test; never dial-back-attestable in production).
+  relays per public subnet (IPv4 `/24`, IPv6 `/64`), and — when an `ip2asn` dataset
+  is loaded (`neo seed --asn-db`) — at most `MAX_ATTESTED_PER_ASN` per autonomous
+  system. Registration stays unbounded (memory-bounded by `MAX_ENTRIES`); only the
+  *listed* set clients pick from is capped. The cap counts a relay against **only
+  the address its dial-back verified**, never an unverified advertised one — so a
+  record can't pad its `addrs` with a victim's `/24`/AS to consume that network's
+  cap slots and evict honest relays there. Loopback / internal addresses are exempt.
+- **Maturation (uptime).** Optionally (`neo seed --min-maturity`, off by default) a
+  relay is not attested until it has stayed continuously healthy for a window. The
+  seed measures this by dial-back, so it is *unforgeable* by the relay and raises the
+  Sybil **time** cost. Off by default because the seed is in-memory (a restart blanks
+  the snapshot for the window) — enable once several independent seeds exist.
 - **Selection diversity.** Every client circuit builder front-loads
   subnet-distinct hops (`neo-core::net::prioritize_distinct_subnets`) so one
   operator can't own two hops of a path — including the k-of-n *share* router, where
@@ -141,10 +149,14 @@ full Sybil resistance):
   standalone defense.
 
 The honest boundary: this raises the flood cost from "sign N records" to "control N
-reachable hosts across ≳N/2 distinct `/24`s **and** pass N dial-backs **and** spend
-N proofs". An adversary spanning a `/16`, many rented `/24`s, or an IPv6 block still
-defeats it. Per-ASN caps (need a BGP dataset) and bandwidth-weighted selection are
-deferred — see `MILESTONES.md` M36.
+reachable hosts across ≳N/2 distinct `/24`s (and ≳N/8 distinct ASes) **and** pass N
+dial-backs **and** spend N proofs **and**, under the maturation gate, keep them all
+alive for the window". An adversary spanning a `/16`, many rented `/24`s/ASes, or an
+IPv6 block still defeats the diversity caps. **Bandwidth**-weighted selection is
+deliberately *not* used: the M17 proof-of-relay receipts are client-attested and
+thus forgeable by a colluding client+relay, so weighting selection by them would be
+security theater — proven bandwidth gates the unlinkable credit economy (M32), not
+path selection. See `MILESTONES.md` M36.
 
 ## The seed (`discovery.junctus.org`)
 

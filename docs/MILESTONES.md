@@ -696,7 +696,7 @@ enumerate and burn the whole fleet — the classic way nation-states kill bridge
   whose earn side is honestly still client-attested (M17/M32 caveat), so it is only worthwhile once M27's
   wire path and M32's hardened earning land.
 
-### M36 — Sybil-resistant relay admission + diverse path selection 🔨 (subnet layer shipped; ASN + bandwidth-weighting deferred)
+### M36 — Sybil-resistant relay admission + diverse path selection ✅ (subnet+ASN caps, diverse selection, PoW, uptime gate; continuous weighting deferred)
 Why it matters: dial-back attestation binds an identity to an address it actually controls, but **nothing
 caps how many relays one operator runs**. N listener processes on *different ports* of a single IP each
 pass their own dial-back and get attested, and clients pick hops by NodeId at random with **no
@@ -727,8 +727,17 @@ not this one: M4.5 prevents *forging/hijacking* relays, M11 makes selection *unb
     diversity reorder (front-loads subnet-distinct candidates, falls back to repeats when subnets are
     scarce so a young 2-relay network still builds full circuits).
   - **Admission diversity:** the seed caps *attested* relays per public subnet (`MAX_ATTESTED_PER_SUBNET`)
-    in `registry.rs::cap_per_subnet` — registration stays unbounded, only snapshot listing is capped;
-    internal/loopback exempt.
+    and, when an `ip2asn` dataset is loaded (`neo seed --asn-db`), per **ASN** (`MAX_ATTESTED_PER_ASN`) —
+    `registry.rs::attestable`. Registration stays unbounded, only snapshot listing is capped;
+    internal/loopback exempt. The cap counts **only the dial-back-verified address**, never an unverified
+    advertised one — so a record can't pad its `addrs` with a victim's `/24`/AS to evict honest relays
+    there (fixed after an adversarial review found that hole). Cap survivors are the earliest-registered,
+    so a ground low node-id can't displace an incumbent.
+  - **Maturation gate (seed-measured uptime):** optional (`neo seed --min-maturity`, default off) — a relay
+    isn't attested until it has stayed continuously healthy for the window. The seed measures uptime by
+    dial-back, so it is **unforgeable** by the relay; it raises the Sybil *time* cost. Off by default
+    because the seed is in-memory (a restart would blank the snapshot for the window); enable once several
+    independent seeds exist.
   - **Selection diversity** wired into every live circuit builder: `neo-routing`
     `select_path`/`select_disjoint_paths` (the k-of-n share-correlation case)/`select_path_seeded`
     (stays deterministic + VRF-verifiable), `ExitSelector::select` (rotates the *subnet*, not just the
@@ -743,8 +752,17 @@ not this one: M4.5 prevents *forging/hijacking* relays, M11 makes selection *unb
     It is **not** full Sybil resistance: an adversary with a `/16`, many rented `/24`s, or an IPv6 block
     still defeats subnet diversity, and CPU PoW is cheap at scale. The dominant attacker cost is the IPs,
     not the hashing.
-  - **Still deferred:** per-**ASN** caps (need a maintained BGP dataset), and **bandwidth/uptime
-    weighting** of selection (needs the M17 proof-of-relay accounting) — both listed in the plan above.
+  - **Bandwidth weighting — deliberately declined for Sybil resistance.** The M17 proof-of-relay economy
+    (`neo-credits::earn` — `RelayReceipt` + `EarnLedger`) already exists, but its receipts are
+    *client-attested*: a colluding client+relay can fabricate capped receipts for unperformed work (an
+    open problem Tor doesn't solve either). Weighting *selection* by that signal would import forgeable
+    input into the anti-Sybil path — security theater. So proven-bandwidth stays where it belongs (gating
+    the unlinkable **credit** economy, M32), not steering path selection. The unforgeable weighting signal
+    — **uptime** — shipped instead, as the maturation gate above.
+  - **Still deferred (needs a snapshot wire-format bump):** *continuous* uptime weighting (a witness-signed
+    per-relay weight in the snapshot + client weighted selection), a follow-on to the binary maturation
+    gate. Left out here to avoid a `SNAPSHOT_VERSION` change + diff-sync + client rollout on the live
+    network for a marginal gain over the gate.
 
 ---
 
