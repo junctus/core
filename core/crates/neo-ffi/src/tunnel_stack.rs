@@ -180,7 +180,7 @@ impl NeoTunnelStackSession {
         mirrors: Vec<String>,
         witnesses_hex: Vec<String>,
         threshold: u32,
-        hops: u32,
+        privacy: crate::tunnel::NeoPrivacy,
         net_interface_index: u32,
     ) -> Result<NeoTunnelStackSession, NeoTunnelError> {
         // Pin every circuit socket this stack opens to the physical interface, so
@@ -205,14 +205,19 @@ impl NeoTunnelStackSession {
             witnesses.push(key);
         }
 
-        let hops = hops.max(1) as usize;
+        // The privacy dial decides both the mixing (per-cell delay + cover) and the
+        // circuit length (neo_mix::MixParams::for_level: off=1, balanced=3, paranoid=5).
+        let level: neo_core::PrivacyLevel = privacy.into();
+        let mix = neo_mix::MixParams::for_level(level);
+        let hops = mix.hops.max(1);
+
         let rt = runtime();
         let relays = rt.block_on(fetch_relays(&mirrors, &witnesses, threshold as usize))?;
         let relay_count = relays.len() as u32;
         if relays.len() < hops {
             return Err(NeoTunnelError::Discovery {
                 message: format!(
-                    "need {hops} relays for a circuit, the snapshot has {relay_count}"
+                    "need {hops} relays for a {level:?} circuit, the snapshot has {relay_count}"
                 ),
             });
         }
@@ -232,6 +237,7 @@ impl NeoTunnelStackSession {
             to_stack_rx,
             from_stack_tx,
             picker,
+            mix,
         ));
 
         Ok(NeoTunnelStackSession {
@@ -310,15 +316,16 @@ impl NeoTunnelStackSession {
 }
 
 /// Discover relays and start a multi-hop tunnel. `witnesses` are hex-encoded
-/// trusted witness keys; `threshold` is how many must sign the snapshot; `hops`
-/// is the relays per circuit (last is the exit).
+/// trusted witness keys; `threshold` is how many must sign the snapshot; `privacy`
+/// is the dial (`off`/`balanced`/`paranoid`) that sets both the mixing posture and
+/// the circuit length (off=1, balanced=3, paranoid=5 hops).
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 pub fn tunnel_stack_connect(
     secret: Vec<u8>,
     mirrors: Vec<String>,
     witnesses: Vec<String>,
     threshold: u32,
-    hops: u32,
+    privacy: crate::tunnel::NeoPrivacy,
     net_interface_index: u32,
 ) -> Result<std::sync::Arc<NeoTunnelStackSession>, NeoTunnelError> {
     NeoTunnelStackSession::connect_inner(
@@ -326,7 +333,7 @@ pub fn tunnel_stack_connect(
         mirrors,
         witnesses,
         threshold,
-        hops,
+        privacy,
         net_interface_index,
     )
     .map(std::sync::Arc::new)

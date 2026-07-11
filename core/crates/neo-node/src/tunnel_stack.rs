@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use neo_core::NodeIdentity;
+use neo_mix::{sample_exponential, MixParams};
 use neo_netstack::{
     ConnReader, ConnWriter, Connection, Connections, NetStack, Outbound, UdpConnections, UdpFlow,
 };
@@ -38,6 +39,8 @@ impl<F: Fn() -> Vec<Hop> + Send + Sync> CircuitPicker for F {
 /// - `from_tun`: raw IP packets read from the OS TUN.
 /// - `to_tun`: raw IP packets to write back to the OS TUN.
 /// - `picker`: chooses a fresh circuit per intercepted flow.
+/// - `mix`: the privacy dial — per-cell timing delay and cover-traffic interval
+///   (`neo_mix::MixParams::for_level`) applied to each flow's outbound stream.
 #[allow(clippy::too_many_arguments)] // a data-path entry point; all args are distinct wiring
 pub async fn run_tunnel_stack(
     identity: Arc<NodeIdentity>,
@@ -48,6 +51,7 @@ pub async fn run_tunnel_stack(
     mut from_tun: mpsc::Receiver<Vec<u8>>,
     to_tun: mpsc::Sender<Vec<u8>>,
     picker: Arc<dyn CircuitPicker>,
+    mix: MixParams,
 ) {
     loop {
         tokio::select! {
@@ -68,7 +72,7 @@ pub async fn run_tunnel_stack(
                     let identity = identity.clone();
                     let circuit = picker.pick();
                     tokio::spawn(async move {
-                        handle_flow(identity, conn, circuit).await;
+                        handle_flow(identity, conn, circuit, mix).await;
                     });
                 }
                 None => break,
@@ -78,7 +82,7 @@ pub async fn run_tunnel_stack(
                     let identity = identity.clone();
                     let circuit = picker.pick();
                     tokio::spawn(async move {
-                        handle_udp_flow(identity, flow, circuit).await;
+                        handle_udp_flow(identity, flow, circuit, mix).await;
                     });
                 }
                 None => break,
@@ -89,7 +93,7 @@ pub async fn run_tunnel_stack(
 
 /// Open a `udp:`-tagged circuit to one UDP flow's destination and shuttle
 /// datagrams both ways (one datagram == one circuit cell).
-async fn handle_udp_flow(identity: Arc<NodeIdentity>, flow: UdpFlow, circuit: Vec<Hop>) {
+async fn handle_udp_flow(identity: Arc<NodeIdentity>, flow: UdpFlow, circuit: Vec<Hop>, mix: MixParams) {
     let target = format!("udp:{}", flow.dst);
     let (sink, stream) = match open_circuit(&identity, &circuit, &target).await {
         Ok(pair) => pair,
@@ -99,12 +103,26 @@ async fn handle_udp_flow(identity: Arc<NodeIdentity>, flow: UdpFlow, circuit: Ve
         }
     };
     let (mut incoming, reply) = flow.split();
-    // client → exit: each datagram becomes one forward cell.
+    // client → exit: each datagram becomes one forward cell, timing-mixed + covered.
     let to_exit = async move {
         let mut sink = sink;
-        while let Some(datagram) = incoming.recv().await {
-            if sink.send(&datagram).await.is_err() {
-                break;
+        let mut cover = cover_ticker(&mix);
+        loop {
+            tokio::select! {
+                datagram = incoming.recv() => match datagram {
+                    Some(datagram) => {
+                        delay(&mix).await;
+                        if sink.send(&datagram).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                },
+                _ = tick(&mut cover) => {
+                    if sink.send_cover().await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     };
@@ -122,7 +140,7 @@ async fn handle_udp_flow(identity: Arc<NodeIdentity>, flow: UdpFlow, circuit: Ve
 }
 
 /// Open a circuit to one flow's destination and splice bytes both ways.
-async fn handle_flow(identity: Arc<NodeIdentity>, conn: Connection, circuit: Vec<Hop>) {
+async fn handle_flow(identity: Arc<NodeIdentity>, conn: Connection, circuit: Vec<Hop>, mix: MixParams) {
     let target = conn.dst.to_string();
     let (sink, stream) = match open_circuit(&identity, &circuit, &target).await {
         Ok(pair) => pair,
@@ -133,21 +151,43 @@ async fn handle_flow(identity: Arc<NodeIdentity>, conn: Connection, circuit: Vec
         }
     };
     let (reader, writer) = conn.split();
-    splice(reader, writer, sink, stream).await;
+    splice(reader, writer, sink, stream, mix).await;
 }
 
 /// Pump a flow's bytes to/from its circuit until either side ends.
+///
+/// The client→exit direction is **timing-mixed**: each cell waits an exponential
+/// delay (`mix.mean_delay`) before it goes out, and — while the flow is idle —
+/// **cover cells** are injected every `mix.cover_interval`, so an observer on the
+/// client's link sees a padded, jittered stream rather than the raw send pattern.
+/// The stream stays strictly ordered (a single task), since the exit re-emits the
+/// bytes to a real TCP connection and must not receive them reordered.
 async fn splice(
     mut reader: ConnReader,
     writer: ConnWriter,
     mut sink: CircuitSink,
     mut stream: CircuitStream,
+    mix: MixParams,
 ) {
     // client → exit
     let to_exit = async move {
-        while let Some(bytes) = reader.read().await {
-            if sink.send(&bytes).await.is_err() {
-                break;
+        let mut cover = cover_ticker(&mix);
+        loop {
+            tokio::select! {
+                bytes = reader.read() => match bytes {
+                    Some(bytes) => {
+                        delay(&mix).await;
+                        if sink.send(&bytes).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                },
+                _ = tick(&mut cover) => {
+                    if sink.send_cover().await.is_err() {
+                        break;
+                    }
+                }
             }
         }
     };
@@ -162,6 +202,34 @@ async fn splice(
     tokio::select! {
         _ = to_exit => {}
         _ = to_client => {}
+    }
+}
+
+/// The cover-traffic timer for a flow, or `None` when the level disables cover.
+fn cover_ticker(mix: &MixParams) -> Option<tokio::time::Interval> {
+    mix.cover_interval.map(|period| {
+        // Start one period out (not immediately), and if the task is busy sending
+        // real cells, skip missed cover ticks rather than bursting.
+        let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval
+    })
+}
+
+/// Await the next cover tick, or never (`pending`) when cover is disabled.
+async fn tick(cover: &mut Option<tokio::time::Interval>) {
+    match cover {
+        Some(interval) => {
+            interval.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// Await this flow's per-cell timing delay (a no-op when `mean_delay` is zero).
+async fn delay(mix: &MixParams) {
+    if !mix.mean_delay.is_zero() {
+        tokio::time::sleep(sample_exponential(mix.mean_delay)).await;
     }
 }
 
@@ -357,6 +425,15 @@ mod tests {
             from_tun_rx,
             to_tun_tx,
             picker,
+            // Exercise the mixing path: a small per-cell delay plus frequent cover
+            // cells. The echo must still round-trip (cover is dropped at the exit,
+            // real bytes stay ordered).
+            MixParams {
+                mean_delay: Duration::from_millis(5),
+                cover_interval: Some(Duration::from_millis(20)),
+                hops: 2,
+                redundancy: (1, 1),
+            },
         ));
 
         // Drive the smoltcp client dialing the echo server; shuttle its packets
