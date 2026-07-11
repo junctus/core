@@ -85,6 +85,44 @@ impl SubnetKey {
     }
 }
 
+/// Reorder `items` so that a greedy prefix maximizes subnet diversity (M36).
+///
+/// Walk the input once: emit each item whose subnet has not been seen yet; hold
+/// back an item whose subnet is already represented and append it afterwards (in
+/// original order). Taking the first `k` of the result therefore yields the most
+/// subnet-diverse `k` available, falling back to same-subnet repeats only when
+/// diversity is genuinely exhausted — so a young network with few subnets still
+/// builds a full circuit instead of failing. This is deliberately **best-effort**,
+/// not a hard constraint: the client can't refuse to route just because every
+/// relay happens to share a /24.
+///
+/// `subnet_of` returns an item's subnets (usually one; several if multi-homed;
+/// empty if it advertises no IP literal). An item with no subnet is treated as
+/// always-distinct — it can't be *shown* to collide, and attested relays carry IP
+/// literals anyway. Callers that want randomized paths should shuffle before
+/// calling; the reorder is stable with respect to the input.
+pub fn prioritize_distinct_subnets<T, F>(items: Vec<T>, subnet_of: F) -> Vec<T>
+where
+    F: Fn(&T) -> Vec<SubnetKey>,
+{
+    let mut used = std::collections::HashSet::new();
+    let mut first = Vec::with_capacity(items.len());
+    let mut rest = Vec::new();
+    for item in items {
+        let subs = subnet_of(&item);
+        if subs.iter().all(|s| !used.contains(s)) {
+            for s in subs {
+                used.insert(s);
+            }
+            first.push(item);
+        } else {
+            rest.push(item);
+        }
+    }
+    first.extend(rest);
+    first
+}
+
 fn is_cgnat(v4: &Ipv4Addr) -> bool {
     // 100.64.0.0/10 carrier-grade NAT.
     let o = v4.octets();
@@ -151,5 +189,36 @@ mod tests {
         for bad in ["example.com:443", "not-an-addr", "1.2.3.4", ":9000", ""] {
             assert_eq!(SubnetKey::from_addr(bad), None, "{bad} has no subnet");
         }
+    }
+
+    #[test]
+    fn prioritize_front_loads_distinct_subnets() {
+        let sub = |a: &&str| SubnetKey::from_addr(a).into_iter().collect::<Vec<_>>();
+        // Two hosts in 1.1.1.0/24, one in 2.2.2.0/24, one in 3.3.3.0/24.
+        let items = vec!["1.1.1.5:443", "1.1.1.6:443", "2.2.2.5:443", "3.3.3.5:443"];
+        let out = prioritize_distinct_subnets(items, sub);
+        // First three are all distinct subnets; the duplicate 1.1.1.x is held back.
+        let first3: Vec<_> = out[..3]
+            .iter()
+            .filter_map(|a| SubnetKey::from_addr(a))
+            .collect();
+        let uniq: std::collections::HashSet<_> = first3.iter().collect();
+        assert_eq!(uniq.len(), 3, "first three hops must be distinct subnets");
+        assert_eq!(out[3], "1.1.1.6:443", "the duplicate is appended last");
+        assert_eq!(
+            out.len(),
+            4,
+            "no item is dropped — best-effort, not a filter"
+        );
+    }
+
+    #[test]
+    fn prioritize_falls_back_when_diversity_exhausted() {
+        // All in one /24: nothing to diversify, but nothing is dropped either.
+        let sub = |a: &&str| SubnetKey::from_addr(a).into_iter().collect::<Vec<_>>();
+        let items = vec!["7.7.7.1:443", "7.7.7.2:443", "7.7.7.3:443"];
+        let out = prioritize_distinct_subnets(items.clone(), sub);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0], "7.7.7.1:443"); // first of the subnet kept in front
     }
 }

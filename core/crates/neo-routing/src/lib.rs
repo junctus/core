@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 
+use neo_core::net::{prioritize_distinct_subnets, SubnetKey};
 use neo_core::{Error, NodeId, Result};
 
 pub mod exit;
@@ -27,6 +28,20 @@ pub struct Relay {
     pub sphinx: [u8; 32],
     /// A dialable transport address (e.g. `host:port`).
     pub addr: String,
+}
+
+impl Relay {
+    /// The relay's subnet ([`SubnetKey`]) for Sybil-diversity checks (M36), or an
+    /// empty vector if its address is not an IP literal. Shaped for
+    /// [`prioritize_distinct_subnets`].
+    pub(crate) fn subnet_keys(&self) -> Vec<SubnetKey> {
+        SubnetKey::from_addr(&self.addr).into_iter().collect()
+    }
+
+    /// The relay's single subnet, if its address is an IP literal.
+    pub(crate) fn subnet(&self) -> Option<SubnetKey> {
+        SubnetKey::from_addr(&self.addr)
+    }
 }
 
 /// A static set of relays to route through.
@@ -72,11 +87,11 @@ impl Router {
             )));
         }
         let order = shuffled_indices(self.relays.len())?;
-        Ok(order
-            .into_iter()
-            .take(hops)
-            .map(|i| self.relays[i].clone())
-            .collect())
+        let shuffled: Vec<Relay> = order.into_iter().map(|i| self.relays[i].clone()).collect();
+        // Front-load subnet-distinct relays so the chosen hops span as many /24s as
+        // available (M36) — one operator shouldn't own two hops of a circuit.
+        let diverse = prioritize_distinct_subnets(shuffled, Relay::subnet_keys);
+        Ok(diverse.into_iter().take(hops).collect())
     }
 
     /// Select `paths` mutually node-disjoint paths of `hops` relays each.
@@ -97,10 +112,17 @@ impl Router {
             )));
         }
         let order = shuffled_indices(self.relays.len())?;
-        Ok(order
+        let shuffled: Vec<Relay> = order.into_iter().map(|i| self.relays[i].clone()).collect();
+        // Diversify across the *whole* selection before chunking into paths: for
+        // k-of-n shares, two node-disjoint paths that both traverse one /24 still
+        // hand that operator two shares to correlate. Front-loading distinct
+        // subnets makes each share's path land in a different network when the
+        // relay set allows it (M36, best-effort on a small network).
+        let diverse = prioritize_distinct_subnets(shuffled, Relay::subnet_keys);
+        Ok(diverse
             .chunks(hops)
             .take(paths)
-            .map(|chunk| chunk.iter().map(|&i| self.relays[i].clone()).collect())
+            .map(|chunk| chunk.to_vec())
             .collect())
     }
 
@@ -129,11 +151,12 @@ impl Router {
             let j = draw_below(&mut reader, i as u64 + 1) as usize;
             order.swap(i, j);
         }
-        Ok(order
-            .into_iter()
-            .take(hops)
-            .map(|i| self.relays[i].clone())
-            .collect())
+        let permuted: Vec<Relay> = order.into_iter().map(|i| self.relays[i].clone()).collect();
+        // Subnet diversity is applied as a deterministic reorder of the seeded
+        // permutation, so the result stays reproducible and VRF-verifiable: a
+        // verifier with the same relay set and seed derives the same path (M36).
+        let diverse = prioritize_distinct_subnets(permuted, Relay::subnet_keys);
+        Ok(diverse.into_iter().take(hops).collect())
     }
 }
 
@@ -189,6 +212,34 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    /// One relay per entry; the entry is the /24's third octet, so equal entries
+    /// share a subnet and distinct entries are distinct /24s. The host octet varies
+    /// with the index so node ids (and addresses) are always distinct.
+    fn relays_in_subnets(subnets: &[u8]) -> Vec<Relay> {
+        subnets
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| {
+                let id = NodeIdentity::generate().unwrap();
+                let pubkey = id.public();
+                Relay {
+                    id: pubkey.id,
+                    kex: *pubkey.kex.as_bytes(),
+                    sphinx: pubkey.sphinx,
+                    addr: format!("10.0.{s}.{i}:9000"),
+                }
+            })
+            .collect()
+    }
+
+    fn distinct_subnets(relays: &[Relay]) -> usize {
+        relays
+            .iter()
+            .filter_map(|r| SubnetKey::from_addr(&r.addr))
+            .collect::<std::collections::HashSet<_>>()
+            .len()
     }
 
     #[test]
@@ -247,5 +298,43 @@ mod tests {
 
         let hops: std::collections::HashSet<_> = path_a.iter().map(|r| r.id).collect();
         assert_eq!(hops.len(), 3, "hops are distinct");
+    }
+
+    #[test]
+    fn path_prefers_distinct_subnets_when_available() {
+        // 6 relays across 5 distinct /24s (two collide in subnet 1); a 4-hop path
+        // should land in 4 distinct subnets.
+        let router = Router::new(relays_in_subnets(&[1, 1, 2, 3, 4, 5]));
+        let path = router.select_path_seeded(&[9u8; 32], 4).unwrap();
+        assert_eq!(distinct_subnets(&path), 4, "path spans 4 distinct /24s");
+    }
+
+    #[test]
+    fn disjoint_share_paths_prefer_distinct_subnets() {
+        // The k-of-n case: two disjoint 3-hop paths across 6 distinct /24s must not
+        // route two shares through one operator's subnet.
+        let router = Router::new(relays_in_subnets(&[1, 2, 3, 4, 5, 6]));
+        let paths = router.select_disjoint_paths(2, 3).unwrap();
+        let all: Vec<Relay> = paths.into_iter().flatten().collect();
+        assert_eq!(
+            distinct_subnets(&all),
+            6,
+            "all six share-hops in distinct /24s"
+        );
+    }
+
+    #[test]
+    fn selection_falls_back_when_subnets_are_exhausted() {
+        // All four relays share one /24: diversity is impossible, but a full path
+        // must still be built (best-effort, not a hard filter).
+        let router = Router::new(relays_in_subnets(&[9, 9, 9, 9]));
+        let path = router.select_path(3).unwrap();
+        assert_eq!(path.len(), 3, "still builds a full path with no diversity");
+        let ids: std::collections::HashSet<_> = path.iter().map(|r| r.id).collect();
+        assert_eq!(
+            ids.len(),
+            3,
+            "hops remain node-distinct even without subnet diversity"
+        );
     }
 }

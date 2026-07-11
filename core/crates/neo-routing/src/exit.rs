@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use neo_core::net::SubnetKey;
 use neo_core::{Error, NodeId, Result};
 
 use crate::{rand_below, Relay};
@@ -68,30 +69,63 @@ impl ExitPolicy {
     }
 }
 
-/// Selects a fresh exit per request, never repeating the immediately-previous one.
+/// Selects a fresh exit per request, rotating away from the immediately-previous
+/// exit — and, when the relay set allows, away from its whole subnet, so rotation
+/// changes the *operator* and not just the address (M36).
 pub struct ExitSelector {
     exits: Vec<Relay>,
     last: Option<NodeId>,
+    last_subnet: Option<SubnetKey>,
 }
 
 impl ExitSelector {
     /// Build a selector over the exit-capable relays.
     pub fn new(exits: Vec<Relay>) -> Self {
-        Self { exits, last: None }
+        Self {
+            exits,
+            last: None,
+            last_subnet: None,
+        }
     }
 
-    /// Pick the next exit, avoiding the one used immediately before.
+    /// Pick the next exit. Prefers an exit in a **different subnet** from the last
+    /// pick (two exits in one /24 are one operator for exposure purposes), falling
+    /// back to a different node, then to any — so a network with a single exit, or
+    /// all exits in one subnet, still works. Best-effort by design: it never fails
+    /// while an exit exists.
     pub fn select(&mut self) -> Result<Relay> {
         if self.exits.is_empty() {
             return Err(Error::Config("no exit relays available".into()));
         }
-        loop {
-            let choice = self.exits[rand_below(self.exits.len())?].clone();
-            if self.exits.len() == 1 || self.last != Some(choice.id) {
-                self.last = Some(choice.id);
-                return Ok(choice);
+        // Tier 1: a different subnet than last (real operator rotation). Only
+        // meaningful for exits that advertise an IP literal.
+        let different_subnet: Vec<usize> = self
+            .exits
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| match (self.last_subnet, r.subnet()) {
+                (Some(last), Some(cur)) => cur != last,
+                _ => false,
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let candidates = if !different_subnet.is_empty() {
+            different_subnet
+        } else {
+            // Tier 2: a different node than last. Tier 3: anything (single exit).
+            let different_node: Vec<usize> = (0..self.exits.len())
+                .filter(|&i| Some(self.exits[i].id) != self.last)
+                .collect();
+            if different_node.is_empty() {
+                (0..self.exits.len()).collect()
+            } else {
+                different_node
             }
-        }
+        };
+        let choice = self.exits[candidates[rand_below(candidates.len())?]].clone();
+        self.last = Some(choice.id);
+        self.last_subnet = choice.subnet();
+        Ok(choice)
     }
 }
 
@@ -103,6 +137,14 @@ impl ExitSelector {
 /// concentrates exit exposure on one node exactly when the design wants it
 /// diffused. This registry enforces full node-disjointness across all active
 /// routes instead.
+///
+/// Node-disjointness is the *hard* invariant here; subnet-disjointness is
+/// deliberately **not** enforced as a gate. Making it one would deadlock small
+/// networks — a deployment with two /24s could never register a single 3-hop
+/// subnet-disjoint route and no traffic would flow. Subnet diversity is instead a
+/// best-effort concern of path *selection* (see `prioritize_distinct_subnets` and
+/// [`ExitSelector::select`]), which degrades gracefully when subnets are scarce
+/// rather than blocking (M36).
 #[derive(Default)]
 pub struct RouteRegistry {
     active: HashSet<Vec<[u8; 32]>>,
@@ -161,13 +203,17 @@ mod tests {
     use neo_core::NodeIdentity;
 
     fn relay() -> Relay {
+        relay_at(String::new())
+    }
+
+    fn relay_at(addr: impl Into<String>) -> Relay {
         let id = NodeIdentity::generate().unwrap();
         let p = id.public();
         Relay {
             id: p.id,
             kex: *p.kex.as_bytes(),
             sphinx: p.sphinx,
-            addr: String::new(),
+            addr: addr.into(),
         }
     }
 
@@ -204,6 +250,38 @@ mod tests {
                 prev,
                 "consecutive requests must use different exits"
             );
+            prev = Some(exit.id);
+        }
+    }
+
+    #[test]
+    fn exit_selector_rotates_subnets_when_possible() {
+        // Two exits in 1.1.1.0/24, one in 2.2.2.0/24. Consecutive picks must land
+        // in different subnets — rotating the operator, not just the address.
+        let mut selector = ExitSelector::new(vec![
+            relay_at("1.1.1.10:443"),
+            relay_at("1.1.1.11:443"),
+            relay_at("2.2.2.10:443"),
+        ]);
+        let mut prev = None;
+        for _ in 0..50 {
+            let exit = selector.select().unwrap();
+            let sub = SubnetKey::from_addr(&exit.addr);
+            assert_ne!(sub, prev, "consecutive exits must be in different subnets");
+            prev = sub;
+        }
+    }
+
+    #[test]
+    fn exit_selector_falls_back_when_all_share_a_subnet() {
+        // All exits in one /24: can't rotate subnets, but must still rotate nodes
+        // and never fail.
+        let mut selector =
+            ExitSelector::new(vec![relay_at("3.3.3.10:443"), relay_at("3.3.3.11:443")]);
+        let mut prev = None;
+        for _ in 0..20 {
+            let exit = selector.select().unwrap();
+            assert_ne!(Some(exit.id), prev, "still rotates the node");
             prev = Some(exit.id);
         }
     }
