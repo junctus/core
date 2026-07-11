@@ -696,6 +696,33 @@ enumerate and burn the whole fleet — the classic way nation-states kill bridge
   whose earn side is honestly still client-attested (M17/M32 caveat), so it is only worthwhile once M27's
   wire path and M32's hardened earning land.
 
+### M36 — Sybil-resistant relay admission + diverse path selection ⬜ (concentration defense)
+Why it matters: dial-back attestation binds an identity to an address it actually controls, but **nothing
+caps how many relays one operator runs**. N listener processes on *different ports* of a single IP each
+pass their own dial-back and get attested, and clients pick hops by NodeId at random with **no
+IP/subnet-diversity rule** — so a cheap Sybil over-represents itself in selection and can land the *same
+operator on both ends of a circuit*, the deanonymization case. The base model stops the other attacks but
+not this one: M4.5 prevents *forging/hijacking* relays, M11 makes selection *unbiasable* — neither limits
+*concentration*.
+- Plan: (a) **admission diversity** at the seed — cap attested relays per `/24` and per-ASN so one box or
+  network can't flood the set; (b) **selection diversity** in the client — never place two hops of a circuit
+  in the same operator/subnet/ASN (Tor's `EnforceDistinctSubnets`), and **weight selection by proven
+  bandwidth/uptime** (the M17 proof-of-relay receipts) so cheaply-spun idle Sybils earn little traffic;
+  (c) **registration gating** — charge a spent unlinkable credit or a proof-of-work per registration
+  (reuse `neo-credits` M10 / the M35 gating) so minting identities costs. Dial-back (M4.5) already blocks
+  claiming IPs you don't control or stacking identities on one `IP:port`; this adds the *cost* and
+  *diversity* layers on top.
+- Why a game-changer: turns "spin up 100 relays on one cheap box and own both ends of victims' circuits"
+  into "acquire IPs across distinct subnets/ASNs **and** earn the bandwidth to be selected" — closing the
+  concentration attack that quietly breaks low-cost overlay anonymity, using the anti-Sybil primitives
+  (credits + proof-of-relay) Tor structurally lacks.
+- Boundary/risk: full Sybil resistance is unsolved in open networks — a well-resourced adversary spanning
+  many ASNs still Sybils; this removes the cheapest same-box/same-subnet attacks and raises cost, it does
+  not eliminate the problem. Subnet/ASN diversity needs a maintained IP-geo/BGP dataset (its own
+  freshness/trust surface), and bandwidth-weighting inherits the honesty of the earn-side accounting, which
+  is still client-attested (M17/M32 caveat). Should land **before the network carries real users**, since
+  today one operator can cheaply run many relays and skew path selection.
+
 ---
 
 ## Audit gate ⬜
