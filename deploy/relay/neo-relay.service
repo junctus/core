@@ -1,6 +1,5 @@
 [Unit]
 Description=neo relay/exit node
-Documentation=https://github.com/  (neo docs/DISCOVERY.md)
 After=network-online.target
 Wants=network-online.target
 

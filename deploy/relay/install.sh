@@ -40,7 +40,8 @@ if [[ ! -f /var/lib/neo-relay/relay.key ]]; then
   sudo -u neo-relay /usr/local/bin/neo identity generate \
     --output /var/lib/neo-relay/relay.key >/dev/null
 fi
-NODE_ID="$(/usr/local/bin/neo identity show --identity /var/lib/neo-relay/relay.key 2>/dev/null | head -1)"
+NODE_ID="$(/usr/local/bin/neo identity show --identity /var/lib/neo-relay/relay.key 2>/dev/null \
+  | awk -F': ' '/node id/{print $2; exit}')"
 
 echo ">> installing systemd service"
 sed -e "s|__ANNOUNCE_ADDR__|${ANNOUNCE_ADDR}|g" \
