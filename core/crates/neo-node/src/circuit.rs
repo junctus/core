@@ -54,6 +54,9 @@ const CELL_MAC_LEN: usize = 16;
 const SEQ_LEN: usize = 8;
 /// Bytes read from a spliced TCP target per return cell.
 const TCP_CHUNK: usize = 8 * 1024;
+/// Largest UDP payload we read from a spliced datagram socket into one return
+/// cell (a whole IPv4 UDP datagram fits; DNS answers are far smaller).
+const UDP_DATAGRAM_MAX: usize = 65_535;
 
 fn fwd_key(secret: &[u8; 32]) -> [u8; 32] {
     blake3::derive_key("neo-circuit-fwd-v1", secret)
@@ -265,7 +268,13 @@ pub async fn serve_circuit<R: NextHop>(
             }
             let target = String::from_utf8(payload)
                 .map_err(|_| Error::Decode("circuit target not valid utf-8".into()))?;
-            exit_splice(secret, &target, pr, pr_opener, pw, pw_sealer, policy).await
+            // A "udp:host:port" target asks the exit to carry datagrams over a UDP
+            // socket (one cell = one datagram); a bare "host:port" is TCP as before.
+            if let Some(udp_target) = target.strip_prefix("udp:") {
+                exit_splice_udp(secret, udp_target, pr, pr_opener, pw, pw_sealer, policy).await
+            } else {
+                exit_splice(secret, &target, pr, pr_opener, pw, pw_sealer, policy).await
+            }
         }
     }
 }
@@ -442,6 +451,102 @@ async fn exit_splice(
     }
 }
 
+/// UDP variant of [`exit_splice`]: each forward cell carries one whole datagram,
+/// sent on a connected UDP socket, and each datagram received back becomes one
+/// return cell. The cell crypto (sequence, per-cell MAC, onion XOR) is identical
+/// to the TCP splice — only the transport differs (datagram boundaries instead of
+/// a byte stream), so one cell maps to exactly one datagram in each direction.
+async fn exit_splice_udp(
+    secret: [u8; 32],
+    target: &str,
+    mut pr: OwnedReadHalf,
+    mut pr_opener: Opener,
+    mut pw: OwnedWriteHalf,
+    mut pw_sealer: Sealer,
+    policy: ExitPolicy,
+) -> Result<()> {
+    // Same SSRF / open-proxy guard as the TCP exit.
+    if !neo_core::net::is_safe_dial_target(target, policy.allow_loopback) {
+        return Err(Error::Config(format!(
+            "exit refuses to splice UDP to non-public target {target}"
+        )));
+    }
+    let udp = tokio::net::UdpSocket::bind("0.0.0.0:0")
+        .await
+        .map_err(|e| Error::Config(format!("exit UDP bind failed: {e}")))?;
+    udp.connect(target)
+        .await
+        .map_err(|e| Error::Config(format!("exit UDP connect to {target} failed: {e}")))?;
+    let udp = std::sync::Arc::new(udp);
+
+    let fk = fwd_key(&secret);
+    let fmk = fwd_mac_key(&secret);
+    let rk = ret_key(&secret);
+    let rmk = ret_mac_key(&secret);
+
+    // client → target: peel the exit's forward layer, verify the e2e MAC, send the
+    // datagram. One forward cell == one datagram.
+    let send_udp = udp.clone();
+    let to_target = async move {
+        let mut next_seq = 0u64;
+        loop {
+            let Ok(framed) = read_frame(&mut pr).await else {
+                break;
+            };
+            let cell = pr_opener.open(&framed)?;
+            if cell.len() < SEQ_LEN + CELL_MAC_LEN {
+                return Err(Error::Decode("short forward cell".into()));
+            }
+            let seq = u64::from_be_bytes(cell[..SEQ_LEN].try_into().expect("8 bytes"));
+            if seq != next_seq {
+                return Err(Error::Crypto("forward cell out of sequence".into()));
+            }
+            next_seq += 1;
+            let mut body = cell[SEQ_LEN..].to_vec();
+            xor_cell(&mut body, &fk, seq);
+            let (mac, payload) = body.split_at(CELL_MAC_LEN);
+            if !ct_eq(mac, &cell_mac(&fmk, seq, payload)) {
+                return Err(Error::Crypto("forward cell failed integrity check".into()));
+            }
+            if send_udp.send(payload).await.is_err() {
+                break;
+            }
+        }
+        Ok::<(), Error>(())
+    };
+
+    // target → client: each received datagram becomes one MAC'd, layered return cell.
+    let to_client = async move {
+        let mut seq = 0u64;
+        let mut buf = vec![0u8; UDP_DATAGRAM_MAX];
+        loop {
+            let n = match udp.recv(&mut buf).await {
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            let payload = &buf[..n];
+            let mut body = Vec::with_capacity(CELL_MAC_LEN + n);
+            body.extend_from_slice(&cell_mac(&rmk, seq, payload));
+            body.extend_from_slice(payload);
+            xor_cell(&mut body, &rk, seq);
+            let mut cell = Vec::with_capacity(SEQ_LEN + body.len());
+            cell.extend_from_slice(&seq.to_be_bytes());
+            cell.extend_from_slice(&body);
+            let out = pw_sealer.seal(&cell)?;
+            if write_frame(&mut pw, &out).await.is_err() {
+                break;
+            }
+            seq += 1;
+        }
+        Ok::<(), Error>(())
+    };
+
+    tokio::select! {
+        r = to_target => r,
+        r = to_client => r,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,6 +689,55 @@ mod tests {
             got, expected,
             "the byte stream round-trips through the circuit"
         );
+    }
+
+    /// Bind a localhost UDP echo server; returns its address.
+    async fn spawn_udp_echo() -> String {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            while let Ok((n, from)) = sock.recv_from(&mut buf).await {
+                if sock.send_to(&buf[..n], from).await.is_err() {
+                    break;
+                }
+            }
+        });
+        addr
+    }
+
+    /// A "udp:host:port" circuit carries whole datagrams both ways, with
+    /// boundaries preserved (one send == one datagram == one recv).
+    #[tokio::test]
+    async fn circuit_carries_udp_datagrams_both_ways() {
+        let echo_addr = spawn_udp_echo().await;
+
+        let exit = NodeIdentity::generate().unwrap();
+        let relay = NodeIdentity::generate().unwrap();
+        let client = NodeIdentity::generate().unwrap();
+
+        let (exit_addr, _exit) = spawn_serve(exit.to_bytes(), HashMap::new()).await;
+        let mut resolver = HashMap::new();
+        resolver.insert(exit.id(), exit_addr.clone());
+        let (relay_addr, _relay) = spawn_serve(relay.to_bytes(), resolver).await;
+
+        let circuit = vec![hop_of(&relay, &relay_addr), hop_of(&exit, &exit_addr)];
+        // The "udp:" prefix routes the exit to the datagram splice.
+        let target = format!("udp:{echo_addr}");
+        let (mut sink, mut stream) = open_circuit(&client, &circuit, &target).await.unwrap();
+
+        let datagrams: [&[u8]; 3] = [b"one", b"two-two", b"three-three-three"];
+        for dg in datagrams {
+            sink.send(dg).await.unwrap();
+            let got = tokio::time::timeout(Duration::from_secs(5), stream.recv())
+                .await
+                .expect("recv in time")
+                .expect("a return datagram arrived");
+            assert_eq!(
+                got, dg,
+                "the datagram round-trips whole through the circuit"
+            );
+        }
     }
 
     #[tokio::test]

@@ -11,19 +11,26 @@
 //! one [`Cmd`] channel, whose `recv_timeout` also honours smoltcp's timers.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
+use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
 use smoltcp::wire::{
-    HardwareAddress, IpAddress, IpCidr, IpProtocol, Ipv4Packet, Ipv6Packet, TcpPacket,
+    HardwareAddress, IpAddress, IpCidr, IpProtocol, Ipv4Packet, Ipv4Repr, Ipv6Packet, TcpPacket,
+    UdpPacket, UdpRepr,
 };
 use tokio::sync::mpsc;
+
+/// Drop a UDP NAT entry after this long with no packet in either direction. UDP
+/// is connectionless, so unlike TCP there's no FIN to reap on; DNS and most UDP
+/// exchanges are brief, so a short idle window keeps the table small.
+const UDP_IDLE: Duration = Duration::from_secs(30);
 
 use crate::device::{ChannelDevice, MTU};
 
@@ -117,12 +124,159 @@ enum Cmd {
     Write(SocketHandle, Vec<u8>),
     /// Close a flow.
     Close(SocketHandle),
+    /// A fully-built IP packet to emit to the TUN (a UDP reply we constructed
+    /// outside the poll loop; smoltcp isn't involved for UDP).
+    SendRaw(Vec<u8>),
+}
+
+/// One intercepted UDP flow: the datagrams a client sent to `dst`, plus a
+/// [`UdpReply`] that wraps circuit responses back into UDP/IP packets to the
+/// client. The caller pumps `incoming` through a `udp:`-tagged neo circuit.
+pub struct UdpFlow {
+    /// The original destination the client sent datagrams to.
+    pub dst: SocketAddr,
+    incoming: mpsc::UnboundedReceiver<Vec<u8>>,
+    reply: UdpReply,
+}
+
+impl UdpFlow {
+    /// Await the next datagram from the client, or `None` once the flow is reaped.
+    pub async fn recv(&mut self) -> Option<Vec<u8>> {
+        self.incoming.recv().await
+    }
+
+    /// Send one datagram (a circuit response) back to the client.
+    pub fn reply(&self, datagram: &[u8]) {
+        self.reply.send(datagram);
+    }
+
+    /// Split into the datagram reader and a cloneable reply handle.
+    pub fn split(self) -> (mpsc::UnboundedReceiver<Vec<u8>>, UdpReply) {
+        (self.incoming, self.reply)
+    }
+}
+
+/// Wraps a circuit's return datagrams into UDP/IP packets addressed back to the
+/// client (from the original target), and queues them for the TUN. Cloneable.
+#[derive(Clone)]
+pub struct UdpReply {
+    cmd: std_mpsc::Sender<Cmd>,
+    /// The client's address (packet destination on the way back).
+    client: SocketAddrV4,
+    /// The target's address (packet source on the way back).
+    target: SocketAddrV4,
+}
+
+impl UdpReply {
+    /// Build a UDP/IP packet `target → client` carrying `datagram` and queue it
+    /// for emission to the TUN. No-op if the client/target aren't IPv4.
+    pub fn send(&self, datagram: &[u8]) {
+        let packet = build_udp_v4(self.target, self.client, datagram);
+        let _ = self.cmd.send(Cmd::SendRaw(packet));
+    }
+}
+
+/// Per-flow UDP NAT state kept in the poll loop.
+struct UdpNat {
+    /// Datagrams from the client → the circuit.
+    incoming_tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// Last time a packet moved in either direction (for idle reaping).
+    last_seen: Instant,
+}
+
+/// The UDP state [`apply_cmd`] needs, bundled to keep its signature small. Holds
+/// borrows of the poll loop's NAT table and the flow/command channels.
+struct UdpCtx<'a> {
+    nat: &'a mut HashMap<(SocketAddr, SocketAddr), UdpNat>,
+    conn_tx: &'a mpsc::UnboundedSender<UdpFlow>,
+    cmd_tx: &'a std_mpsc::Sender<Cmd>,
+}
+
+impl UdpCtx<'_> {
+    /// A client datagram to `dst`: announce the flow on first sight, then forward
+    /// the payload to its circuit. IPv4 only (the TUN carries IPv4).
+    fn inbound(&mut self, src: SocketAddr, dst: SocketAddr, payload: Vec<u8>) {
+        let (SocketAddr::V4(client), SocketAddr::V4(target)) = (src, dst) else {
+            return;
+        };
+        // `self.cmd_tx`/`conn_tx` are shared refs (Copy); copy them out so the
+        // or_insert_with closure doesn't borrow `self` while `nat` is borrowed.
+        let cmd_tx = self.cmd_tx;
+        let conn_tx = self.conn_tx;
+        let entry = self.nat.entry((src, dst)).or_insert_with(|| {
+            let (incoming_tx, incoming) = mpsc::unbounded_channel();
+            let _ = conn_tx.send(UdpFlow {
+                dst,
+                incoming,
+                reply: UdpReply {
+                    cmd: cmd_tx.clone(),
+                    client,
+                    target,
+                },
+            });
+            UdpNat {
+                incoming_tx,
+                last_seen: now(),
+            }
+        });
+        entry.last_seen = now();
+        let _ = entry.incoming_tx.send(payload);
+    }
+}
+
+/// Parse an IPv4 UDP packet's `(client, dst, payload)`; `None` if not IPv4 UDP.
+fn parse_udp(packet: &[u8]) -> Option<(SocketAddr, SocketAddr, Vec<u8>)> {
+    if packet.first().map(|b| b >> 4) != Some(4) {
+        return None; // the TUN is IPv4-only (NEIPv4Settings); ignore anything else
+    }
+    let ip = Ipv4Packet::new_checked(packet).ok()?;
+    if ip.next_header() != IpProtocol::Udp {
+        return None;
+    }
+    let udp = UdpPacket::new_checked(ip.payload()).ok()?;
+    let src = SocketAddr::new(IpAddr::V4(ip.src_addr()), udp.src_port());
+    let dst = SocketAddr::new(IpAddr::V4(ip.dst_addr()), udp.dst_port());
+    Some((src, dst, udp.payload().to_vec()))
+}
+
+/// Build an IPv4 UDP packet `from → to` carrying `payload`, with correct IP and
+/// UDP checksums (via smoltcp's repr emit).
+fn build_udp_v4(from: SocketAddrV4, to: SocketAddrV4, payload: &[u8]) -> Vec<u8> {
+    let udp_repr = UdpRepr {
+        src_port: from.port(),
+        dst_port: to.port(),
+    };
+    let ip_repr = Ipv4Repr {
+        src_addr: *from.ip(),
+        dst_addr: *to.ip(),
+        next_header: IpProtocol::Udp,
+        payload_len: udp_repr.header_len() + payload.len(),
+        hop_limit: 64,
+    };
+    let caps = ChecksumCapabilities::default();
+    let mut buf = vec![0u8; ip_repr.buffer_len() + ip_repr.payload_len];
+    let mut ip_pkt = Ipv4Packet::new_unchecked(&mut buf);
+    ip_repr.emit(&mut ip_pkt, &caps);
+    let src_ip = IpAddress::from(IpAddr::V4(*from.ip()));
+    let dst_ip = IpAddress::from(IpAddr::V4(*to.ip()));
+    let mut udp_pkt = UdpPacket::new_unchecked(ip_pkt.payload_mut());
+    udp_repr.emit(
+        &mut udp_pkt,
+        &src_ip,
+        &dst_ip,
+        payload.len(),
+        |b| b.copy_from_slice(payload),
+        &caps,
+    );
+    buf
 }
 
 /// Outbound IP packets the stack wants written back to the TUN.
 pub type Outbound = mpsc::UnboundedReceiver<Vec<u8>>;
 /// The stream of intercepted TCP flows.
 pub type Connections = mpsc::UnboundedReceiver<Connection>;
+/// The stream of intercepted UDP flows.
+pub type UdpConnections = mpsc::UnboundedReceiver<UdpFlow>;
 
 /// The control handle for a running stack: feed it TUN packets with
 /// [`inject`](Self::inject). Dropping it stops the poll loop. The two output
@@ -136,10 +290,11 @@ pub struct NetStack {
 impl NetStack {
     /// Build a stack, start its poll loop thread, and return the control handle
     /// plus the outbound-packet and intercepted-flow streams.
-    pub fn new() -> (NetStack, Outbound, Connections) {
+    pub fn new() -> (NetStack, Outbound, Connections, UdpConnections) {
         let (cmd_tx, cmd_rx) = std_mpsc::channel::<Cmd>();
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (conn_tx, conn_rx) = mpsc::unbounded_channel::<Connection>();
+        let (udp_tx, udp_rx) = mpsc::unbounded_channel::<UdpFlow>();
         let stop = Arc::new(AtomicBool::new(false));
 
         let loop_cmd_tx = cmd_tx.clone();
@@ -147,11 +302,11 @@ impl NetStack {
         std::thread::Builder::new()
             .name("neo-netstack".into())
             .spawn(move || {
-                run_loop(cmd_rx, loop_cmd_tx, outbound_tx, conn_tx, loop_stop);
+                run_loop(cmd_rx, loop_cmd_tx, outbound_tx, conn_tx, udp_tx, loop_stop);
             })
             .expect("spawn netstack thread");
 
-        (NetStack { cmd: cmd_tx, stop }, outbound_rx, conn_rx)
+        (NetStack { cmd: cmd_tx, stop }, outbound_rx, conn_rx, udp_rx)
     }
 
     /// Feed one inbound IP packet (from the TUN) into the stack.
@@ -191,6 +346,7 @@ fn run_loop(
     conn_cmd_tx: std_mpsc::Sender<Cmd>,
     outbound_tx: mpsc::UnboundedSender<Vec<u8>>,
     conn_tx: mpsc::UnboundedSender<Connection>,
+    udp_conn_tx: mpsc::UnboundedSender<UdpFlow>,
     stop: Arc<AtomicBool>,
 ) {
     let mut device = ChannelDevice::new(MTU);
@@ -210,6 +366,14 @@ fn run_loop(
     let mut flows: HashMap<SocketHandle, Flow> = HashMap::new();
     // 4-tuple (client, dst) → handle, so a retransmitted SYN doesn't open a dup.
     let mut by_tuple: HashMap<(SocketAddr, SocketAddr), SocketHandle> = HashMap::new();
+    // UDP is connectionless: a NAT table keyed by (client, dst) instead of sockets.
+    let mut udp_nat: HashMap<(SocketAddr, SocketAddr), UdpNat> = HashMap::new();
+
+    let mut udp = UdpCtx {
+        nat: &mut udp_nat,
+        conn_tx: &udp_conn_tx,
+        cmd_tx: &conn_cmd_tx,
+    };
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -219,12 +383,26 @@ fn run_loop(
         // Wait for a command or until smoltcp's next timer fires.
         let wait = poll_delay(&mut iface, &mut sockets);
         match cmd_rx.recv_timeout(wait) {
-            Ok(cmd) => apply_cmd(cmd, &mut sockets, &mut flows, &mut by_tuple, &mut device),
+            Ok(cmd) => apply_cmd(
+                cmd,
+                &mut sockets,
+                &mut flows,
+                &mut by_tuple,
+                &mut device,
+                &mut udp,
+            ),
             Err(std_mpsc::RecvTimeoutError::Timeout) => {}
             Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
         }
         while let Ok(cmd) = cmd_rx.try_recv() {
-            apply_cmd(cmd, &mut sockets, &mut flows, &mut by_tuple, &mut device);
+            apply_cmd(
+                cmd,
+                &mut sockets,
+                &mut flows,
+                &mut by_tuple,
+                &mut device,
+                &mut udp,
+            );
         }
 
         // Push buffered circuit→client bytes into socket send buffers.
@@ -242,6 +420,12 @@ fn run_loop(
         }
 
         reap(&mut sockets, &mut flows, &mut by_tuple);
+        // Drop idle UDP flows (connectionless — there's no FIN to reap on).
+        // Dropping the entry closes its incoming_tx, which ends the flow's
+        // circuit handler in run_tunnel_stack.
+        let cutoff = now();
+        udp.nat
+            .retain(|_, nat| (cutoff - nat.last_seen).total_millis() < UDP_IDLE.as_millis() as u64);
     }
 }
 
@@ -266,9 +450,15 @@ fn apply_cmd(
     flows: &mut HashMap<SocketHandle, Flow>,
     by_tuple: &mut HashMap<(SocketAddr, SocketAddr), SocketHandle>,
     device: &mut ChannelDevice,
+    udp: &mut UdpCtx,
 ) {
     match cmd {
         Cmd::Inbound(packet) => {
+            // UDP is handled out of band — smoltcp here carries only TCP.
+            if let Some((src, dst, payload)) = parse_udp(&packet) {
+                udp.inbound(src, dst, payload);
+                return;
+            }
             if let Some((src, dst, syn)) = parse_tcp(&packet) {
                 // A new flow's opening SYN: pre-create a listener bound to the
                 // destination so smoltcp answers it (any_ip lets it accept any dst).
@@ -310,6 +500,10 @@ fn apply_cmd(
             if let Some(flow) = flows.get_mut(&handle) {
                 flow.closing = true;
             }
+        }
+        Cmd::SendRaw(packet) => {
+            // A UDP reply we built; queue it for the TUN (drained after the poll).
+            device.tx.push_back(packet);
         }
     }
 }
@@ -492,7 +686,7 @@ mod tests {
     #[tokio::test]
     async fn intercepts_a_tcp_flow_and_streams_both_ways() {
         let dst: SocketAddr = (Ipv4Addr::new(93, 184, 216, 34), 80).into();
-        let (net, mut outbound, mut conns) = NetStack::new();
+        let (net, mut outbound, mut conns, _udp) = NetStack::new();
         let mut client = Client::dial(dst);
 
         // Pump packets between the two stacks until the gateway announces the flow.
@@ -570,5 +764,44 @@ mod tests {
         .await
         .expect("gateway bytes reached the client");
         assert_eq!(echoed, b"hello from the exit");
+    }
+
+    /// A UDP datagram is intercepted as a flow, delivered whole, and a reply
+    /// datagram comes back out as a correctly-addressed UDP/IP packet. Also
+    /// exercises build_udp_v4 ↔ parse_udp round-tripping.
+    #[tokio::test]
+    async fn intercepts_a_udp_flow_and_replies() {
+        let client: SocketAddrV4 = "10.9.0.2:5300".parse().unwrap();
+        let target: SocketAddrV4 = "93.184.216.34:53".parse().unwrap();
+        let (net, mut outbound, _conns, mut udp_conns) = NetStack::new();
+
+        net.inject(build_udp_v4(client, target, b"dns-query"));
+
+        let mut flow = tokio::time::timeout(Duration::from_secs(5), udp_conns.recv())
+            .await
+            .expect("flow announced in time")
+            .expect("a udp flow arrived");
+        assert_eq!(flow.dst, SocketAddr::V4(target), "destination preserved");
+
+        let got = tokio::time::timeout(Duration::from_secs(5), flow.recv())
+            .await
+            .expect("datagram in time")
+            .expect("a datagram arrived");
+        assert_eq!(got, b"dns-query", "the client datagram is delivered whole");
+
+        // A reply comes back out as a UDP/IP packet from target → client.
+        flow.reply(b"dns-answer");
+        let pkt = tokio::time::timeout(Duration::from_secs(5), outbound.recv())
+            .await
+            .expect("reply packet in time")
+            .expect("a packet was emitted");
+        let (psrc, pdst, payload) = parse_udp(&pkt).expect("emitted packet parses as UDP");
+        assert_eq!(psrc, SocketAddr::V4(target), "reply source is the target");
+        assert_eq!(
+            pdst,
+            SocketAddr::V4(client),
+            "reply destination is the client"
+        );
+        assert_eq!(payload, b"dns-answer", "the reply datagram round-trips");
     }
 }

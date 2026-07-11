@@ -10,7 +10,9 @@
 use std::sync::Arc;
 
 use neo_core::NodeIdentity;
-use neo_netstack::{ConnReader, ConnWriter, Connection, Connections, NetStack, Outbound};
+use neo_netstack::{
+    ConnReader, ConnWriter, Connection, Connections, NetStack, Outbound, UdpConnections, UdpFlow,
+};
 use tokio::sync::mpsc;
 
 use crate::circuit::{open_circuit, CircuitSink, CircuitStream};
@@ -36,11 +38,13 @@ impl<F: Fn() -> Vec<Hop> + Send + Sync> CircuitPicker for F {
 /// - `from_tun`: raw IP packets read from the OS TUN.
 /// - `to_tun`: raw IP packets to write back to the OS TUN.
 /// - `picker`: chooses a fresh circuit per intercepted flow.
+#[allow(clippy::too_many_arguments)] // a data-path entry point; all args are distinct wiring
 pub async fn run_tunnel_stack(
     identity: Arc<NodeIdentity>,
     net: NetStack,
     mut outbound: Outbound,
     mut conns: Connections,
+    mut udp_conns: UdpConnections,
     mut from_tun: mpsc::Receiver<Vec<u8>>,
     to_tun: mpsc::Sender<Vec<u8>>,
     picker: Arc<dyn CircuitPicker>,
@@ -69,7 +73,51 @@ pub async fn run_tunnel_stack(
                 }
                 None => break,
             },
+            flow = udp_conns.recv() => match flow {
+                Some(flow) => {
+                    let identity = identity.clone();
+                    let circuit = picker.pick();
+                    tokio::spawn(async move {
+                        handle_udp_flow(identity, flow, circuit).await;
+                    });
+                }
+                None => break,
+            },
         }
+    }
+}
+
+/// Open a `udp:`-tagged circuit to one UDP flow's destination and shuttle
+/// datagrams both ways (one datagram == one circuit cell).
+async fn handle_udp_flow(identity: Arc<NodeIdentity>, flow: UdpFlow, circuit: Vec<Hop>) {
+    let target = format!("udp:{}", flow.dst);
+    let (sink, stream) = match open_circuit(&identity, &circuit, &target).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::debug!(%target, error = %e, "udp circuit open failed; dropping flow");
+            return;
+        }
+    };
+    let (mut incoming, reply) = flow.split();
+    // client → exit: each datagram becomes one forward cell.
+    let to_exit = async move {
+        let mut sink = sink;
+        while let Some(datagram) = incoming.recv().await {
+            if sink.send(&datagram).await.is_err() {
+                break;
+            }
+        }
+    };
+    // exit → client: each return cell becomes one datagram back to the client.
+    let to_client = async move {
+        let mut stream = stream;
+        while let Ok(datagram) = stream.recv().await {
+            reply.send(&datagram);
+        }
+    };
+    tokio::select! {
+        _ = to_exit => {}
+        _ = to_client => {}
     }
 }
 
@@ -296,7 +344,7 @@ mod tests {
         let circuit = vec![hop_of(&relay, &relay_addr), hop_of(&exit, &exit_addr)];
 
         // Stand up the netstack + the tunnel-stack driver.
-        let (net, outbound, conns) = NetStack::new();
+        let (net, outbound, conns, udp_conns) = NetStack::new();
         let (from_tun_tx, from_tun_rx) = mpsc::channel::<Vec<u8>>(256);
         let (to_tun_tx, mut to_tun_rx) = mpsc::channel::<Vec<u8>>(256);
         let picker: Arc<dyn CircuitPicker> = Arc::new(move || circuit.clone());
@@ -305,6 +353,7 @@ mod tests {
             net,
             outbound,
             conns,
+            udp_conns,
             from_tun_rx,
             to_tun_tx,
             picker,

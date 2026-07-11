@@ -12,4 +12,7 @@ mod device;
 mod stack;
 
 pub use device::MTU;
-pub use stack::{ConnReader, ConnWriter, Connection, Connections, NetStack, Outbound};
+pub use stack::{
+    ConnReader, ConnWriter, Connection, Connections, NetStack, Outbound, UdpConnections, UdpFlow,
+    UdpReply,
+};

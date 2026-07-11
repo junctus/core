@@ -163,7 +163,17 @@ impl NeoTunnelStackSession {
         witnesses_hex: Vec<String>,
         threshold: u32,
         hops: u32,
+        net_interface_index: u32,
     ) -> Result<NeoTunnelStackSession, NeoTunnelError> {
+        // Pin every circuit socket this stack opens to the physical interface, so
+        // per-flow relay connections made *after* the OS points the default route
+        // at our TUN bypass it instead of looping back in (which is why browsing
+        // failed once the tunnel was up). Process-wide, exactly like the relay's
+        // `--net-interface`. The one-time mirror fetch below runs before the TUN
+        // is the default route, so it doesn't need this. Index 0 = unscoped.
+        if net_interface_index != 0 {
+            neo_node::netif::set_bound_interface(net_interface_index);
+        }
         let identity = NodeIdentity::from_bytes(&secret).map_err(|_| NeoTunnelError::Identity)?;
 
         let mut witnesses = Vec::with_capacity(witnesses_hex.len());
@@ -190,7 +200,7 @@ impl NeoTunnelStackSession {
         }
 
         let picker: Arc<dyn CircuitPicker> = Arc::new(SnapshotPicker { relays, hops });
-        let (net, outbound, conns) = NetStack::new();
+        let (net, outbound, conns, udp_conns) = NetStack::new();
         let (to_stack_tx, to_stack_rx) = mpsc::channel(QUEUE_DEPTH);
         let (from_stack_tx, from_stack_rx) = mpsc::channel(QUEUE_DEPTH);
         let identity = Arc::new(identity);
@@ -200,6 +210,7 @@ impl NeoTunnelStackSession {
             net,
             outbound,
             conns,
+            udp_conns,
             to_stack_rx,
             from_stack_tx,
             picker,
@@ -290,9 +301,17 @@ pub fn tunnel_stack_connect(
     witnesses: Vec<String>,
     threshold: u32,
     hops: u32,
+    net_interface_index: u32,
 ) -> Result<std::sync::Arc<NeoTunnelStackSession>, NeoTunnelError> {
-    NeoTunnelStackSession::connect_inner(secret, mirrors, witnesses, threshold, hops)
-        .map(std::sync::Arc::new)
+    NeoTunnelStackSession::connect_inner(
+        secret,
+        mirrors,
+        witnesses,
+        threshold,
+        hops,
+        net_interface_index,
+    )
+    .map(std::sync::Arc::new)
 }
 
 #[cfg(test)]
