@@ -109,6 +109,13 @@ pub struct SeedConfig {
     /// leaves this `false` so an attacker cannot make the seed dial its own
     /// localhost services (SSRF).
     pub allow_loopback: bool,
+    /// Require a registration proof-of-work (M36) in the `X-Neo-Pow` header. A
+    /// coarse anti-flood measure; see [`neo_core::pow`]. When enabling this on a
+    /// live seed, roll out PoW-capable relays **first** — an older relay binary
+    /// sends no proof and would be refused.
+    pub require_registration_pow: bool,
+    /// Difficulty (leading zero bits) for the registration PoW when required.
+    pub registration_pow_bits: u32,
 }
 
 impl Default for SeedConfig {
@@ -124,6 +131,8 @@ impl Default for SeedConfig {
                 "::1".parse().expect("v6 loopback"),
             ],
             allow_loopback: false,
+            require_registration_pow: true,
+            registration_pow_bits: neo_core::pow::REGISTRATION_POW_BITS,
         }
     }
 }
@@ -148,6 +157,10 @@ struct AppState {
     trusted_proxies: Vec<IpAddr>,
     /// Whether dial-back may target loopback (dev/test).
     allow_loopback: bool,
+    /// Whether registration requires a valid `X-Neo-Pow` proof (M36).
+    require_registration_pow: bool,
+    /// Difficulty (leading zero bits) for the registration PoW.
+    registration_pow_bits: u32,
     /// Published committee descriptors (M28), stored as opaque bytes — the seed
     /// is a bulletin board here, not a trust root: a client parses and verifies
     /// each (its members are witness-attested relays; a bogus committee just
@@ -267,6 +280,8 @@ impl Seed {
             cooldown: config.register_cooldown,
             trusted_proxies: config.trusted_proxies.clone(),
             allow_loopback: config.allow_loopback,
+            require_registration_pow: config.require_registration_pow,
+            registration_pow_bits: config.registration_pow_bits,
             committees: RwLock::new(Vec::new()),
         });
         // Publish an initial (empty) signed snapshot immediately.
@@ -419,6 +434,29 @@ async fn post_register(
         Err(e) => return (StatusCode::BAD_REQUEST, format!("bad record: {e}\n")),
     };
 
+    // Registration proof-of-work (M36): a coarse anti-flood gate bound to the
+    // record's identity. Checked before the (cheap) key cooldown and the (more
+    // expensive) signature verification inside `admit`, so an unsolved flood is
+    // rejected early.
+    if state.require_registration_pow {
+        match parse_pow_header(&headers) {
+            Some(nonce)
+                if neo_core::pow::verify(&record.id, nonce, state.registration_pow_bits) => {}
+            Some(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "invalid registration proof-of-work\n".to_string(),
+                )
+            }
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "missing X-Neo-Pow registration proof-of-work\n".to_string(),
+                )
+            }
+        }
+    }
+
     // Per-key cooldown: bounds one identity's registration rate across IPs.
     if !state.check_and_stamp_key_cooldown(record.id) {
         return (StatusCode::TOO_MANY_REQUESTS, "slow down\n".to_string());
@@ -465,6 +503,11 @@ impl AppState {
         guard.retain(|_, last| now.duration_since(*last) < cooldown * 4);
         true
     }
+}
+
+/// Parse the `X-Neo-Pow` registration proof-of-work nonce (a decimal `u64`).
+fn parse_pow_header(headers: &HeaderMap) -> Option<u64> {
+    headers.get("x-neo-pow")?.to_str().ok()?.trim().parse().ok()
 }
 
 /// The client IP for rate-limiting. `X-Forwarded-For` is honored **only** when
@@ -547,6 +590,13 @@ mod tests {
     use neo_discovery::now_unix;
 
     fn test_state() -> Arc<AppState> {
+        test_state_with_pow(false, 0)
+    }
+
+    fn test_state_with_pow(
+        require_registration_pow: bool,
+        registration_pow_bits: u32,
+    ) -> Arc<AppState> {
         let state = Arc::new(AppState {
             registry: Mutex::new(Registry::new()),
             witness: NodeIdentity::generate().unwrap(),
@@ -557,6 +607,8 @@ mod tests {
             cooldown: Duration::from_secs(30),
             trusted_proxies: vec!["127.0.0.1".parse().unwrap()],
             allow_loopback: true,
+            require_registration_pow,
+            registration_pow_bits,
             committees: RwLock::new(Vec::new()),
         });
         state.resign_snapshot();
@@ -652,6 +704,75 @@ mod tests {
             .unwrap();
         let signed = SignedSnapshot::from_bytes(&bytes).unwrap();
         signed.verify(&[witness], 1, now_unix()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn registration_requires_valid_proof_of_work() {
+        // A low difficulty keeps the test fast while exercising the real gate.
+        let bits = 8;
+        let state = test_state_with_pow(true, bits);
+        let app = router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let base = format!("http://{addr}");
+        let client = reqwest::Client::new();
+
+        let relay = NodeIdentity::generate().unwrap();
+        let record = PeerRecord::build_signed(
+            &relay,
+            vec!["127.0.0.1:9000".into()],
+            true,
+            false,
+            now_unix() + 3600,
+            1,
+        )
+        .unwrap();
+
+        // Each POST uses a distinct forwarded IP (127.0.0.1 is a trusted proxy) so
+        // the per-IP cooldown doesn't mask the PoW gate under test.
+        // No proof → refused.
+        let resp = client
+            .post(format!("{base}/register"))
+            .header("x-forwarded-for", "10.0.0.1")
+            .body(record.to_bytes())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "registration without PoW is refused");
+
+        // A deterministically wrong nonce → refused.
+        let bad = (0..)
+            .find(|&n| !neo_core::pow::verify(&relay.id(), n, bits))
+            .unwrap();
+        let resp = client
+            .post(format!("{base}/register"))
+            .header("x-forwarded-for", "10.0.0.2")
+            .header("x-neo-pow", bad.to_string())
+            .body(record.to_bytes())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "an invalid PoW nonce is refused");
+
+        // A valid proof → accepted.
+        let nonce = neo_core::pow::solve(&relay.id(), bits).unwrap();
+        let resp = client
+            .post(format!("{base}/register"))
+            .header("x-forwarded-for", "10.0.0.3")
+            .header("x-neo-pow", nonce.to_string())
+            .body(record.to_bytes())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 202, "a valid PoW registers the relay");
     }
 
     #[test]

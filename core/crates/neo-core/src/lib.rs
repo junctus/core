@@ -12,6 +12,7 @@ pub mod config;
 pub mod error;
 pub mod identity;
 pub mod net;
+pub mod pow;
 
 pub use config::{NodeConfig, PrivacyLevel};
 pub use error::{Error, Result};

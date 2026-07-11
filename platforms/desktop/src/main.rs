@@ -102,6 +102,11 @@ enum Command {
         /// localhost services (SSRF).
         #[arg(long, default_value_t = false)]
         allow_loopback: bool,
+        /// Disable the registration proof-of-work gate (M36). PoW is required by
+        /// default; pass this during a rollout while relays still run a binary
+        /// that doesn't send `X-Neo-Pow`, then drop it once they're updated.
+        #[arg(long, default_value_t = false)]
+        no_registration_pow: bool,
     },
     /// Fetch, verify, and print the current relay snapshot (diagnostics).
     Snapshot {
@@ -297,6 +302,7 @@ async fn main() -> anyhow::Result<()> {
             snapshot_interval,
             register_cooldown,
             allow_loopback,
+            no_registration_pow,
         } => {
             run_seed(
                 &bind,
@@ -305,6 +311,7 @@ async fn main() -> anyhow::Result<()> {
                 snapshot_interval,
                 register_cooldown,
                 allow_loopback,
+                !no_registration_pow,
             )
             .await?
         }
@@ -511,6 +518,7 @@ async fn run_seed(
     snapshot_interval: u64,
     register_cooldown: u64,
     allow_loopback: bool,
+    require_registration_pow: bool,
 ) -> anyhow::Result<()> {
     use std::time::Duration;
 
@@ -528,6 +536,7 @@ async fn run_seed(
         snapshot_interval: Duration::from_secs(snapshot_interval.max(1)),
         register_cooldown: Duration::from_secs(register_cooldown),
         allow_loopback,
+        require_registration_pow,
         ..SeedConfig::default()
     };
     let seed = Seed::new(witness, prober, config);

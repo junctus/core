@@ -245,10 +245,21 @@ fn write_cache(snapshot: &SignedSnapshot) -> Result<()> {
 pub async fn register_with_seeds(cfg: &DiscoveryConfig, record: &PeerRecord) -> Result<usize> {
     let client = http_client()?;
     let body = record.to_bytes();
+    // Solve the registration proof-of-work once (M36), bound to this identity and
+    // reused across every mirror. A one-off ~1M-hash cost (sub-second); a seed that
+    // does not require PoW simply ignores the header.
+    let pow = neo_core::pow::solve(&record.id, neo_core::pow::REGISTRATION_POW_BITS)
+        .context("solving the registration proof-of-work")?;
     let mut accepted = 0;
     for mirror in &cfg.mirrors {
         let url = format!("{mirror}/register");
-        match client.post(&url).body(body.clone()).send().await {
+        match client
+            .post(&url)
+            .header("x-neo-pow", pow.to_string())
+            .body(body.clone())
+            .send()
+            .await
+        {
             Ok(resp) if resp.status().is_success() => {
                 tracing::info!(mirror = %mirror, status = %resp.status(), "registered with seed");
                 accepted += 1;
