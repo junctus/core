@@ -1,0 +1,41 @@
+[Unit]
+Description=neo relay/exit node
+Documentation=https://github.com/  (neo docs/DISCOVERY.md)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=neo-relay
+Group=neo-relay
+# Forwards onion traffic (and, with --exit, egresses to the clearnet). Registers
+# with the baked-in discovery seeds and re-registers on a heartbeat. The node
+# identity persists in /var/lib/neo-relay so the relay keeps a stable id (and
+# thus its attested listing) across restarts. install.sh patches the placeholders.
+ExecStart=/usr/local/bin/neo run --relay __EXIT__ --listen __BIND__ --announce-addr __ANNOUNCE_ADDR__ --identity /var/lib/neo-relay/relay.key
+Restart=always
+RestartSec=5
+
+# Bind a low port (e.g. :443) as a non-root service without full privileges.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# Sandbox: a relay/exit needs outbound TCP but no local state beyond its identity.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ReadWritePaths=/var/lib/neo-relay
+LimitNOFILE=65536
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target
