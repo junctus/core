@@ -520,6 +520,10 @@ impl Discovery for LocalRegistry {
         for i in (1..relays.len()).rev() {
             relays.swap(i, rand_below(i + 1)?);
         }
+        // Front-load subnet-distinct relays so a caller taking the first `n` gets a
+        // subnet-diverse sample rather than several relays from one operator (M36).
+        let mut relays =
+            neo_core::net::prioritize_distinct_subnets(relays, PeerRecord::subnet_keys);
         relays.truncate(n);
         Ok(relays)
     }

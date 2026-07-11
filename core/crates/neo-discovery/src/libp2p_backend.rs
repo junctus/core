@@ -412,6 +412,13 @@ async fn event_loop(mut node: Libp2pNode, mut commands: mpsc::Receiver<Command>)
                                 relays.swap(i, j);
                             }
                         }
+                        // Front-load subnet-distinct relays before truncating so the
+                        // sample spans operators, not just addresses — a Sybil with
+                        // many relays in one /24 gets only one into the front (M36).
+                        let mut relays = neo_core::net::prioritize_distinct_subnets(
+                            relays,
+                            PeerRecord::subnet_keys,
+                        );
                         relays.truncate(take);
                         let _ = reply.send(relays);
                     }

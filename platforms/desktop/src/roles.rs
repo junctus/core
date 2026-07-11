@@ -323,9 +323,10 @@ pub async fn run_send(
     Ok(())
 }
 
-/// Pick `hops` distinct relays at random and turn them into a circuit.
+/// Pick `hops` distinct relays at random and turn them into a circuit, preferring
+/// hops in distinct subnets (M36) so one operator can't own the whole path.
 fn pick_circuit(relays: &[&PeerRecord], hops: usize) -> Result<Vec<Hop>> {
-    // Fisher–Yates over indices, then take the first `hops`.
+    // Fisher–Yates over indices ...
     let mut idx: Vec<usize> = (0..relays.len()).collect();
     for i in (1..idx.len()).rev() {
         let mut b = [0u8; 8];
@@ -333,6 +334,9 @@ fn pick_circuit(relays: &[&PeerRecord], hops: usize) -> Result<Vec<Hop>> {
         let j = (u64::from_le_bytes(b) % (i as u64 + 1)) as usize;
         idx.swap(i, j);
     }
+    // ... then front-load subnet-distinct hops so the first `hops` span as many
+    // /24s as the relay set allows (best-effort; falls back to repeats otherwise).
+    let idx = neo_core::net::prioritize_distinct_subnets(idx, |&i| relays[i].subnet_keys());
     idx.into_iter()
         .take(hops)
         .map(|i| {

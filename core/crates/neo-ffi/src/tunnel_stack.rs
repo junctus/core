@@ -75,8 +75,26 @@ fn pick_circuit_inner(relays: &[PeerRecord], hops: usize) -> Option<Vec<Hop>> {
         let j = rand_index(i + 1)?;
         rest.swap(i, j);
     }
-    let order = rest
+    // Prefer middle hops in subnets distinct from each other AND from the exit
+    // (M36): put the exit first so its /24 is already "used", reorder to front-load
+    // distinct subnets, then peel the exit back to the tail. Best-effort — a small
+    // relay set still yields a full circuit.
+    let subnet_of = |&i: &usize| -> Vec<neo_core::net::SubnetKey> {
+        relays[i]
+            .addrs
+            .first()
+            .and_then(|a| neo_core::net::SubnetKey::from_addr(a))
+            .into_iter()
+            .collect()
+    };
+    let mut with_exit = Vec::with_capacity(rest.len() + 1);
+    with_exit.push(exit_idx);
+    with_exit.extend(rest);
+    let diverse = neo_core::net::prioritize_distinct_subnets(with_exit, subnet_of);
+    // `diverse[0]` is the exit (it led the input and is always kept in front).
+    let order = diverse
         .into_iter()
+        .skip(1)
         .take(hops - 1)
         .chain(std::iter::once(exit_idx)); // exit last
 
@@ -333,6 +351,36 @@ mod tests {
 
     fn make_relay(port: u16) -> PeerRecord {
         make_relay_flagged(port, false)
+    }
+
+    fn make_relay_at(addr: &str, exit: bool) -> PeerRecord {
+        let id = NodeIdentity::generate().unwrap();
+        PeerRecord::build_signed(&id, vec![addr.into()], true, exit, now_unix() + 3600, 1).unwrap()
+    }
+
+    #[test]
+    fn pick_circuit_prefers_distinct_subnets() {
+        // Three relays in distinct /24s plus an exit in its own /24. Every 3-hop
+        // pick should span three distinct subnets (M36), exit still last.
+        let relays = vec![
+            make_relay_at("1.1.1.1:9000", false),
+            make_relay_at("2.2.2.1:9000", false),
+            make_relay_at("3.3.3.1:9000", false),
+            make_relay_at("4.4.4.1:9000", true),
+        ];
+        for _ in 0..40 {
+            let circuit = pick_circuit(&relays, 3);
+            assert_eq!(circuit.len(), 3);
+            assert!(
+                circuit.last().unwrap().addr.starts_with("4.4.4."),
+                "exit last"
+            );
+            let subs: std::collections::HashSet<_> = circuit
+                .iter()
+                .filter_map(|h| neo_core::net::SubnetKey::from_addr(&h.addr))
+                .collect();
+            assert_eq!(subs.len(), 3, "hops span three distinct subnets");
+        }
     }
 
     #[test]
