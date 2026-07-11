@@ -58,16 +58,6 @@ const TCP_CHUNK: usize = 8 * 1024;
 /// cell (a whole IPv4 UDP datagram fits; DNS answers are far smaller).
 const UDP_DATAGRAM_MAX: usize = 65_535;
 
-/// Forward endpoint-payload kinds (its first byte). A **cover** cell carries no
-/// application data — the exit drops it — but is byte-for-byte a normal cell on
-/// the wire, so the client can pad its outbound stream for timing/volume mixing
-/// (`neo_mix`). Real cells carry `[REAL][data]`, cover cells `[COVER][pad]`.
-const CELL_REAL: u8 = 0;
-const CELL_COVER: u8 = 1;
-/// Padding a cover cell carries. Exact length hiding is the transport's job
-/// (`neo-transport` bucketing); this just gives a cover cell plausible bulk.
-const COVER_PAD: usize = 256;
-
 fn fwd_key(secret: &[u8; 32]) -> [u8; 32] {
     blake3::derive_key("neo-circuit-fwd-v1", secret)
 }
@@ -127,30 +117,15 @@ pub struct CircuitStream {
 }
 
 impl CircuitSink {
-    /// Send one application cell (real data) to the exit through the circuit.
+    /// Send one application cell to the exit through the circuit.
     pub async fn send(&mut self, data: &[u8]) -> Result<()> {
-        self.send_tagged(CELL_REAL, data).await
-    }
-
-    /// Send a **cover** cell: indistinguishable from a real cell on the wire, but
-    /// the exit discards it. Lets the client pad its outbound timing and volume
-    /// (the mixing/cover-traffic dial — see `neo_mix`).
-    pub async fn send_cover(&mut self) -> Result<()> {
-        self.send_tagged(CELL_COVER, &[0u8; COVER_PAD]).await
-    }
-
-    async fn send_tagged(&mut self, kind: u8, data: &[u8]) -> Result<()> {
         let seq = self.seq;
         self.seq += 1;
         let exit_secret = self.secrets.last().expect("non-empty circuit");
-        // Endpoint payload is [kind][data]; the e2e MAC covers it, then onion-layer
-        // the [MAC][kind][data] body, hop 0 outermost.
-        let mut tagged = Vec::with_capacity(1 + data.len());
-        tagged.push(kind);
-        tagged.extend_from_slice(data);
-        let mut body = Vec::with_capacity(CELL_MAC_LEN + tagged.len());
-        body.extend_from_slice(&cell_mac(&fwd_mac_key(exit_secret), seq, &tagged));
-        body.extend_from_slice(&tagged);
+        // Endpoint body: [e2e MAC][payload], then onion-layer it, hop 0 outermost.
+        let mut body = Vec::with_capacity(CELL_MAC_LEN + data.len());
+        body.extend_from_slice(&cell_mac(&fwd_mac_key(exit_secret), seq, data));
+        body.extend_from_slice(data);
         for secret in self.secrets.iter().rev() {
             xor_cell(&mut body, &fwd_key(secret), seq);
         }
@@ -159,6 +134,15 @@ impl CircuitSink {
         cell.extend_from_slice(&body);
         let framed = self.sealer.seal(&cell)?;
         write_frame(&mut self.w, &framed).await
+    }
+
+    /// Send a **cover** cell: a zero-length cell. It rides the wire like any other
+    /// cell (so it fills timing gaps — the cover-traffic dial), but carries no
+    /// application bytes, so the exit writes nothing to the target. Zero-length is
+    /// what keeps cover **wire-compatible with every exit**: an exit that doesn't
+    /// special-case cover just writes an empty payload (a no-op) and advances.
+    pub async fn send_cover(&mut self) -> Result<()> {
+        self.send(&[]).await
     }
 }
 
@@ -433,16 +417,11 @@ async fn exit_splice(
             next_seq += 1;
             let mut body = cell[SEQ_LEN..].to_vec();
             xor_cell(&mut body, &fk, seq);
-            let (mac, tagged) = body.split_at(CELL_MAC_LEN);
-            if !ct_eq(mac, &cell_mac(&fmk, seq, tagged)) {
+            let (mac, payload) = body.split_at(CELL_MAC_LEN);
+            if !ct_eq(mac, &cell_mac(&fmk, seq, payload)) {
                 return Err(Error::Crypto("forward cell failed integrity check".into()));
             }
-            let Some((&kind, payload)) = tagged.split_first() else {
-                return Err(Error::Decode("empty forward cell".into()));
-            };
-            if kind == CELL_COVER {
-                continue; // cover padding: authenticated, then dropped
-            }
+            // A zero-length payload is a cover cell: authenticated, writes nothing.
             if tw.write_all(payload).await.is_err() {
                 break;
             }
@@ -535,15 +514,13 @@ async fn exit_splice_udp(
             next_seq += 1;
             let mut body = cell[SEQ_LEN..].to_vec();
             xor_cell(&mut body, &fk, seq);
-            let (mac, tagged) = body.split_at(CELL_MAC_LEN);
-            if !ct_eq(mac, &cell_mac(&fmk, seq, tagged)) {
+            let (mac, payload) = body.split_at(CELL_MAC_LEN);
+            if !ct_eq(mac, &cell_mac(&fmk, seq, payload)) {
                 return Err(Error::Crypto("forward cell failed integrity check".into()));
             }
-            let Some((&kind, payload)) = tagged.split_first() else {
-                return Err(Error::Decode("empty forward cell".into()));
-            };
-            if kind == CELL_COVER {
-                continue; // cover padding: authenticated, then dropped
+            // A zero-length payload is a cover cell — don't relay an empty datagram.
+            if payload.is_empty() {
+                continue;
             }
             if send_udp.send(payload).await.is_err() {
                 break;
@@ -742,9 +719,10 @@ mod tests {
         let circuit = vec![hop_of(&relay, &relay_addr), hop_of(&exit, &exit_addr)];
         let (mut sink, mut stream) = open_circuit(&client, &circuit, &echo_addr).await.unwrap();
 
-        // Interleave cover cells with real data. The exit authenticates every cell
-        // (seq is strict) but must drop the cover ones, so the echo returns only
-        // the real bytes, in order.
+        // Interleave cover cells with real data. Cover cells are zero-length, so
+        // the exit authenticates every cell (seq is strict) and writes an empty
+        // payload for the cover ones — the echo returns only the real bytes, in
+        // order, and the cover cells are wire-compatible with any exit.
         sink.send(b"hello ").await.unwrap();
         sink.send_cover().await.unwrap();
         sink.send(b"brave ").await.unwrap();

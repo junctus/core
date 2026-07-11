@@ -58,7 +58,11 @@ fn pick_circuit(relays: &[PeerRecord], hops: usize) -> Vec<Hop> {
 }
 
 fn pick_circuit_inner(relays: &[PeerRecord], hops: usize) -> Option<Vec<Hop>> {
-    if hops == 0 || relays.len() < hops {
+    // Build the longest circuit the network supports, up to the requested hops:
+    // a small relay set (fewer relays than the level asks for) still yields a
+    // working, shorter circuit rather than dropping every flow.
+    let hops = hops.min(relays.len());
+    if hops == 0 {
         return None;
     }
     // The terminal hop egresses to the clearnet, so it must be an exit.
@@ -209,18 +213,24 @@ impl NeoTunnelStackSession {
         // circuit length (neo_mix::MixParams::for_level: off=1, balanced=3, paranoid=5).
         let level: neo_core::PrivacyLevel = privacy.into();
         let mix = neo_mix::MixParams::for_level(level);
-        let hops = mix.hops.max(1);
+        let target_hops = mix.hops.max(1);
 
         let rt = runtime();
         let relays = rt.block_on(fetch_relays(&mirrors, &witnesses, threshold as usize))?;
         let relay_count = relays.len() as u32;
-        if relays.len() < hops {
+        // Need at least one exit relay to reach the clearnet; otherwise every flow
+        // would be dropped. Surface that as a clear connect failure.
+        if !relays.iter().any(|r| r.exit) {
             return Err(NeoTunnelError::Discovery {
                 message: format!(
-                    "need {hops} relays for a {level:?} circuit, the snapshot has {relay_count}"
+                    "no exit relay in the snapshot ({relay_count} relays) — cannot reach the clearnet"
                 ),
             });
         }
+        // Build the longest circuit the network supports, up to the level's target,
+        // so a small relay set still connects (at reduced hops) rather than dropping
+        // every flow. pick_circuit clamps per-flow too; this keeps them consistent.
+        let hops = target_hops.min(relays.len());
 
         let picker: Arc<dyn CircuitPicker> = Arc::new(SnapshotPicker { relays, hops });
         let (net, outbound, conns, udp_conns) = NetStack::new();
@@ -428,8 +438,9 @@ mod tests {
             "no exit → flow dropped"
         );
 
-        // Too many hops or zero → dropped.
-        assert!(pick_circuit(&relays, 9).is_empty());
+        // More hops than the network has clamps to the relay count (build the
+        // longest circuit available); zero hops still yields nothing.
+        assert_eq!(pick_circuit(&relays, 9).len(), relays.len());
         assert!(pick_circuit(&relays, 0).is_empty());
     }
 
