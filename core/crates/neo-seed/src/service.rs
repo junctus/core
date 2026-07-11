@@ -799,8 +799,8 @@ mod tests {
             let mut reg = state.registry.lock().unwrap();
             reg.admit(mk(&a, 1)).unwrap();
             reg.admit(mk(&b, 1)).unwrap();
-            reg.record_health(&a.id(), true);
-            reg.record_health(&b.id(), true);
+            reg.record_health(&a.id(), Some("127.0.0.1:9000".into()));
+            reg.record_health(&b.id(), Some("127.0.0.1:9000".into()));
         }
         state.resign_snapshot();
 
@@ -823,9 +823,9 @@ mod tests {
         {
             let mut reg = state.registry.lock().unwrap();
             reg.admit(mk(&c, 1)).unwrap();
-            reg.record_health(&c.id(), true);
+            reg.record_health(&c.id(), Some("127.0.0.1:9000".into()));
             for _ in 0..crate::registry::MAX_STRIKES {
-                reg.record_health(&a.id(), false);
+                reg.record_health(&a.id(), None);
             }
         }
         state.resign_snapshot();

@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 
+use neo_core::net::SubnetKey;
 use neo_core::{NodeId, NodeIdentity, Result};
 use neo_discovery::snapshot::{SignedSnapshot, Snapshot};
 use neo_discovery::{now_unix, PeerRecord};
@@ -38,6 +39,15 @@ struct Entry {
     healthy: bool,
     /// Consecutive failed checks; at [`MAX_STRIKES`] the entry is dropped.
     strikes: u32,
+    /// The advertised address the last dial-back actually verified. Only this
+    /// address is *proven* to belong to the operator, so only **its** subnet may
+    /// count toward the per-subnet cap — a record can pad `addrs` with IPs in a
+    /// victim's /24 it does not control, and those must never be counted (M36).
+    verified_addr: Option<String>,
+    /// When this identity was first admitted (unix seconds). The per-subnet cap
+    /// keeps the earliest-registered relays, so a freshly-ground low node-id can't
+    /// displace an established incumbent that shares its subnet.
+    registered_at: u64,
 }
 
 /// A verified, health-tracked set of relay records.
@@ -83,12 +93,21 @@ impl Registry {
             Some(existing) if existing.record.seq >= record.seq => Ok(false),
             Some(existing) => {
                 let healthy = existing.healthy;
+                let registered_at = existing.registered_at;
+                // Keep the verified address only if the refreshed record still
+                // advertises it; otherwise it must be re-proven by a dial-back.
+                let verified_addr = existing
+                    .verified_addr
+                    .clone()
+                    .filter(|a| record.addrs.contains(a));
                 self.entries.insert(
                     record.id,
                     Entry {
                         record,
                         healthy,
                         strikes: 0,
+                        verified_addr,
+                        registered_at,
                     },
                 );
                 Ok(true)
@@ -105,6 +124,8 @@ impl Registry {
                         record,
                         healthy: false,
                         strikes: 0,
+                        verified_addr: None,
+                        registered_at: now_unix(),
                     },
                 );
                 Ok(true)
@@ -124,19 +145,24 @@ impl Registry {
             .collect()
     }
 
-    /// Record the outcome of a health check. A success clears strikes and
-    /// marks the relay attestable; [`MAX_STRIKES`] consecutive failures evict
-    /// it entirely.
-    pub fn record_health(&mut self, id: &NodeId, ok: bool) {
+    /// Record the outcome of a health check. `verified_addr` is the address the
+    /// dial-back actually completed a handshake against (`Some`) or `None` on
+    /// failure. A success clears strikes, marks the relay attestable, and records
+    /// the proven address; [`MAX_STRIKES`] consecutive failures evict it entirely.
+    pub fn record_health(&mut self, id: &NodeId, verified_addr: Option<String>) {
         if let Some(entry) = self.entries.get_mut(id) {
-            if ok {
-                entry.healthy = true;
-                entry.strikes = 0;
-            } else {
-                entry.healthy = false;
-                entry.strikes += 1;
-                if entry.strikes >= MAX_STRIKES {
-                    self.entries.remove(id);
+            match verified_addr {
+                Some(addr) => {
+                    entry.healthy = true;
+                    entry.strikes = 0;
+                    entry.verified_addr = Some(addr);
+                }
+                None => {
+                    entry.healthy = false;
+                    entry.strikes += 1;
+                    if entry.strikes >= MAX_STRIKES {
+                        self.entries.remove(id);
+                    }
                 }
             }
         }
@@ -153,16 +179,48 @@ impl Registry {
     /// HashMap iteration order) so a snapshot re-signs to byte-identical bodies
     /// across restarts, and so a client reconstructing a set from a diff and the
     /// seed that signed it agree on the exact bytes the witnesses signed.
+    ///
+    /// Applies the per-subnet Sybil cap (M36): at most [`MAX_ATTESTED_PER_SUBNET`]
+    /// relays per public subnet. The cap counts a relay against **only the subnet
+    /// of the address its dial-back verified** — never an unverified advertised
+    /// address, which a record could set to a victim's /24 to evict honest relays
+    /// there. Cap slots go to the earliest-registered relays, so a freshly-ground
+    /// low node-id can't displace an established incumbent sharing its subnet.
     pub fn attestable(&self) -> Vec<PeerRecord> {
         let now = now_unix();
-        let mut relays: Vec<PeerRecord> = self
+        let mut healthy: Vec<(u64, PeerRecord, Option<SubnetKey>)> = self
             .entries
             .values()
             .filter(|e| e.healthy && !e.record.is_expired(now))
-            .map(|e| e.record.clone())
+            .map(|e| (e.registered_at, e.record.clone(), verified_subnet(e)))
             .collect();
-        relays.sort_unstable_by(|a, b| a.id.as_bytes().cmp(b.id.as_bytes()));
-        cap_per_subnet(relays)
+        // Process oldest-first (id as a stable tiebreak) so incumbents keep the
+        // scarce per-subnet slots.
+        healthy.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| a.1.id.as_bytes().cmp(b.1.id.as_bytes()))
+        });
+        let mut per_subnet: HashMap<SubnetKey, usize> = HashMap::new();
+        let mut kept: Vec<PeerRecord> = healthy
+            .into_iter()
+            .filter_map(|(_, record, subnet)| match subnet {
+                // No verified *public* subnet (loopback/dev, or not yet re-verified
+                // after an address change) → not counted against any subnet.
+                None => Some(record),
+                Some(s) => {
+                    let count = per_subnet.entry(s).or_insert(0);
+                    if *count >= MAX_ATTESTED_PER_SUBNET {
+                        None
+                    } else {
+                        *count += 1;
+                        Some(record)
+                    }
+                }
+            })
+            .collect();
+        // Canonical ascending-id order for deterministic snapshot bytes.
+        kept.sort_unstable_by(|a, b| a.id.as_bytes().cmp(b.id.as_bytes()));
+        kept
     }
 
     /// Build a snapshot of the attestable relays and sign it as `witness`.
@@ -181,48 +239,18 @@ impl Registry {
     }
 }
 
-/// Keep at most [`MAX_ATTESTED_PER_SUBNET`] relays per public subnet, preserving
-/// input order (so the canonical ascending-id order is retained and the kept
-/// relays are deterministic). A relay is dropped if *any* of its public subnets is
-/// already full — so a multi-homed record can't slip a full subnet past the cap by
-/// also advertising a spare one. Records with no public subnet (loopback / internal
-/// dev addresses) are never capped: they can't be dial-back-attested in production
-/// anyway, and collapsing them into one bucket would break local multi-relay tests.
-fn cap_per_subnet(relays: Vec<PeerRecord>) -> Vec<PeerRecord> {
-    let mut per_subnet: HashMap<neo_core::net::SubnetKey, usize> = HashMap::new();
-    relays
-        .into_iter()
-        .filter(|r| {
-            let subnets = public_subnets(r);
-            if subnets.is_empty() {
-                return true;
-            }
-            if subnets
-                .iter()
-                .any(|s| per_subnet.get(s).copied().unwrap_or(0) >= MAX_ATTESTED_PER_SUBNET)
-            {
-                return false;
-            }
-            for s in subnets {
-                *per_subnet.entry(s).or_insert(0) += 1;
-            }
-            true
-        })
-        .collect()
-}
-
-/// The distinct **public** subnets a record advertises (internal / loopback
-/// addresses excluded from the Sybil cap). Deduped so a record advertising two
-/// addresses in one /24 counts that subnet once.
-fn public_subnets(record: &PeerRecord) -> Vec<neo_core::net::SubnetKey> {
-    let mut seen = std::collections::HashSet::new();
-    record
-        .addrs
-        .iter()
-        .filter(|a| neo_core::net::is_safe_dial_target(a, false))
-        .filter_map(|a| neo_core::net::SubnetKey::from_addr(a))
-        .filter(|k| seen.insert(*k))
-        .collect()
+/// The subnet an entry counts against for the per-subnet cap: the subnet of the
+/// address its dial-back **verified**, or `None` if that address is not a public
+/// IP literal (loopback / internal dev addresses are exempt) or nothing has been
+/// verified yet. Crucially this is *not* derived from all advertised addresses —
+/// only the proven one — so a record can't pad its `addrs` with a victim's /24 to
+/// consume that subnet's cap slots (M36, review finding C1).
+fn verified_subnet(entry: &Entry) -> Option<SubnetKey> {
+    let addr = entry.verified_addr.as_ref()?;
+    if !neo_core::net::is_safe_dial_target(addr, false) {
+        return None;
+    }
+    SubnetKey::from_addr(addr)
 }
 
 #[cfg(test)]
@@ -261,7 +289,7 @@ mod tests {
 
         // Not attestable until a health check passes.
         assert!(reg.attestable().is_empty());
-        reg.record_health(&id.id(), true);
+        reg.record_health(&id.id(), Some("127.0.0.1:9000".into()));
         assert_eq!(reg.attestable().len(), 1);
     }
 
@@ -284,7 +312,7 @@ mod tests {
         let mut reg = Registry::new();
         let id = NodeIdentity::generate().unwrap();
         reg.admit(relay_record(&id, 1)).unwrap();
-        reg.record_health(&id.id(), true);
+        reg.record_health(&id.id(), Some("127.0.0.1:9000".into()));
 
         // A refresh (higher seq) keeps the relay attestable, no health gap.
         assert!(reg.admit(relay_record(&id, 2)).unwrap());
@@ -299,10 +327,10 @@ mod tests {
         let mut reg = Registry::new();
         let id = NodeIdentity::generate().unwrap();
         reg.admit(relay_record(&id, 1)).unwrap();
-        reg.record_health(&id.id(), true);
+        reg.record_health(&id.id(), Some("127.0.0.1:9000".into()));
 
         for _ in 0..MAX_STRIKES {
-            reg.record_health(&id.id(), false);
+            reg.record_health(&id.id(), None);
         }
         assert!(reg.is_empty(), "relay should be evicted after max strikes");
     }
@@ -314,7 +342,7 @@ mod tests {
         let unchecked = NodeIdentity::generate().unwrap();
         reg.admit(relay_record(&healthy, 1)).unwrap();
         reg.admit(relay_record(&unchecked, 1)).unwrap();
-        reg.record_health(&healthy.id(), true);
+        reg.record_health(&healthy.id(), Some("127.0.0.1:9000".into()));
 
         let witness = NodeIdentity::generate().unwrap();
         let signed = reg.sign_snapshot(&witness);
@@ -332,13 +360,13 @@ mod tests {
             let id = NodeIdentity::generate().unwrap();
             reg.admit(relay_record_at(&id, &format!("{host}:443"), 1))
                 .unwrap();
-            reg.record_health(&id.id(), true);
+            reg.record_health(&id.id(), Some(format!("{host}:443")));
         }
         // ... plus one in a different /24.
         let other = NodeIdentity::generate().unwrap();
         reg.admit(relay_record_at(&other, "9.9.9.7:443", 1))
             .unwrap();
-        reg.record_health(&other.id(), true);
+        reg.record_health(&other.id(), Some("9.9.9.7:443".into()));
 
         let attested = reg.attestable();
         // Only MAX_ATTESTED_PER_SUBNET from the flooded /24, plus the lone relay.
@@ -352,6 +380,48 @@ mod tests {
     }
 
     #[test]
+    fn padding_addrs_with_a_victim_subnet_cannot_evict_honest_relays() {
+        // Review finding C1: the cap must count only the dial-back-*verified*
+        // address, never an unverified advertised one — else an attacker fills a
+        // victim /24's cap slots by naming IPs it doesn't control.
+        let mut reg = Registry::new();
+        // Two honest relays fill the victim /24 (to the cap), each verified at its
+        // own address.
+        for host in ["45.33.32.10", "45.33.32.11"] {
+            let id = NodeIdentity::generate().unwrap();
+            reg.admit(relay_record_at(&id, &format!("{host}:443"), 1))
+                .unwrap();
+            reg.record_health(&id.id(), Some(format!("{host}:443")));
+        }
+        // An attacker advertises its real address PLUS two IPs in the victim /24 it
+        // does not control; only its real address answers the dial-back.
+        let attacker = NodeIdentity::generate().unwrap();
+        let padded = PeerRecord::build_signed(
+            &attacker,
+            vec![
+                "9.9.9.9:443".into(),
+                "45.33.32.20:443".into(),
+                "45.33.32.21:443".into(),
+            ],
+            true,
+            false,
+            now_unix() + 3600,
+            1,
+        )
+        .unwrap();
+        reg.admit(padded).unwrap();
+        reg.record_health(&attacker.id(), Some("9.9.9.9:443".into()));
+
+        let attested = reg.attestable();
+        // Both honest relays survive — the padding consumed no victim-/24 slots —
+        // and the attacker attests only in its own /24.
+        assert!(attested.iter().any(|r| r.addrs[0] == "45.33.32.10:443"));
+        assert!(attested.iter().any(|r| r.addrs[0] == "45.33.32.11:443"));
+        assert!(attested.iter().any(|r| r.addrs[0] == "9.9.9.9:443"));
+        assert_eq!(attested.len(), 3);
+    }
+
+    #[test]
     fn loopback_relays_are_exempt_from_the_subnet_cap() {
         // All test relays share 127.0.0.0/24 but must not be capped — loopback is
         // never a real public subnet and would break local multi-relay setups.
@@ -359,7 +429,7 @@ mod tests {
         for _ in 0..MAX_ATTESTED_PER_SUBNET + 2 {
             let id = NodeIdentity::generate().unwrap();
             reg.admit(relay_record(&id, 1)).unwrap();
-            reg.record_health(&id.id(), true);
+            reg.record_health(&id.id(), Some("127.0.0.1:9000".into()));
         }
         assert_eq!(reg.attestable().len(), MAX_ATTESTED_PER_SUBNET + 2);
     }

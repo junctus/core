@@ -123,6 +123,44 @@ where
     first
 }
 
+/// Cluster `items` so all items sharing a subnet are **contiguous** (M36), for the
+/// k-of-n disjoint-path case where the goal is the *opposite* of
+/// [`prioritize_distinct_subnets`]: minimize how many subnets straddle more than
+/// one path.
+///
+/// When the result is sliced into fixed-size paths (`chunks(hops)`), grouping keeps
+/// each subnet's relays together so a subnet tends to land inside a **single**
+/// path. That matters because each disjoint path carries one share of a sliced
+/// flow: an operator appearing in two paths sees two shares (correlation), whereas
+/// an operator appearing twice *within one path* still sees only that path's one
+/// share. Front-loading distinct subnets instead (or round-robin dealing) would
+/// spread each subnet *across* paths — exactly the leak to avoid.
+///
+/// Subnet first-appearance order (and within-subnet order) is preserved, so a
+/// shuffled input stays randomized. Items with no IP-literal subnet each form their
+/// own singleton group — they are never merged with one another.
+pub fn group_by_subnet<T, F>(items: Vec<T>, subnet_of: F) -> Vec<T>
+where
+    F: Fn(&T) -> Vec<SubnetKey>,
+{
+    let mut buckets: Vec<Vec<T>> = Vec::new();
+    let mut index: std::collections::HashMap<SubnetKey, usize> = std::collections::HashMap::new();
+    for item in items {
+        match subnet_of(&item).first().copied() {
+            Some(key) => {
+                if let Some(&i) = index.get(&key) {
+                    buckets[i].push(item);
+                } else {
+                    index.insert(key, buckets.len());
+                    buckets.push(vec![item]);
+                }
+            }
+            None => buckets.push(vec![item]),
+        }
+    }
+    buckets.into_iter().flatten().collect()
+}
+
 fn is_cgnat(v4: &Ipv4Addr) -> bool {
     // 100.64.0.0/10 carrier-grade NAT.
     let o = v4.octets();
@@ -220,5 +258,41 @@ mod tests {
         let out = prioritize_distinct_subnets(items.clone(), sub);
         assert_eq!(out.len(), 3);
         assert_eq!(out[0], "7.7.7.1:443"); // first of the subnet kept in front
+    }
+
+    #[test]
+    fn group_by_subnet_clusters_and_confines_subnets_to_one_chunk() {
+        let sub = |a: &&str| SubnetKey::from_addr(a).into_iter().collect::<Vec<_>>();
+        // Two relays each in three /24s, interleaved on input.
+        let items = vec![
+            "1.1.1.1:443",
+            "2.2.2.1:443",
+            "3.3.3.1:443",
+            "1.1.1.2:443",
+            "2.2.2.2:443",
+            "3.3.3.2:443",
+        ];
+        let out = group_by_subnet(items.clone(), sub);
+        assert_eq!(out.len(), 6, "nothing dropped");
+        // Same-subnet items are now contiguous.
+        assert_eq!(&out[0..2], &["1.1.1.1:443", "1.1.1.2:443"]);
+        assert_eq!(&out[2..4], &["2.2.2.1:443", "2.2.2.2:443"]);
+        assert_eq!(&out[4..6], &["3.3.3.1:443", "3.3.3.2:443"]);
+        // Cut into two 3-hop paths: with 3 subnets for 6 hops one subnet must
+        // straddle the cut, but grouping confines it to exactly one straddler (the
+        // minimum) rather than spreading all three across both paths.
+        let a: std::collections::HashSet<_> = out[0..3]
+            .iter()
+            .filter_map(|x| SubnetKey::from_addr(x))
+            .collect();
+        let b: std::collections::HashSet<_> = out[3..6]
+            .iter()
+            .filter_map(|x| SubnetKey::from_addr(x))
+            .collect();
+        assert_eq!(
+            a.intersection(&b).count(),
+            1,
+            "exactly one subnet straddles"
+        );
     }
 }

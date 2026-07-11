@@ -696,7 +696,7 @@ enumerate and burn the whole fleet — the classic way nation-states kill bridge
   whose earn side is honestly still client-attested (M17/M32 caveat), so it is only worthwhile once M27's
   wire path and M32's hardened earning land.
 
-### M36 — Sybil-resistant relay admission + diverse path selection ⬜ (concentration defense)
+### M36 — Sybil-resistant relay admission + diverse path selection 🔨 (subnet layer shipped; ASN + bandwidth-weighting deferred)
 Why it matters: dial-back attestation binds an identity to an address it actually controls, but **nothing
 caps how many relays one operator runs**. N listener processes on *different ports* of a single IP each
 pass their own dial-back and get attested, and clients pick hops by NodeId at random with **no
@@ -722,6 +722,29 @@ not this one: M4.5 prevents *forging/hijacking* relays, M11 makes selection *unb
   freshness/trust surface), and bandwidth-weighting inherits the honesty of the earn-side accounting, which
   is still client-attested (M17/M32 caveat). Should land **before the network carries real users**, since
   today one operator can cheaply run many relays and skew path selection.
+- **Shipped (subnet + PoW layer):**
+  - `neo-core::net::SubnetKey` (IPv4 `/24`, IPv6 `/64`) + `prioritize_distinct_subnets` — a *best-effort*
+    diversity reorder (front-loads subnet-distinct candidates, falls back to repeats when subnets are
+    scarce so a young 2-relay network still builds full circuits).
+  - **Admission diversity:** the seed caps *attested* relays per public subnet (`MAX_ATTESTED_PER_SUBNET`)
+    in `registry.rs::cap_per_subnet` — registration stays unbounded, only snapshot listing is capped;
+    internal/loopback exempt.
+  - **Selection diversity** wired into every live circuit builder: `neo-routing`
+    `select_path`/`select_disjoint_paths` (the k-of-n share-correlation case)/`select_path_seeded`
+    (stays deterministic + VRF-verifiable), `ExitSelector::select` (rotates the *subnet*, not just the
+    node), `neo-ffi` netstack picker, desktop `pick_circuit`, and `sample_relays`. The committee circuit
+    is intentionally untouched — it routes its whole fixed roster, so member independence is a
+    ceremony-assembly concern, not a client pick.
+  - **Registration gating:** `neo-core::pow` proof-of-work bound to the relay `NodeId`, verified by the
+    seed before admit (`require_registration_pow`, default on; `neo seed --no-registration-pow` for the
+    rollout window).
+  - **Honest scope of what shipped:** this raises the flood cost from "sign N records" to "control N
+    reachable hosts across ≳N/2 distinct `/24`s **and** spend N proofs-of-work **and** pass N dial-backs".
+    It is **not** full Sybil resistance: an adversary with a `/16`, many rented `/24`s, or an IPv6 block
+    still defeats subnet diversity, and CPU PoW is cheap at scale. The dominant attacker cost is the IPs,
+    not the hashing.
+  - **Still deferred:** per-**ASN** caps (need a maintained BGP dataset), and **bandwidth/uptime
+    weighting** of selection (needs the M17 proof-of-relay accounting) — both listed in the plan above.
 
 ---
 

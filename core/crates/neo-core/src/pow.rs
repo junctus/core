@@ -55,11 +55,22 @@ pub fn verify(id: &NodeId, nonce: u64, bits: u32) -> bool {
     leading_zero_bits(&pow_hash(id, nonce)) >= bits
 }
 
+/// The most leading-zero bits `solve` will attempt. Above this, the expected work
+/// (`2^bits` hashes) is minutes-to-years — almost certainly a misconfiguration, so
+/// `solve` refuses rather than hanging the relay indefinitely. Comfortably above
+/// [`REGISTRATION_POW_BITS`].
+pub const MAX_SOLVABLE_BITS: u32 = 32;
+
 /// Grind a valid `nonce` for `id` at `bits` difficulty. Deterministic (scans from
 /// 0), so a relay caches the result and never recomputes for the same identity.
-/// Returns `None` only if the whole `u64` space is exhausted without a solution —
-/// impossible at any sane difficulty (`bits < 64`).
+///
+/// Returns `None` if `bits` exceeds [`MAX_SOLVABLE_BITS`] (fail fast on an absurd
+/// difficulty rather than spinning forever), or — impossibly at any sane
+/// difficulty — if the whole `u64` nonce space is exhausted.
 pub fn solve(id: &NodeId, bits: u32) -> Option<u64> {
+    if bits > MAX_SOLVABLE_BITS {
+        return None;
+    }
     (0..=u64::MAX).find(|&nonce| verify(id, nonce, bits))
 }
 
@@ -90,6 +101,16 @@ mod tests {
         let id = NodeIdentity::generate().unwrap().id();
         // nonce 0 almost certainly has fewer than 24 leading zero bits.
         assert!(!verify(&id, 0, 24) || verify(&id, 0, 0));
+    }
+
+    #[test]
+    fn solve_refuses_absurd_difficulty_instead_of_hanging() {
+        let id = NodeIdentity::generate().unwrap().id();
+        assert_eq!(
+            solve(&id, MAX_SOLVABLE_BITS + 1),
+            None,
+            "an unsolvable difficulty must fail fast, not spin"
+        );
     }
 
     #[test]

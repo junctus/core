@@ -11,7 +11,7 @@
 
 #![forbid(unsafe_code)]
 
-use neo_core::net::{prioritize_distinct_subnets, SubnetKey};
+use neo_core::net::{group_by_subnet, prioritize_distinct_subnets, SubnetKey};
 use neo_core::{Error, NodeId, Result};
 
 pub mod exit;
@@ -113,13 +113,19 @@ impl Router {
         }
         let order = shuffled_indices(self.relays.len())?;
         let shuffled: Vec<Relay> = order.into_iter().map(|i| self.relays[i].clone()).collect();
-        // Diversify across the *whole* selection before chunking into paths: for
-        // k-of-n shares, two node-disjoint paths that both traverse one /24 still
-        // hand that operator two shares to correlate. Front-loading distinct
-        // subnets makes each share's path land in a different network when the
-        // relay set allows it (M36, best-effort on a small network).
-        let diverse = prioritize_distinct_subnets(shuffled, Relay::subnet_keys);
-        Ok(diverse
+        // For k-of-n shares each path carries one share, so the leak to avoid is an
+        // operator straddling *two* paths (it would see two shares). Grouping
+        // same-subnet relays contiguously before chunking keeps each subnet inside
+        // a single path when possible, minimizing that cross-path spread. When at
+        // least `paths * hops` distinct subnets exist the paths are fully
+        // subnet-disjoint; with fewer, collisions are confined to as few paths as
+        // possible rather than smeared across all of them (an operator repeated
+        // within one path still sees only that path's single share). Best-effort —
+        // never fails on a small network. Note: front-loading distinct subnets
+        // here (the single-path strategy) would be *wrong* — it spreads each subnet
+        // across paths, the opposite of what shares want.
+        let grouped = group_by_subnet(shuffled, Relay::subnet_keys);
+        Ok(grouped
             .chunks(hops)
             .take(paths)
             .map(|chunk| chunk.to_vec())
@@ -321,6 +327,31 @@ mod tests {
             6,
             "all six share-hops in distinct /24s"
         );
+    }
+
+    #[test]
+    fn disjoint_share_paths_confine_collisions_when_subnets_are_scarce() {
+        // Review finding H1: with only 3 subnets for 2×3 hops, full disjointness is
+        // impossible — but grouping must keep each operator inside ONE path (so it
+        // sees one share), never spread across both (two shares to correlate).
+        for _ in 0..64 {
+            let router = Router::new(relays_in_subnets(&[1, 1, 2, 2, 3, 3]));
+            let paths = router.select_disjoint_paths(2, 3).unwrap();
+            let subnets_of = |p: &[Relay]| -> std::collections::HashSet<SubnetKey> {
+                p.iter()
+                    .filter_map(|r| SubnetKey::from_addr(&r.addr))
+                    .collect()
+            };
+            let a = subnets_of(&paths[0]);
+            let b = subnets_of(&paths[1]);
+            let straddlers = a.intersection(&b).count();
+            // 3 subnets, 2 paths of 3 distinct hops → exactly one subnet must be
+            // shared, but never more than one.
+            assert!(
+                straddlers <= 1,
+                "at most one operator may span both share-paths, got {straddlers}"
+            );
+        }
     }
 
     #[test]

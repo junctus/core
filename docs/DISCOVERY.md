@@ -117,6 +117,35 @@ simultaneously proves reachability and binds address ↔ identity. Relays that f
 repeatedly are struck and evicted. This stops a seed from amplifying bogus or
 hijacked entries.
 
+## Concentration defense: subnet caps, diverse selection, and registration PoW (M36)
+
+Dial-back binds an identity to an address, but it does not cap how many relays one
+operator runs — N processes on distinct ports of one box each pass their own
+dial-back. M36 adds a *concentration* layer (a coarse anti-Sybil measure, **not**
+full Sybil resistance):
+
+- **Admission diversity.** The seed attests at most `MAX_ATTESTED_PER_SUBNET`
+  relays per public subnet (IPv4 `/24`, IPv6 `/64`) — `registry.rs::cap_per_subnet`.
+  Registration stays unbounded (memory-bounded by `MAX_ENTRIES`); only the *listed*
+  set clients pick from is capped, so one network can't flood selection. Loopback /
+  internal addresses are exempt (dev/test; never dial-back-attestable in production).
+- **Selection diversity.** Every client circuit builder front-loads
+  subnet-distinct hops (`neo-core::net::prioritize_distinct_subnets`) so one
+  operator can't own two hops of a path — including the k-of-n *share* router, where
+  two "disjoint" paths through one `/24` would still leak two shares to one operator.
+  It is **best-effort**: a young network with few subnets still builds full circuits.
+- **Registration proof-of-work.** A relay attaches an `X-Neo-Pow` proof bound to
+  its `NodeId` (`neo-core::pow`); the seed verifies it before admit. This taxes
+  identity minting per-Sybil. CPU PoW is cheap at scale, so it's a speed bump on top
+  of the real costs (a reachable host + a distinct subnet per identity), not a
+  standalone defense.
+
+The honest boundary: this raises the flood cost from "sign N records" to "control N
+reachable hosts across ≳N/2 distinct `/24`s **and** pass N dial-backs **and** spend
+N proofs". An adversary spanning a `/16`, many rented `/24`s, or an IPv6 block still
+defeats it. Per-ASN caps (need a BGP dataset) and bandwidth-weighted selection are
+deferred — see `MILESTONES.md` M36.
+
 ## The seed (`discovery.junctus.org`)
 
 `neo seed` runs a witness signer + health checker + a static HTTP service
@@ -174,7 +203,9 @@ signatures on the snapshot, so the DoH transport and the DNS are untrusted.
 | Tamper with a snapshot diff | Client reconstructs + re-verifies witness signatures; any mismatch → discard + full refetch |
 | Swap a compact record's key | `id` commits to the key; dial-time `peer_id == id` check rejects a mismatch |
 | Replay an old record | `expires_at` + monotonic `seq` |
-| Registration flooding | Per-IP cooldown; body-size limit |
+| Registration flooding | Per-IP + per-key cooldown; body-size limit; registration proof-of-work (M36) |
+| Flood the attested set from one network | Per-subnet attestation cap (`/24`, `/64`); coarse — a multi-`/24` adversary still Sybils (M36) |
+| Own both hops of a victim's circuit | Subnet-diverse selection at every picker; best-effort on small networks (M36) |
 
 ## Limitations
 
@@ -187,3 +218,7 @@ signatures on the snapshot, so the DoH transport and the DNS are untrusted.
 - **Witnesses are a small trusted set** (like Tor directory authorities).
   Dissolving that trust is exactly what frontier milestones M11 (VRF-verifiable
   path selection) and M13 (PIR discovery + proof-of-mixing) are for.
+- **Sybil resistance is partial (M36).** Subnet caps + diverse selection + a
+  registration PoW raise concentration cost but don't eliminate it — an adversary
+  with many distinct `/24`s (or a `/16`, or an IPv6 block) still Sybils. Per-ASN
+  caps and bandwidth-weighted selection are deferred.

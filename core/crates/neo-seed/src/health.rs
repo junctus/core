@@ -19,25 +19,36 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Dial the relay and confirm it authenticates as the record's signing key.
 ///
-/// Succeeds if *any* advertised address completes the handshake with a peer
-/// key equal to `record.signing`. Uses `prober` as the local identity for the
-/// handshake (a seed's own identity is fine — the check is one-directional).
+/// Returns the **first advertised address that verified** (completed the
+/// handshake with a peer key equal to `record.signing`), or `None` if none did.
+/// Uses `prober` as the local identity for the handshake (a seed's own identity
+/// is fine — the check is one-directional).
+///
+/// Returning *which* address verified matters for the Sybil subnet cap (M36): a
+/// record may advertise addresses the operator does **not** control (padding its
+/// `addrs` with IPs in a victim's /24 to weaponize the cap against honest relays
+/// there). Only the address that actually answered the dial-back is proven, so
+/// only its subnet may be counted toward the cap.
 ///
 /// **SSRF guard:** an advertised address that is not a safe *public* IP:port
 /// literal (loopback, RFC1918, link-local / cloud metadata, ULA, CGNAT, or a
 /// hostname) is skipped, so an attacker cannot register a record naming an
 /// internal address and make the seed dial it. `allow_loopback` opens localhost
 /// for local dev/test only.
-pub async fn dial_back(prober: &NodeIdentity, record: &PeerRecord, allow_loopback: bool) -> bool {
+pub async fn dial_back(
+    prober: &NodeIdentity,
+    record: &PeerRecord,
+    allow_loopback: bool,
+) -> Option<String> {
     for addr in &record.addrs {
         if !neo_core::net::is_safe_dial_target(addr, allow_loopback) {
             continue;
         }
         if handshake_matches(prober, addr, &record.signing).await {
-            return true;
+            return Some(addr.clone());
         }
     }
-    false
+    None
 }
 
 async fn handshake_matches(prober: &NodeIdentity, addr: &str, expected: &[u8; 32]) -> bool {
@@ -71,7 +82,7 @@ mod tests {
             PeerRecord::build_signed(&relay_id, vec![addr], true, false, now_unix() + 3600, 1)
                 .unwrap();
         let prober = NodeIdentity::generate().unwrap();
-        assert!(dial_back(&prober, &record, true).await);
+        assert!(dial_back(&prober, &record, true).await.is_some());
         let _ = server.await;
     }
 
@@ -91,7 +102,7 @@ mod tests {
             PeerRecord::build_signed(&imposter, vec![addr], true, false, now_unix() + 3600, 1)
                 .unwrap();
         let prober = NodeIdentity::generate().unwrap();
-        assert!(!dial_back(&prober, &record, true).await);
+        assert!(dial_back(&prober, &record, true).await.is_none());
         server.abort();
     }
 
@@ -109,7 +120,7 @@ mod tests {
         )
         .unwrap();
         let prober = NodeIdentity::generate().unwrap();
-        assert!(!dial_back(&prober, &record, true).await);
+        assert!(dial_back(&prober, &record, true).await.is_none());
     }
 
     #[tokio::test]
@@ -132,7 +143,7 @@ mod tests {
         .unwrap();
         let prober = NodeIdentity::generate().unwrap();
         assert!(
-            !dial_back(&prober, &record, false).await,
+            dial_back(&prober, &record, false).await.is_none(),
             "internal targets must not be dialed"
         );
     }
