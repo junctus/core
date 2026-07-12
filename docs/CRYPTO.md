@@ -89,10 +89,12 @@ A **3-message, key-confirmed** PQ-hybrid AKE (`neo-crypto::handshake`):
   the deferred sub-protocols are now built and tested (still semi-honest / malicious-*detecting*):
   ✅ the **full RFC 8439 AEAD** (multi-block Poly1305, matched byte-for-byte against the stock crate) and
   ✅ **TLS 1.3 record framing** (nonce/AAD/content-type, a real `TLSCiphertext`);
-  ✅ the **DECO EC point→field conversion** — `ectf::ectf` composes **Gilboa MtA over `F_p`** (on the crate's
-  real OT) and a masked inversion into an additive x-coordinate share, its test **validated against P-256
-  point addition from the vetted `p256` crate**; its A2B partner (`convert::a2b_shared`) closes the point→bit
-  bridge;
+  ✅ the **DECO EC point→field conversion + the full pre-master bridge** — `ectf::ectf` composes **Gilboa MtA
+  over `F_p`** (on the crate's real OT) and a masked inversion into an additive x-coordinate share (validated
+  against **P-256 point addition from the vetted `p256` crate**); `convert::a2b_shared` runs A2B **on the real
+  256-bit P-256 prime**; and `convert::premaster_hash_from_point_shares` **chains ectf → a2b → the SHA-256
+  key-schedule circuit end-to-end** — EC point shares → `SHA-256(x-coordinate)` under 2PC, the x-coordinate
+  **never assembled**, validated against `p256` and the NIST-KAT SHA-256 reference;
   ✅ the **WRK17 authenticated-share core** (`wrk17`) — TinyOT-style IT-MAC shares, **OT-generated `aAND`
   triples**, an authenticated circuit evaluation whose every open is **MAC-checked** so any tampered wire
   **aborts**, plus the **sacrifice check** — a real, tested malicious-*detection* layer (verified against a

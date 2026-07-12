@@ -69,6 +69,7 @@ pub mod poly1305;
 pub mod sha256;
 pub mod wrk17;
 
+pub use convert::{a2b_shared, premaster_hash_from_point_shares};
 pub use ectf::ectf;
 pub use garble::{decode, evaluate, GarbledCircuit, Garbler};
 pub use wrk17::{

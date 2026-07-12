@@ -1,31 +1,34 @@
 //! Share conversion for the MPC-TLS key schedule — the arithmetic→boolean half of
 //! DECO's EC point→bit conversion.
 //!
-//! DECO's [`session::shared_ecdhe`](super::session::shared_ecdhe) leaves the two
-//! parties with an **additive share of the ECDHE point**. The TLS key schedule
-//! ([`sha256`](super::sha256) under 2PC) consumes a **bit-share of the pre-master
-//! secret** (the point's x-coordinate). Bridging the two is a two-step conversion:
+//! DECO's additively-shared ECDHE leaves the two parties with an **additive share of
+//! the ECDHE point**. The TLS key schedule ([`sha256`](super::sha256) under 2PC)
+//! consumes a **bit-share of the pre-master secret** (the point's x-coordinate).
+//! Bridging the two is a two-step conversion, and **both steps are now built**:
 //!
 //! 1. additive EC *point* shares → an additive *x-coordinate* share (mod the curve
-//!    prime) — EC addition under MPC on the real curve. This is the harder,
-//!    still-**research** half (real-curve field arithmetic + inversion in-circuit).
+//!    prime) — EC addition under MPC on the real curve: [`ectf`](super::ectf::ectf).
 //! 2. that additive field-element share → a **bit-share** — an **arithmetic-to-
-//!    boolean (A2B)** conversion. **This module.**
+//!    boolean (A2B)** conversion: [`a2b_shared`], **this module**.
 //!
 //! [`a2b_shared`] is the step-2 primitive: given two additive shares of a value
 //! `x = (share_a + share_b) mod prime` (each share in `[0, prime)`), it computes,
-//! under 2PC, XOR-shares of the bits of `x` — without either party ever assembling
-//! `x`. It is exactly what feeds the key-schedule circuit once step 1 lands.
+//! under 2PC, XOR-shares of the bits of `x` — without either party assembling `x`.
+//! [`premaster_hash_from_point_shares`] chains both steps into the key-schedule
+//! circuit: **EC point shares → `SHA-256(x-coordinate)` under 2PC**, x never assembled
+//! (validated end-to-end against the `p256` crate and the NIST-KAT SHA-256 reference).
 //!
-//! Semi-honest, like the rest of the 2PC session.
+//! Semi-honest at the MtA layer (OT is `kos`), like the rest of the 2PC session.
 
 use std::collections::HashSet;
 
 use neo_core::{Error, Result};
 
 use super::circuit::{Builder, Circuit};
+use super::ectf::ectf;
 use super::garble;
 use super::poly1305::{mux, pad, sub_circuit};
+use super::sha256::digest_shared;
 
 /// Arithmetic-to-boolean share conversion mod `prime` (256-bit, little-endian). The
 /// parties hold additive shares `share_a`, `share_b ∈ [0, prime)` of a secret
@@ -49,6 +52,43 @@ pub fn a2b_shared(
     let evaluator_wires: HashSet<usize> = (256..512).collect();
     let out = garble::eval_2pc(&circuit, &evaluator_wires, &inputs)?; // x ⊕ maskA
     Ok((mask, bits_to_32(&out)))
+}
+
+/// **End-to-end pre-master conversion under 2PC**: additive EC *point* shares →
+/// XOR-shares of `SHA-256(x-coordinate)` — the pre-master (the point's x-coordinate)
+/// is **never assembled at either party**. Chains the three built stages:
+///
+/// 1. [`ectf`](super::ectf::ectf) — point shares → additive x-coordinate share (mod the
+///    curve prime), big-endian.
+/// 2. [`a2b_shared`] — additive field share → XOR **bit**-shares (on the real 256-bit
+///    curve prime, not a toy modulus).
+/// 3. [`digest_shared`](super::sha256::digest_shared) — `SHA-256(shareA ⊕ shareB)` under
+///    2PC, i.e. `SHA-256(x)`.
+///
+/// This is the concrete "EC point → key-schedule input" bridge: it feeds the shared
+/// ECDHE secret into the SHA-256 (HKDF-core) circuit without either party ever holding
+/// the x-coordinate. `p1/p2` are each `(x, y)` as 32-byte **big-endian** field elements;
+/// `prime` is the curve prime, big-endian. Semi-honest at the MtA layer (OT is `kos`);
+/// the SHA-256 core here stands in for the full HKDF-Expand-Label schedule.
+pub fn premaster_hash_from_point_shares(
+    p1: (&[u8; 32], &[u8; 32]),
+    p2: (&[u8; 32], &[u8; 32]),
+    prime: &[u8; 32],
+) -> Result<([u8; 32], [u8; 32])> {
+    // 1. ECtF → additive x-coordinate shares (big-endian).
+    let (s1_be, s2_be) = ectf(p1, p2, prime)?;
+    // 2. A2B works little-endian: reverse the shares and the prime.
+    let (a_le, b_le) = a2b_shared(&reverse32(&s1_be), &reverse32(&s2_be), &reverse32(prime))?;
+    // `a_le ⊕ b_le = x` in little-endian bytes. `digest_shared` hashes `shareA ⊕ shareB`
+    // as big-endian words, so reverse both shares → they XOR to `x` big-endian, and it
+    // computes SHA-256(x) with `x` in its canonical wire (big-endian) form.
+    digest_shared(&reverse32(&a_le), &reverse32(&b_le))
+}
+
+fn reverse32(x: &[u8; 32]) -> [u8; 32] {
+    let mut o = *x;
+    o.reverse();
+    o
 }
 
 /// The A2B circuit: `x = (a + b) mod prime`, then XOR-mask the 256-bit result.
@@ -140,5 +180,88 @@ mod tests {
                 "high bytes are zero for a 63-bit modulus"
             );
         }
+    }
+
+    /// P-256 base field prime, little-endian (A2B works little-endian).
+    fn p256_prime_le() -> [u8; 32] {
+        let be: [u8; 32] = [
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff,
+        ];
+        let mut le = be;
+        le.reverse();
+        le
+    }
+
+    #[test]
+    fn a2b_reconstructs_at_the_full_p256_prime() {
+        use num_bigint::BigUint;
+        let p_le = p256_prime_le();
+        let p = BigUint::from_bytes_le(&p_le);
+        let half: BigUint = &p >> 1u32;
+        // Additive-share pairs mod the real 256-bit prime: small, high-byte, and a
+        // wrap (half + half + 10 ≥ p ⇒ conditional-subtract path at full width).
+        let cases = [
+            (BigUint::from(7u32), BigUint::from(9u32)),
+            (half.clone(), &half + 10u32),
+            (&p - 1u32, BigUint::from(5u32)),
+        ];
+        for (a, b) in cases {
+            let a = a % &p;
+            let b = b % &p;
+            let x = (&a + &b) % &p;
+            let (oa, ob) = a2b_shared(&le32(&a), &le32(&b), &p_le).unwrap();
+            let recovered: [u8; 32] = core::array::from_fn(|i| oa[i] ^ ob[i]);
+            assert_eq!(
+                BigUint::from_bytes_le(&recovered),
+                x,
+                "256-bit A2B reconstructs (a+b) mod p_256"
+            );
+        }
+    }
+
+    fn le32(x: &num_bigint::BigUint) -> [u8; 32] {
+        let v = x.to_bytes_le();
+        let mut o = [0u8; 32];
+        o[..v.len()].copy_from_slice(&v);
+        o
+    }
+
+    #[test]
+    fn point_shares_to_premaster_hash_end_to_end() {
+        // The full bridge: real P-256 point shares → SHA-256(x-coordinate) under 2PC,
+        // validated against the vetted `p256` crate (ground-truth x) and the
+        // NIST-KAT-verified `sha256` reference. The x-coordinate is never assembled.
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        use p256::ProjectivePoint;
+
+        let be: [u8; 32] = {
+            let mut b = p256_prime_le();
+            b.reverse();
+            b
+        };
+        let g = ProjectivePoint::GENERATOR;
+        let p1 = g.to_affine(); // G
+        let p2 = (g + g).to_affine(); // 2G
+        let sum = (g + (g + g)).to_affine(); // 3G = G + 2G
+        let coords = |pt: &p256::AffinePoint| -> ([u8; 32], [u8; 32]) {
+            let e = pt.to_encoded_point(false);
+            (
+                <[u8; 32]>::try_from(e.x().unwrap().as_slice()).unwrap(),
+                <[u8; 32]>::try_from(e.y().unwrap().as_slice()).unwrap(),
+            )
+        };
+        let (x1, y1) = coords(&p1);
+        let (x2, y2) = coords(&p2);
+        let (sx, _) = coords(&sum);
+
+        let (h_a, h_b) = premaster_hash_from_point_shares((&x1, &y1), (&x2, &y2), &be).unwrap();
+        let got: [u8; 32] = core::array::from_fn(|i| h_a[i] ^ h_b[i]);
+        assert_eq!(
+            got,
+            super::super::sha256::sha256(&sx),
+            "2PC pipeline yields SHA-256 of P-256's real (G+2G) x-coordinate"
+        );
     }
 }

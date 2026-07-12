@@ -381,9 +381,11 @@ plaintext are **never assembled at a single party** — built and verified botto
     additive **x-coordinate** share under 2PC: `Δx²`, `Δy²` and a **masked inversion** (Bar-Ilan–Beaver),
     every share-product a **Gilboa MtA over `F_p`** (`mta_fp`, on the crate's real IKNP OT). Its test
     **validates the reconstructed x-coordinate against P-256 point addition computed by the vetted `p256`
-    crate** — an independent oracle, on the real P-256 prime. Its A2B partner (`convert::a2b_shared`) closes
-    the point→bit bridge. Semi-honest; `F_p` via variable-time `num-bigint` (a constant-time field is the
-    production step).
+    crate** — an independent oracle, on the real P-256 prime. `convert::a2b_shared` runs A2B **on the real
+    256-bit P-256 prime**, and `convert::premaster_hash_from_point_shares` **chains ectf → a2b → the SHA-256
+    key-schedule circuit end-to-end** — EC point shares → `SHA-256(x-coordinate)` under 2PC, the x-coordinate
+    **never assembled**, validated against `p256` and the NIST-KAT SHA-256 reference. Semi-honest; `F_p` via
+    variable-time `num-bigint` (a constant-time field is the production step).
   - ✅ **WRK17 authenticated-share core (`wrk17`)** — the malicious-security *machinery*: TinyOT-style
     **both-directions IT-MAC shares** `⟨x⟩` (XOR/NOT local, **open re-checks both MACs**), **OT-generated
     `aAND` triples** (`rand_triples`, cross terms via 1-bit OT, then authenticated), the **sacrifice check**
@@ -405,13 +407,15 @@ plaintext are **never assembled at a single party** — built and verified botto
   **live wiring** to a real TLS socket on the server's actual curve, and the **external audit**. That *security*
   **cannot be established by correctness tests**; the live session path stays semi-honest with dual-execution's
   ≤1-bit leak until it lands.
-- Tests (45): OT delivers only the chosen message; IKNP extends past `k`; **KOS delivers honestly, its
+- Tests (47): OT delivers only the chosen message; IKNP extends past `k`; **KOS delivers honestly, its
   `GF(2¹²⁸)` is a field, and inconsistent-receiver attacks abort the correlation check**; every gate garbles over all inputs;
   garbled adder matches native add with OT-split inputs; ChaCha/SHA-256/Poly1305 references match their KATs
   and the circuits match; ECDHE is additively shared and matches the server; keystream / key-schedule / MAC
   each run under 2PC into shares; the **full ChaCha20-Poly1305 AEAD** and a **TLS 1.3 record** seal under 2PC
-  and match the stock crate; A2B reconstructs a field element from additive shares; **MtA over `F_p` gives
-  additive shares of the product**; **ECtF's x-coordinate share reconstructs P-256's real point addition**;
+  and match the stock crate; A2B reconstructs a field element from additive shares **at the full 256-bit P-256
+  prime**; **MtA over `F_p` gives additive shares of the product**; **ECtF's x-coordinate share reconstructs
+  P-256's real point addition**, and the **ectf→a2b→SHA-256 pipeline hashes the x-coordinate under 2PC**
+  (matched against `p256` + the NIST SHA-256 reference);
   IT-MAC bits verify, reject a flip, resist forgery, and stay authenticated under XOR; **WRK17 shares open
   correctly, a tampered share aborts, OT triples satisfy `c=a∧b`, the sacrifice check catches a corrupted
   triple, the WRK17 combine is correct over all 16 input pairs, bucketing yields correct triples, and a 4-bit
