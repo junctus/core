@@ -24,6 +24,13 @@ pub fn is_internal_ip(ip: &IpAddr) -> bool {
                 || v4.octets()[0] == 0 // 0.0.0.0/8
         }
         IpAddr::V6(v6) => {
+            // An IPv4-mapped (`::ffff:a.b.c.d`) or IPv4-compatible (`::a.b.c.d`)
+            // literal routes to the embedded IPv4 — classify it by that address, or
+            // `::ffff:127.0.0.1` / `::ffff:169.254.169.254` would slip past this
+            // guard and re-open the SSRF / cloud-metadata hole for internal V4s.
+            if let Some(v4) = v6.to_ipv4() {
+                return is_internal_ip(&IpAddr::V4(v4));
+            }
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
@@ -40,7 +47,16 @@ pub fn is_internal_ip(ip: &IpAddr) -> bool {
 pub fn is_safe_dial_target(addr: &str, allow_loopback: bool) -> bool {
     match addr.parse::<SocketAddr>() {
         Ok(sa) => {
-            let ip = sa.ip();
+            // Normalize an IPv4-mapped IPv6 literal to its IPv4 form so the loopback
+            // allowance treats `::ffff:127.0.0.1` exactly like `127.0.0.1` (and a
+            // mapped internal target is still rejected by `is_internal_ip` below).
+            let ip = match sa.ip() {
+                IpAddr::V6(v6) => v6
+                    .to_ipv4_mapped()
+                    .map(IpAddr::V4)
+                    .unwrap_or(IpAddr::V6(v6)),
+                other => other,
+            };
             if ip.is_loopback() {
                 return allow_loopback;
             }
@@ -278,7 +294,13 @@ mod tests {
             "[::1]:443",
             "[fe80::1]:80",
             "[fc00::1]:80",
-            "example.com:443", // hostname → rejected (no literals)
+            // IPv4-mapped / -compatible IPv6 forms of internal V4s must NOT slip
+            // past the guard (they route to the embedded IPv4).
+            "[::ffff:127.0.0.1]:443",      // mapped loopback
+            "[::ffff:10.0.0.5]:443",       // mapped RFC1918
+            "[::ffff:169.254.169.254]:80", // mapped cloud metadata
+            "[::ffff:192.168.1.1]:80",     // mapped RFC1918
+            "example.com:443",             // hostname → rejected (no literals)
             "not-an-addr",
         ] {
             assert!(
@@ -295,6 +317,11 @@ mod tests {
         // Loopback only when explicitly allowed (dev/test).
         assert!(!is_safe_dial_target("127.0.0.1:9000", false));
         assert!(is_safe_dial_target("127.0.0.1:9000", true));
+        // A mapped-loopback literal follows the same loopback opt-in.
+        assert!(!is_safe_dial_target("[::ffff:127.0.0.1]:9000", false));
+        assert!(is_safe_dial_target("[::ffff:127.0.0.1]:9000", true));
+        // A mapped *public* V4 is still a valid public target.
+        assert!(is_safe_dial_target("[::ffff:1.1.1.1]:443", false));
     }
 
     #[test]

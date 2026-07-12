@@ -120,7 +120,13 @@ impl CircuitSink {
     /// Send one application cell to the exit through the circuit.
     pub async fn send(&mut self, data: &[u8]) -> Result<()> {
         let seq = self.seq;
-        self.seq += 1;
+        // The (key, seq) pair drives a one-time XOR keystream, so seq must NEVER
+        // repeat — refuse to wrap rather than silently reuse a keystream (which
+        // would let an observer XOR two cells and recover plaintext). At u64 this is
+        // unreachable in practice; the check makes the guarantee unconditional.
+        self.seq = seq
+            .checked_add(1)
+            .ok_or_else(|| Error::Crypto("circuit cell sequence exhausted".into()))?;
         let exit_secret = self.secrets.last().expect("non-empty circuit");
         // Endpoint body: [e2e MAC][payload], then onion-layer it, hop 0 outermost.
         let mut body = Vec::with_capacity(CELL_MAC_LEN + data.len());
@@ -161,7 +167,10 @@ impl CircuitStream {
         if seq != self.next_seq {
             return Err(Error::Crypto("return cell out of sequence".into()));
         }
-        self.next_seq += 1;
+        self.next_seq = self
+            .next_seq
+            .checked_add(1)
+            .ok_or_else(|| Error::Crypto("circuit cell sequence exhausted".into()))?;
         let mut body = cell[SEQ_LEN..].to_vec();
         for secret in &self.secrets {
             xor_cell(&mut body, &ret_key(secret), seq);
@@ -414,7 +423,9 @@ async fn exit_splice(
             if seq != next_seq {
                 return Err(Error::Crypto("forward cell out of sequence".into()));
             }
-            next_seq += 1;
+            next_seq = next_seq
+                .checked_add(1)
+                .ok_or_else(|| Error::Crypto("splice cell sequence exhausted".into()))?;
             let mut body = cell[SEQ_LEN..].to_vec();
             xor_cell(&mut body, &fk, seq);
             let (mac, payload) = body.split_at(CELL_MAC_LEN);
@@ -450,7 +461,9 @@ async fn exit_splice(
             if write_frame(&mut pw, &out).await.is_err() {
                 break;
             }
-            seq += 1;
+            seq = seq
+                .checked_add(1)
+                .ok_or_else(|| Error::Crypto("splice cell sequence exhausted".into()))?;
         }
         Ok::<(), Error>(())
     };
@@ -511,7 +524,9 @@ async fn exit_splice_udp(
             if seq != next_seq {
                 return Err(Error::Crypto("forward cell out of sequence".into()));
             }
-            next_seq += 1;
+            next_seq = next_seq
+                .checked_add(1)
+                .ok_or_else(|| Error::Crypto("splice cell sequence exhausted".into()))?;
             let mut body = cell[SEQ_LEN..].to_vec();
             xor_cell(&mut body, &fk, seq);
             let (mac, payload) = body.split_at(CELL_MAC_LEN);
@@ -550,7 +565,9 @@ async fn exit_splice_udp(
             if write_frame(&mut pw, &out).await.is_err() {
                 break;
             }
-            seq += 1;
+            seq = seq
+                .checked_add(1)
+                .ok_or_else(|| Error::Crypto("splice cell sequence exhausted".into()))?;
         }
         Ok::<(), Error>(())
     };
