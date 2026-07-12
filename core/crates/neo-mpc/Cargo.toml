@@ -8,7 +8,7 @@ description = "Committee exit: threshold secret-sharing of the clearnet request.
 
 [dependencies]
 neo-core.workspace = true
-sharks.workspace = true
+blahaj.workspace = true
 blake3.workspace = true
 curve25519-dalek.workspace = true
 chacha20poly1305.workspace = true

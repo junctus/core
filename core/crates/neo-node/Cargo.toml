@@ -25,6 +25,7 @@ tracing.workspace = true
 blake3.workspace = true
 socket2.workspace = true
 getrandom.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 # Frontier crates, used only by the M10–M13 capstone integration test.

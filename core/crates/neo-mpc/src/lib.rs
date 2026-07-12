@@ -11,14 +11,13 @@
 //! one share per committee member: any `k` reconstruct it, and a hash bound into
 //! the secret makes a corrupted/swapped share detectable at reconstruction.
 //!
-//! **Honesty caveat on secrecy.** Textbook Shamir gives *information-theoretic*
-//! secrecy (any `k-1` shares reveal nothing). The shipped backing crate `sharks
-//! 0.5.0` (unmaintained, RUSTSEC-2024-0398) draws the top polynomial coefficient
-//! from `1..=255` rather than `0..=255`, so a below-threshold coalition gets a
-//! *small statistical* advantage — the information-theoretic bound holds only for a
-//! bias-free implementation. Migrating to a vetted GF(256) Shamir (e.g. the
-//! `blahaj` fork) with a share-uniformity test is tracked as hardening; the
-//! verifiable [`vss`] path (used by the real MPC-TLS flow) does not depend on it.
+//! **Secrecy.** Textbook Shamir gives *information-theoretic* secrecy (any `k-1`
+//! shares reveal nothing), which holds only for a **bias-free** coefficient draw.
+//! The backing crate is [`blahaj`] (a maintained fork of the unmaintained `sharks
+//! 0.5.0`, RUSTSEC-2024-0398) whose top polynomial coefficient is drawn uniformly
+//! over the full field, so no below-threshold coalition gains a statistical
+//! advantage. The verifiable [`vss`] path (used by the real MPC-TLS flow) does not
+//! depend on this Shamir split at all.
 //!
 //! ## Toward MPC-TLS (partly closed)
 //!
@@ -50,8 +49,8 @@ pub mod mpc_tls;
 pub mod threshold;
 pub mod vss;
 
+use blahaj::{Share, Sharks};
 use neo_core::{Error, Result};
-use sharks::{Share, Sharks};
 
 /// Domain tag bound into every shared secret (versioning + separation).
 const SECRET_DOMAIN: &[u8] = b"neo-committee-request-v1";
@@ -157,9 +156,9 @@ impl MemberShare {
 }
 
 /// Secret-share `request` across a committee. Returns one [`MemberShare`] per
-/// member; hand exactly one to each. Any `threshold-1` of them reveal (almost)
-/// nothing — see the crate doc's honesty caveat on the `sharks 0.5.0` coefficient
-/// bias; the guarantee is information-theoretic only for a bias-free Shamir.
+/// member; hand exactly one to each. Any `threshold-1` of them reveal nothing
+/// (information-theoretic secrecy — the `blahaj` backing draws coefficients
+/// bias-free; see the crate doc).
 pub fn deal(request: &ClearnetRequest, cfg: CommitteeConfig) -> Result<Vec<MemberShare>> {
     cfg.validate()?;
 

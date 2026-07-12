@@ -45,7 +45,10 @@ voprf = { version = "0.5", features = ["ristretto255"] }
 rand = "0.8"
 chacha20poly1305 = "0.10"
 reed-solomon-erasure = "4"
-sharks = "0.5"
+# blahaj: a maintained, bias-free fork of `sharks` that fixes RUSTSEC-2024-0398
+# (biased GF(256) coefficients weakening Shamir's information-theoretic secrecy).
+# API-compatible drop-in for the `Sharks`/`Share`/`dealer`/`recover` surface used.
+blahaj = "0.6"
 hkdf = "0.12"
 sha2 = "0.10"
 getrandom = "0.2"

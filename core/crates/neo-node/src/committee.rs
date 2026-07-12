@@ -35,6 +35,7 @@ use neo_crypto::{
 use neo_mpc::threshold::{self, Ciphertext, Partial};
 use neo_mpc::vss::{KeyCommitments, KeyShare};
 use tokio::io::{AsyncRead, AsyncWrite};
+use zeroize::Zeroize;
 
 use crate::forward::{Hop, NextHop};
 use crate::run::{connect_verified, read_frame, write_frame};
@@ -59,6 +60,9 @@ fn xor_mask(data: &mut [u8], key: &[u8; 32]) {
     for (b, k) in data.iter_mut().zip(&ks) {
         *b ^= k;
     }
+    // The keystream is as sensitive as the sealed partial — wipe it rather than
+    // leave it in freed heap.
+    ks.zeroize();
 }
 
 fn seal_mac(key: &[u8; 32], body: &[u8]) -> [u8; SEAL_MAC_LEN] {

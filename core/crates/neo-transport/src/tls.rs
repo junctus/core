@@ -255,7 +255,10 @@ fn key_share_ext(grease: u16, eph: &[u8; 32]) -> Vec<u8> {
 
 fn server_name_ext(host: &str) -> Vec<u8> {
     // ServerNameList <1..2^16-1> of { name_type=host_name(0), HostName <1..2^16-1> }.
-    let host = host.as_bytes();
+    // A DNS name is at most 253 bytes; clamp so the u16 length casts here (and the
+    // enclosing record's u16 length in build_client_hello) can never truncate on a
+    // pathologically long input, which would emit a malformed ClientHello.
+    let host = &host.as_bytes()[..host.len().min(253)];
     let mut entry = Vec::with_capacity(3 + host.len());
     entry.push(0x00); // host_name
     entry.extend_from_slice(&(host.len() as u16).to_be_bytes());
