@@ -47,6 +47,7 @@
 //! - The **external audit** gate, as everywhere in neo.
 
 pub mod circuit;
+pub mod convert;
 pub mod dualex;
 pub mod garble;
 pub mod ot;

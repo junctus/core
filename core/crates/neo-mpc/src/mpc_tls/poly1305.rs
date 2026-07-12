@@ -373,7 +373,7 @@ fn reduce_circuit(b: &mut Builder, v: &[usize], zero: usize, one: usize) -> Vec<
 }
 
 /// Subtract `y` from `x` (same width); returns `(x-y mod 2^n, borrow_out)`.
-fn sub_circuit(b: &mut Builder, x: &[usize], y: &[usize]) -> (Vec<usize>, usize) {
+pub(crate) fn sub_circuit(b: &mut Builder, x: &[usize], y: &[usize]) -> (Vec<usize>, usize) {
     let mut borrow = b.zero();
     let mut out = Vec::with_capacity(x.len());
     for i in 0..x.len() {
@@ -393,14 +393,14 @@ fn sub_circuit(b: &mut Builder, x: &[usize], y: &[usize]) -> (Vec<usize>, usize)
 
 /// `sel==1 ? one_wire : zero_wire`, per bit: `out = z ^ (sel & (o ^ z))` inverted…
 /// here `mux(z_val, o_val, sel)` returns `sel ? o_val : z_val`.
-fn mux(b: &mut Builder, z_val: &usize, o_val: &usize, sel: usize) -> usize {
+pub(crate) fn mux(b: &mut Builder, z_val: &usize, o_val: &usize, sel: usize) -> usize {
     // sel==1 keeps z_val (v), sel==0 keeps o_val (diff): borrow=1 means v<p → keep v.
     let x = b.xor(*z_val, *o_val);
     let g = b.and(sel, x);
     b.xor(*o_val, g)
 }
 
-fn pad(v: &[usize], n: usize, zero: usize) -> Vec<usize> {
+pub(crate) fn pad(v: &[usize], n: usize, zero: usize) -> Vec<usize> {
     let mut o = v.to_vec();
     o.truncate(n);
     while o.len() < n {
