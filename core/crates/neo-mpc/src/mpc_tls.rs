@@ -46,6 +46,7 @@
 //!   length blocks) iterated through the same circuits.
 //! - The **external audit** gate, as everywhere in neo.
 
+pub mod auth;
 pub mod circuit;
 pub mod convert;
 pub mod dualex;
