@@ -407,15 +407,21 @@ pub async fn serve_circuit<R: NextHop>(
 /// Ports an exit refuses to splice to by default — the reduced-harm baseline. These
 /// are the destinations that generate the abuse complaints (and law-enforcement
 /// attention) that deter people from running exits at all: mail (spam), remote
-/// login / admin (brute-force scanning), file sharing, and plaintext DNS
-/// (amplification / exfiltration). Blocking them turns an exit from an open proxy
-/// into a low-risk web egress. (A configurable allow/deny list — HTTPS-only,
-/// operator-curated — is the rest of M31.)
+/// login / admin (brute-force scanning), and file sharing. Blocking them turns an
+/// exit from an open proxy into a low-risk web egress.
+///
+/// **DNS (53) is intentionally *allowed*** — it is essential for browsing (a VPN
+/// client resolves all names through the tunnel to avoid a DNS leak, so blocking 53
+/// breaks every page load), and an exit resolving on behalf of a client *through the
+/// circuit* is not a DNS-amplification vector: the response returns down the circuit
+/// to that client, never reflected to a spoofed victim (unlike an open UDP resolver).
+/// Tor blocks SMTP for the same abuse reason but likewise resolves DNS.
+///
+/// (A configurable allow/deny list — HTTPS-only, operator-curated — is the rest of M31.)
 const DENIED_EXIT_PORTS: &[u16] = &[
     22,  // SSH
     23,  // Telnet
     25,  // SMTP (spam — Tor blocks this too)
-    53,  // plaintext DNS
     135, // MS RPC
     137, 138, 139, // NetBIOS
     445, // SMB
@@ -648,7 +654,7 @@ async fn exit_splice_udp(
             "exit refuses to splice UDP to non-public target {target}"
         )));
     }
-    // Reduced-harm port policy (e.g. block plaintext DNS:53 amplification over UDP).
+    // Reduced-harm port policy (blocks the abuse-prone ports; DNS:53 is allowed).
     check_exit_port(target, &policy)?;
     let udp = tokio::net::UdpSocket::bind("0.0.0.0:0")
         .await
@@ -745,12 +751,17 @@ mod tests {
     #[test]
     fn exit_port_policy_blocks_abuse_ports() {
         let policy = ExitPolicy::default();
-        // Web egress is fine.
+        // Web egress is fine — and DNS (53) is intentionally allowed, so a VPN client
+        // can resolve names through the tunnel (blocking it breaks every page load).
         assert!(policy.permits_port(443));
         assert!(policy.permits_port(80));
         assert!(policy.permits_port(8080));
+        assert!(
+            policy.permits_port(53),
+            "DNS must be allowed for name resolution"
+        );
         // Abuse-prone ports are refused (reduced-harm default).
-        for p in [22u16, 23, 25, 53, 445, 465, 587, 3389, 6667] {
+        for p in [22u16, 23, 25, 445, 465, 587, 3389, 6667] {
             assert!(!policy.permits_port(p), "port {p} must be denied");
         }
         // The splice-level guard rejects a denied port and accepts a web port.
