@@ -13,6 +13,7 @@
 pub mod circuit;
 pub mod committee;
 pub mod forward;
+pub mod mux;
 pub mod netif;
 pub mod run;
 pub mod serve;

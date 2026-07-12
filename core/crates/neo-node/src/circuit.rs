@@ -186,6 +186,103 @@ impl CircuitStream {
 
 /// Client: open a persistent circuit through `circuit` to a `target` the exit
 /// will splice a TCP connection to. Returns the send/receive halves.
+/// Exit-side **read** half of a circuit's cell channel: reads forward cells, peels
+/// the exit's single forward layer, checks strict sequencing, and verifies the
+/// end-to-end MAC, returning the endpoint payload. It is exactly `exit_splice`'s
+/// forward loop exposed as a [`FrameSource`](crate::mux::FrameSource), so the exit
+/// can run stream multiplexing ([`crate::mux::serve_mux`]) over the same cells.
+pub struct ExitFrameSource {
+    r: OwnedReadHalf,
+    opener: Opener,
+    secret: [u8; 32],
+    next_seq: u64,
+}
+
+impl ExitFrameSource {
+    /// Wrap the exit's inbound half and per-circuit secret.
+    pub fn new(r: OwnedReadHalf, opener: Opener, secret: [u8; 32]) -> Self {
+        Self {
+            r,
+            opener,
+            secret,
+            next_seq: 0,
+        }
+    }
+
+    async fn recv_payload(&mut self) -> Result<Vec<u8>> {
+        let framed = read_frame(&mut self.r).await?;
+        let cell = self.opener.open(&framed)?;
+        if cell.len() < SEQ_LEN + CELL_MAC_LEN {
+            return Err(Error::Decode("short forward cell".into()));
+        }
+        let seq = u64::from_be_bytes(cell[..SEQ_LEN].try_into().expect("8 bytes"));
+        if seq != self.next_seq {
+            return Err(Error::Crypto("forward cell out of sequence".into()));
+        }
+        self.next_seq = self
+            .next_seq
+            .checked_add(1)
+            .ok_or_else(|| Error::Crypto("splice cell sequence exhausted".into()))?;
+        let mut body = cell[SEQ_LEN..].to_vec();
+        xor_cell(&mut body, &fwd_key(&self.secret), seq);
+        let (mac, payload) = body.split_at(CELL_MAC_LEN);
+        if !ct_eq(mac, &cell_mac(&fwd_mac_key(&self.secret), seq, payload)) {
+            return Err(Error::Crypto("forward cell failed integrity check".into()));
+        }
+        Ok(payload.to_vec())
+    }
+}
+
+impl crate::mux::FrameSource for ExitFrameSource {
+    async fn recv_frame(&mut self) -> Result<Vec<u8>> {
+        self.recv_payload().await
+    }
+}
+
+/// Exit-side **write** half: wraps an endpoint payload into a return cell (e2e MAC,
+/// the exit's single return layer, strict sequence). `exit_splice`'s return loop
+/// exposed as a [`FrameSink`](crate::mux::FrameSink).
+pub struct ExitFrameSink {
+    w: OwnedWriteHalf,
+    sealer: Sealer,
+    secret: [u8; 32],
+    seq: u64,
+}
+
+impl ExitFrameSink {
+    /// Wrap the exit's outbound half and per-circuit secret.
+    pub fn new(w: OwnedWriteHalf, sealer: Sealer, secret: [u8; 32]) -> Self {
+        Self {
+            w,
+            sealer,
+            secret,
+            seq: 0,
+        }
+    }
+
+    async fn send_payload(&mut self, payload: &[u8]) -> Result<()> {
+        let seq = self.seq;
+        self.seq = seq
+            .checked_add(1)
+            .ok_or_else(|| Error::Crypto("splice cell sequence exhausted".into()))?;
+        let mut body = Vec::with_capacity(CELL_MAC_LEN + payload.len());
+        body.extend_from_slice(&cell_mac(&ret_mac_key(&self.secret), seq, payload));
+        body.extend_from_slice(payload);
+        xor_cell(&mut body, &ret_key(&self.secret), seq);
+        let mut cell = Vec::with_capacity(SEQ_LEN + body.len());
+        cell.extend_from_slice(&seq.to_be_bytes());
+        cell.extend_from_slice(&body);
+        let out = self.sealer.seal(&cell)?;
+        write_frame(&mut self.w, &out).await
+    }
+}
+
+impl crate::mux::FrameSink for ExitFrameSink {
+    async fn send_frame(&mut self, frame: Vec<u8>) -> Result<()> {
+        self.send_payload(&frame).await
+    }
+}
+
 pub async fn open_circuit(
     identity: &NodeIdentity,
     circuit: &[Hop],
@@ -286,9 +383,17 @@ pub async fn serve_circuit<R: NextHop>(
             }
             let target = String::from_utf8(payload)
                 .map_err(|_| Error::Decode("circuit target not valid utf-8".into()))?;
-            // A "udp:host:port" target asks the exit to carry datagrams over a UDP
-            // socket (one cell = one datagram); a bare "host:port" is TCP as before.
-            if let Some(udp_target) = target.strip_prefix("udp:") {
+            // Target dispatch:
+            //  - "mux"          → run stream multiplexing (many streams to many
+            //                     targets over this one circuit).
+            //  - "udp:host:port"→ carry datagrams over a UDP socket (one cell = one
+            //                     datagram).
+            //  - "host:port"    → splice a single TCP connection (the original mode).
+            if target == "mux" {
+                let sink = ExitFrameSink::new(pw, pw_sealer, secret);
+                let source = ExitFrameSource::new(pr, pr_opener, secret);
+                crate::mux::serve_mux(sink, source, policy).await
+            } else if let Some(udp_target) = target.strip_prefix("udp:") {
                 exit_splice_udp(secret, udp_target, pr, pr_opener, pw, pw_sealer, policy).await
             } else {
                 exit_splice(secret, &target, pr, pr_opener, pw, pw_sealer, policy).await
@@ -791,6 +896,64 @@ mod tests {
             got, expected,
             "the byte stream round-trips through the circuit"
         );
+    }
+
+    /// A loopback echo server that accepts *many* connections (mux opens one per
+    /// stream).
+    async fn spawn_multi_echo() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let (mut r, mut w) = sock.into_split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn circuit_multiplexes_streams_in_mux_mode() {
+        // The same 2-hop circuit, opened in "mux" mode, carries two independent
+        // streams to their own connections over one onion — exercising the exit's
+        // ExitFrameSource/Sink codec + serve_mux dispatch over real cells.
+        let echo_addr = spawn_multi_echo().await;
+        let exit = NodeIdentity::generate().unwrap();
+        let relay = NodeIdentity::generate().unwrap();
+        let client = NodeIdentity::generate().unwrap();
+        let (exit_addr, _exit) = spawn_serve(exit.to_bytes(), HashMap::new()).await;
+        let mut resolver = HashMap::new();
+        resolver.insert(exit.id(), exit_addr.clone());
+        let (relay_addr, _relay) = spawn_serve(relay.to_bytes(), resolver).await;
+        let circuit = vec![hop_of(&relay, &relay_addr), hop_of(&exit, &exit_addr)];
+
+        let (sink, stream) = open_circuit(&client, &circuit, "mux").await.unwrap();
+        let mux = crate::mux::MuxClient::start(sink, stream);
+
+        let mut a = tokio::time::timeout(Duration::from_secs(5), mux.open(&echo_addr))
+            .await
+            .expect("open a")
+            .expect("stream a");
+        let mut b = tokio::time::timeout(Duration::from_secs(5), mux.open(&echo_addr))
+            .await
+            .expect("open b")
+            .expect("stream b");
+        assert_ne!(a.id(), b.id());
+
+        a.send(b"stream-a").await.unwrap();
+        b.send(b"stream-b").await.unwrap();
+        let ga = tokio::time::timeout(Duration::from_secs(5), a.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let gb = tokio::time::timeout(Duration::from_secs(5), b.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ga.as_deref(), Some(&b"stream-a"[..]));
+        assert_eq!(gb.as_deref(), Some(&b"stream-b"[..]));
     }
 
     #[tokio::test]
