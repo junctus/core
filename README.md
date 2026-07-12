@@ -49,6 +49,7 @@ docs/             see the index below
 | [`PROTOCOL.md`](docs/PROTOCOL.md) | the per-flow wire pipeline and exit models |
 | [`CRYPTO.md`](docs/CRYPTO.md) | primitives and the constructions built on them |
 | [`DISCOVERY.md`](docs/DISCOVERY.md) | zero-config discovery, witnessed snapshots, Sybil/eclipse |
+| [`MONETIZATION.md`](docs/MONETIZATION.md) | economic sustainability without breaking unlinkability |
 | [`THREAT_MODEL.md`](docs/THREAT_MODEL.md) | adversaries, answers, honest limits |
 | [`SECURITY_ANALYSIS.md`](docs/SECURITY_ANALYSIS.md) | the adversarial internal review and its fixes |
 
