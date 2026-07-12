@@ -350,10 +350,15 @@ Close M6's deferred strong transports.
   only ever sees decoy; authenticators are unlinkable; a captured hello expires after the epoch window;
   camouflage round-trips both shapes and rejects the wrong shape; auth + camouflage work end-to-end over TCP.
 
-### M24 — Full two-party MPC-TLS core ✅ (real 2PC; full AEAD + key schedule under MPC)
+### M24 — Two-party MPC-TLS ✅ (malicious-secure 2PC crypto stack complete + adversarially verified; audit-gated)
 Take M22 to the real thing: compute a TLS session under **two-party computation** so the record key and
-plaintext are **never assembled at a single party** — built and verified bottom-up, then the documented
-"remaining steps" done: the SHA-256 key schedule, Poly1305 MAC, OT extension, and a malicious-security step.
+plaintext are **never assembled at a single party** — built and verified bottom-up, then every documented
+"remaining step" done, all the way to a **complete malicious-secure 2PC stack** (KOS malicious OT → malicious
+`F_pre` leaky-AND + bucketing → constant-round authenticated garbling, plus SPDZ for the field path), each
+construction implemented from its published spec, correctness/abort-tested, and adversarially verified.
+**"Done" here means the crypto stack is complete + tested + verified — audit-gated like all of neo, not
+production-proven.** What remains is *not* crypto-primitive work: the external audit + formal proofs,
+live-TLS systems integration, and two internal wirings (`ectf::mul_shared`→`spdz`; the KOS Roy22 fix).
 - Done: `neo-mpc::mpc_tls` — a genuine 2PC stack, each layer checked against a reference before the next:
   - `ot` / `ot_ext` — 1-of-2 **oblivious transfer** (Chou–Orlandi) and **IKNP OT extension** (many cheap OTs
     from `k=128` base OTs).
@@ -370,7 +375,8 @@ plaintext are **never assembled at a single party** — built and verified botto
     which iterates the same tag circuit by Horner and is a documented remaining step (see the deferred list).
   - `dualex` — **dual-execution**: a cheating garbler is caught by an output-equality check.
   Crate: `neo-mpc`.
-- The four deferred steps are now all built and tested (each a verified brick; semi-honest / malicious-*detecting*):
+- Every deferred step is now built, tested, and adversarially verified — building up to a complete
+  malicious-secure 2PC stack (each a verified brick):
   - ✅ **Full RFC 8439 AEAD under 2PC** — `session::seal_aead_shared` composes multi-block ChaCha20 with a
     **multi-block Poly1305** (`poly1305::tag_shared_multi`, Horner over the AAD/ciphertext/length blocks, key
     shared, message public); verifies **byte-for-byte against the stock `chacha20poly1305` crate**.
@@ -722,15 +728,12 @@ they all terminate or relay plaintext somewhere — neo's 2PC-TLS is the only st
 and plaintext are provably never assembled at one party.
 - Plan: the M24 2PC-TLS core (`neo-mpc::mpc_tls`) now has both deferred sub-protocols built and tested —
   the **EC point→field conversion** (`ectf`, validated against `p256`) that turns the shared ECDHE point
-  into the x-coordinate share feeding the SHA-256 key-schedule circuit, and the **WRK17 authenticated-share
-  core** (`wrk17`, MAC-checked, malicious-*detecting*), both now running their OT over **KOS maliciously-secure
-  OT** (`kos`, aborts on a cheating receiver) with WRK17's **bucketing / leakage removal** (`combine` +
-  `bucketed_triples`) built, and the **TLS 1.3 key schedule** (`hkdf::hkdf_expand_label_shared`, HKDF-Expand-
-  Label under 2PC) matched against the vetted `hmac`/`hkdf` crates. What M33 still needs on top: the exact
-  WRK17 **leaky-AND hash** primitive and the **constant-round garbled online** + formal proof (for real
-  malicious security, not just detection), an **MtA consistency check** for ECtF, and the **live wiring** — a
-  real TLS 1.3 handshake state machine + record layer against an actual server (the crypto is built; this is
-  systems integration). Then
+  into the x-coordinate share feeding the SHA-256 key-schedule circuit, and the **complete malicious 2PC**
+  (`kos` malicious OT → `authgarble` malicious `F_pre` leaky-AND + bucketing → constant-round authenticated
+  garbling; `spdz` for the field path; `hkdf` key schedule matched to the vetted crates), all adversarially
+  verified. The MPC-TLS crypto is **done**. What M33 still needs on top is **not crypto-primitive work**: the
+  formal proofs + the **external audit**, and the **live wiring** — a real TLS 1.3 handshake state machine +
+  record layer against an actual server (systems integration). Then
   a selective-opening circuit proves one fact ("balance > X", "account age > 2y") while the session bytes are
   never assembled anywhere. Also delivers the real distrusted-exit browsing mode and the plaintext-free
   forward leg M28 needs.

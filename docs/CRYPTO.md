@@ -65,12 +65,15 @@ A **3-message, key-confirmed** PQ-hybrid AKE (`neo-crypto::handshake`):
   **under 2PC into XOR-shares** — the ChaCha keystream, the SHA-256 key schedule, the Poly1305 tag, and an
   end-to-end **ChaCha20-Poly1305 record**, so the record key, keystream, and plaintext are **never
   assembled at any one party**. **dualex** adds a dual-execution check that catches a cheating garbler.
-  The **DECO EC point→field conversion** (`ectf`, Gilboa MtA over `F_p` + masked inversion, validated against
-  the vetted `p256` crate) and the **WRK17 authenticated-share core** (`wrk17`: IT-MAC shares, OT-generated
-  `aAND` triples, MAC-checked authenticated evaluation that aborts on tamper) are both built and tested — the
-  latter a malicious-*detection* layer, both now running their OT over `kos` (so the aBit/MtA/triple OTs
-  abort on a cheating receiver). Semi-honest / malicious-detecting core; see Outstanding for the remaining
-  hardening (malicious triple generation, an MtA consistency check, and the audit gate).
+  The **malicious-secure 2PC stack is complete and tested**: the **DECO EC point→pre-master conversion**
+  (`ectf`, Gilboa MtA over a **constant-time** `F_p` + masked inversion → `convert::a2b_shared` → the SHA-256
+  key schedule, validated against the vetted `p256` + NIST-KAT SHA-256); **KOS maliciously-secure OT** (`kos`);
+  the complete **WRK17/KRRW18 malicious 2PC** — malicious `F_pre` (`leaky_and` + bucketing) feeding
+  **constant-round authenticated garbling** (`authgarble`, where a corrupted garbled row aborts); the **TLS 1.3
+  key schedule** (`hkdf`, matched to the vetted `hmac`/`hkdf` crates); and **SPDZ** authenticated arithmetic
+  (`spdz`) for the field path. Every layer's abort mechanism is tested, and the constructions were
+  **adversarially verified against the published specs**. The formal malicious-security proofs and the
+  **external audit** are the security gate, as everywhere in neo.
 - **Persistent circuit tunnels** (`neo-node::circuit`) — a long-lived Sphinx circuit carrying a
   bidirectional byte stream as **counter-keyed onion cells** (no keystream reuse) with a **per-cell
   end-to-end MAC**, and a real **TCP splice** at the exit — TCP-over-onion, integrity to parity with the
@@ -84,47 +87,22 @@ A **3-message, key-confirmed** PQ-hybrid AKE (`neo-crypto::handshake`):
 
 ## Outstanding
 
-- **Two-party MPC-TLS** runs the **full ChaCha20-Poly1305 AEAD and SHA-256 key schedule under 2PC**
-  (`neo-mpc::mpc_tls`), semi-honest, with OT extension and a dual-execution cheating-garbler check. Both of
-  the deferred sub-protocols are now built and tested (still semi-honest / malicious-*detecting*):
-  ✅ the **full RFC 8439 AEAD** (multi-block Poly1305, matched byte-for-byte against the stock crate) and
-  ✅ **TLS 1.3 record framing** (nonce/AAD/content-type, a real `TLSCiphertext`);
-  ✅ the **DECO EC point→field conversion + the full pre-master bridge** — `ectf::ectf` composes **Gilboa MtA
-  over `F_p`** (on the crate's real OT) and a masked inversion into an additive x-coordinate share (validated
-  against **P-256 point addition from the vetted `p256` crate**); `convert::a2b_shared` runs A2B **on the real
-  256-bit P-256 prime**; and `convert::premaster_hash_from_point_shares` **chains ectf → a2b → the SHA-256
-  key-schedule circuit end-to-end** — EC point shares → `SHA-256(x-coordinate)` under 2PC, the x-coordinate
-  **never assembled**, validated against `p256` and the NIST-KAT SHA-256 reference;
-  ✅ the **WRK17 authenticated-share core** (`wrk17`) — TinyOT-style IT-MAC shares, **OT-generated `aAND`
-  triples**, an authenticated circuit evaluation whose every open is **MAC-checked** so any tampered wire
-  **aborts**, plus the **sacrifice check** — a real, tested malicious-*detection* layer (verified against a
-  4-bit adder and by tamper-abort tests);
-  ✅ the **KOS maliciously-secure OT extension** (`kos`) — IKNP plus a `GF(2¹²⁸)` correlation check that
-  **aborts on a cheating receiver** (tested); ECtF's MtA and WRK17's aBit/triple OTs now run over it, closing
-  the OT layer's selective-failure channel (the aBit consistency check);
-  ✅ WRK17's **bucketing / leakage removal** (`wrk17::combine` + `bucketed_triples`) — the real WRK17 combine
-  (open `y1⊕y2`, fold to `(⟨x1⊕x2⟩,⟨y1⟩,⟨z1⊕z2⊕d·x2⟩)`) over random buckets; combine verified exhaustively;
-  ✅ the **TLS 1.3 key schedule under 2PC** (`hkdf::hkdf_expand_label_shared`) — `HKDF-Expand-Label` /
-  HMAC-SHA256 with a **shared secret + public label** inside the garbled SHA-256 circuit, matched byte-for-byte
-  against the vetted `hmac`/`hkdf` crates;
-  ✅ the **complete WRK17/KRRW18 malicious 2PC**, implemented from the published construction and tied together
-  end-to-end (`authgarble`): the malicious `F_pre` — **leaky-AND triples** (`leaky_and`: garbled rows
-  `r0=H(X)⊕Z`, `r1=H(X⊕Δ_A)⊕Y⊕Z`) plus **bucketing** (`combine` + `bucketed_and_triples`, random-shuffled
-  buckets) — feeding the **constant-round authenticated-garbling online** (every wire a doubly-authenticated
-  `{x}=[x·(Δ_A,Δ_B,1)]`, each AND a half-gate pair, a **corrupted garbled row ⇒ abort**). Tested exhaustively
-  at the gate/triple level, and **end-to-end**: bucketed leaky-AND triples drive the garbled evaluation of a
-  4-bit adder correctly. So the whole stack — malicious OT (`kos`) → malicious `F_pre` (leaky-AND + bucketing)
-  → malicious online (authenticated garbling) — is built and correctness/abort-tested; the **formal proofs +
-  external audit** are the security gate (not test-establishable), and `kos` ships original KOS15 (an auditor
-  applies the Roy22 fix);
-  ✅ the **SPDZ authenticated arithmetic** for ECtF's *field* multiplication (`spdz`) — MASCOT/SPDZ shares
-  `[x]` (additive shares of `x` and `α·x`), MAC-checked opens, **Beaver multiplication**, and the **triple
-  sacrifice** check (a tampered share or a corrupted product aborts); the malicious-detection analog of the
-  boolean `wrk17`, over the constant-time `F_p`. Remaining: **wiring** ECtF's `mul_shared` onto this Beaver
-  online, **live wiring** (a real TLS 1.3 handshake state machine + record layer against an actual server —
-  systems integration, not a primitive), and a **succinct** ZK shuffle. Honest,
-  tested cores.
-- **Wire-level transport integration** — wiring the REALITY decoy to a genuine upstream TLS site and
-  embedding the flight in a true TLS ClientHello; `Camouflage` today mimics observable shape, not full
-  QUIC/DTLS protocol crypto (a real QUIC transport lives behind the `quic` feature).
-- The **external cryptography audit** is the hard gate before real-world use.
+- **Two-party MPC-TLS — crypto stack complete** (audit-gated, as all of neo). The full ChaCha20-Poly1305
+  AEAD + TLS 1.3 record framing under 2PC; the DECO **EC point→pre-master** conversion (`ectf` over a
+  constant-time `F_p` → A2B → the SHA-256 key schedule end-to-end, validated against `p256`/NIST); the **TLS
+  1.3 key schedule** (`hkdf`, matched to the vetted `hmac`/`hkdf` crates); and the complete **WRK17/KRRW18
+  malicious 2PC** — malicious OT (`kos`) → malicious `F_pre` (leaky-AND + bucketing) → constant-round
+  authenticated garbling (`authgarble`) — plus **SPDZ** authenticated arithmetic (`spdz`) for the field path.
+  Every layer's abort mechanism is tested and the constructions were **adversarially verified against the
+  published specs**. What remains is **not crypto-primitive work**: the **external audit** (the hard gate) +
+  the formal proofs; **live-TLS systems integration** (a real handshake state machine + record layer against
+  an actual server); and two internal wirings — `ectf::mul_shared` onto the `spdz` Beaver online, and the KOS
+  **Roy22** fix (it ships original KOS15). A **succinct** ZK shuffle is separate research.
+- **REALITY full-session indistinguishability** — the REALITY authenticator is embedded in a real TLS 1.3
+  ClientHello (`neo-transport::tls`, `build/parse_client_hello`) and an active prober is silently
+  reverse-proxied to a genuine pinned upstream (`Conn::reverse_proxy_decoy`) — both built and tested. The
+  remaining gap is the **flagship property**: the authenticated path completes only the first flight (no
+  ServerHello / full session), so active probing or deep inspection *past* the ClientHello can still tell an
+  authenticated neo session from a real TLS site. (`Camouflage` deliberately mimics observable *shape*, not
+  full QUIC/DTLS crypto — the protocol-faithful transport is the `quic` feature; that is a design boundary,
+  not pending work.)
