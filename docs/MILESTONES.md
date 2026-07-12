@@ -473,7 +473,7 @@ Each is buildable on existing crates — no capability here is a from-scratch re
 boundary says so. They are sequenced so the enabling wiring (M26) lands before the features that ride it,
 and every REALITY/MPC milestone depends on the M25 hardening fixes.
 
-### M27 — Genuine in-ClientHello REALITY with a live decoy reverse-proxy ⬜ (flagship)
+### M27 — Genuine in-ClientHello REALITY with a live decoy reverse-proxy 🔨 (in-ClientHello + decoy shipped; full-session TLS mimicry is the remaining flagship piece)
 Why it matters: this converts neo's tested REALITY auth core from "probe-resistant in theory" into the
 actual REALITY threat model — a bridge that *is* a real website to any prober.
 - Plan: two additive pieces on top of the M23 auth core (`neo-crypto::reality`) and the M25 forgery fix.
@@ -493,6 +493,27 @@ actual REALITY threat model — a bridge that *is* a real website to any prober.
   version/ALPN, and TCP-reset behavior or a sophisticated censor distinguishes on side channels. Do **not**
   use "undetectable" language until this and M25's replay-cache fix both land; keep the honest-boundary
   note current.
+- **Shipped (in-ClientHello + decoy):** `neo-transport::tls` — a hand-rolled, structurally-valid TLS 1.3
+  ClientHello builder/parser that hides the 64-byte authenticator in fields already uniform-random
+  (`eph_pub`→`key_share`, `tag`→`legacy_session_id`, real REALITY's layout). `dial_reality` writes a real
+  ClientHello (with SNI); `accept_reality` reads a real TLS record, extracts the fields, and classifies;
+  `Conn::reverse_proxy_decoy` splices an un-authenticated prober to an operator-pinned upstream (SSRF-guarded,
+  connect + splice timeouts). `neo-crypto` gained `RealityKey::client_hello_prefix`. An adversarial review
+  confirmed the ClientHello is structurally valid (a real TLS server/Wireshark accepts it) and the parser is
+  panic-free with no false-authentication path.
+- **NOT yet delivered — the flagship property is not met (honest).** A three-lens review found the
+  authenticated path is still distinguishable: **(1, critical)** after the ClientHello the server sends **no
+  ServerHello** — the authenticated session drops straight into neo's obfuscated framing, so a censor that
+  merely observes the handshake it initiated sees "no server response, then the client keeps sending," a
+  trivial tell. Real REALITY completes a full TLS 1.3 handshake on the auth path too (proxying the upstream's
+  ServerHello + cert) and diverges only *inside* the encrypted stream. **(2)** auth-vs-decoy **timing**
+  differs (the decoy dials an upstream; the auth path doesn't). **(3)** the ClientHello is **one fixed,
+  non-browser-matching fingerprint** (improved with renegotiation_info/status_request/SCT, but still not a
+  byte-exact uTLS profile — itself a tell). So this shipped the two *additive* pieces the plan named, which
+  are necessary but **not sufficient**: the remaining work is **full-session TLS mimicry** — the auth path
+  proxying a real handshake with matched timing, plus a uTLS-grade fingerprint. That is a substantial
+  separate effort. Keep "no undetectable language": today a probe cannot forge the authenticator, but a
+  censor *can* still distinguish an authenticated neo session from a real TLS site.
 
 ### M28 — Verdict: the committee exit no one can subpoena ✅ (decrypt-direction, runnable end-to-end; real clearnet exit + DKG liveness deferred)
 Why it matters: an exit whose operators are *cryptographically incapable* of complying with a wiretap is

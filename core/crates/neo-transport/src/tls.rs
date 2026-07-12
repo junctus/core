@@ -39,15 +39,18 @@ const GROUP_X25519: u16 = 0x001d;
 
 /// Extension type numbers used here (RFC 8446 / IANA TLS registry).
 const EXT_SERVER_NAME: u16 = 0x0000;
+const EXT_STATUS_REQUEST: u16 = 0x0005;
 const EXT_SUPPORTED_GROUPS: u16 = 0x000a;
 const EXT_EC_POINT_FORMATS: u16 = 0x000b;
 const EXT_SIGNATURE_ALGORITHMS: u16 = 0x000d;
 const EXT_ALPN: u16 = 0x0010;
+const EXT_SIGNED_CERTIFICATE_TIMESTAMP: u16 = 0x0012;
 const EXT_EXTENDED_MASTER_SECRET: u16 = 0x0017;
 const EXT_SESSION_TICKET: u16 = 0x0023;
 const EXT_KEY_SHARE: u16 = 0x0033;
 const EXT_PSK_KEY_EXCHANGE_MODES: u16 = 0x002d;
 const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
+const EXT_RENEGOTIATION_INFO: u16 = 0xff01;
 
 /// The largest ClientHello record body we will read/accept — a sane cap far above a
 /// real hello (~a few hundred bytes) that still bounds a malicious length field.
@@ -64,9 +67,15 @@ pub fn build_client_hello(prefix: &[u8; REALITY_PREFIX_LEN], server_name: &str) 
     let (eph, tag) = neo_crypto::RealityKey::split_prefix(prefix);
 
     let mut client_random = [0u8; 32];
-    // A failure here is not fatal to indistinguishability (zeros are still a valid,
-    // if unlucky, random); best-effort fill.
-    let _ = getrandom::getrandom(&mut client_random);
+    if getrandom::getrandom(&mut client_random).is_err() {
+        // getrandom failing is near-impossible on target platforms, but an
+        // all-zero client_random would be a glaring statistical tell — fall back to
+        // the (high-entropy) eph‖tag so the field is never all-zeros.
+        client_random.copy_from_slice(&prefix[..32]);
+        for (r, t) in client_random.iter_mut().zip(&tag) {
+            *r ^= t;
+        }
+    }
     let grease = grease_value();
 
     let mut hello = Vec::with_capacity(512);
@@ -167,16 +176,20 @@ fn key_share_x25519(ext_bytes: &[u8]) -> Option<[u8; 32]> {
 
 /// The extensions block (concatenated), in a plausible modern order.
 fn extensions(grease: u16, server_name: &str, eph: &[u8; 32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(256);
+    let mut out = Vec::with_capacity(320);
     // Leading GREASE (empty), as browsers place one first.
     out.extend_from_slice(&ext(grease, &[]));
     out.extend_from_slice(&ext(EXT_SERVER_NAME, &server_name_ext(server_name)));
     out.extend_from_slice(&ext(EXT_EXTENDED_MASTER_SECRET, &[]));
+    // renegotiation_info: every modern browser sends this (empty renegotiated conn).
+    out.extend_from_slice(&ext(EXT_RENEGOTIATION_INFO, &[0x00]));
     out.extend_from_slice(&ext(EXT_SUPPORTED_GROUPS, &supported_groups(grease)));
     out.extend_from_slice(&ext(EXT_EC_POINT_FORMATS, &[1, 0x00])); // uncompressed
     out.extend_from_slice(&ext(EXT_SESSION_TICKET, &[]));
     out.extend_from_slice(&ext(EXT_ALPN, &alpn(&["h2", "http/1.1"])));
+    out.extend_from_slice(&ext(EXT_STATUS_REQUEST, &status_request())); // OCSP
     out.extend_from_slice(&ext(EXT_SIGNATURE_ALGORITHMS, &signature_algorithms()));
+    out.extend_from_slice(&ext(EXT_SIGNED_CERTIFICATE_TIMESTAMP, &[])); // SCT
     out.extend_from_slice(&ext(EXT_KEY_SHARE, &key_share_ext(grease, eph)));
     out.extend_from_slice(&ext(EXT_PSK_KEY_EXCHANGE_MODES, &[1, 0x01])); // psk_dhe_ke
     out.extend_from_slice(&ext(EXT_SUPPORTED_VERSIONS, &supported_versions(grease)));
@@ -263,6 +276,12 @@ fn alpn(protocols: &[&str]) -> Vec<u8> {
     out.extend_from_slice(&(list.len() as u16).to_be_bytes());
     out.extend_from_slice(&list);
     out
+}
+
+/// An OCSP `status_request` body: `status_type=ocsp(1)`, empty responder-id list,
+/// empty request-extensions — the exact shape browsers send.
+fn status_request() -> Vec<u8> {
+    vec![0x01, 0x00, 0x00, 0x00, 0x00]
 }
 
 fn signature_algorithms() -> Vec<u8> {

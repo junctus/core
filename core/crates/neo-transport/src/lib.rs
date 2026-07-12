@@ -46,6 +46,13 @@ use tokio::net::{TcpListener, TcpStream};
 /// the pre-auth memory-DoS surface small — 1 MiB, not the old 16 MiB.
 const MAX_RECORD: usize = 1024 * 1024;
 
+/// Connect timeout when dialing a decoy upstream, so a blackholed upstream can't
+/// pin a prober's accepted connection open for the OS default (tens of seconds).
+const DECOY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+/// Total lifetime of a decoy splice, so a prober that keeps its write half open
+/// (as a real TLS client does) can't hold two sockets + an accept task forever.
+const DECOY_SPLICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// A reversible transformation applied to each record before it hits the wire.
 pub trait Obfuscation: Clone + Send + Sync + 'static {
     /// Turn an application payload into a wire record.
@@ -350,10 +357,14 @@ pub enum RealityAccept<O: Obfuscation> {
     },
 }
 
-/// Read the client's first **TLS record** whole (the ClientHello), returning its
-/// raw bytes (5-byte record header included) so the decoy path can replay them
-/// verbatim. Bounded by [`tls::MAX_CLIENT_HELLO`] and a read timeout so a slowloris
-/// or an oversized length field can't hang or exhaust the accept task.
+/// Read the client's first **TLS record** (its ClientHello), returning the raw
+/// bytes (5-byte record header included). A ClientHello that a client fragments
+/// across multiple TLS records — rare, but RFC 8446 permits it — yields only the
+/// first record: `parse_client_hello` then returns `None` and the peer takes the
+/// Decoy path, where `copy_bidirectional` still forwards the remaining fragments to
+/// the upstream, so the handshake completes. Bounded by [`tls::MAX_CLIENT_HELLO`]
+/// and a read timeout so a slowloris or an oversized length field can't hang or
+/// exhaust the accept task.
 async fn read_tls_record(stream: &mut TcpStream) -> Result<Vec<u8>> {
     let read = async {
         let mut header = [0u8; 5];
@@ -387,9 +398,15 @@ impl<O: Obfuscation> Conn<O> {
     /// either side closes. A prober therefore completes a real TLS session — real
     /// cert, real page — with an operator-pinned site and learns nothing.
     ///
-    /// `upstream` is operator-configured (not attacker-supplied), but is still run
-    /// through the SSRF guard; `allow_loopback` opens localhost for dev/test decoys.
+    /// `upstream` must be an operator-configured **IP:port literal** (the SSRF guard
+    /// rejects hostnames); `allow_loopback` opens localhost for dev/test decoys.
     /// Consumes `self`: the connection is spent on the proxy.
+    ///
+    /// Bounded against resource exhaustion: the upstream dial has a connect timeout
+    /// and the splice a total timeout, so a prober that stalls or a blackholed
+    /// upstream can't pin an accept task and two sockets open indefinitely (a real
+    /// prober is a TLS client that keeps its write half open awaiting a ServerHello,
+    /// so `copy_bidirectional` would otherwise never return on its own).
     pub async fn reverse_proxy_decoy(
         self,
         first_flight: &[u8],
@@ -401,12 +418,19 @@ impl<O: Obfuscation> Conn<O> {
                 "decoy upstream is not a safe target: {upstream}"
             )));
         }
-        let mut up = TcpStream::connect(upstream).await?;
+        let mut up = tokio::time::timeout(DECOY_CONNECT_TIMEOUT, TcpStream::connect(upstream))
+            .await
+            .map_err(|_| Error::Config("decoy upstream connect timed out".into()))??;
         up.write_all(first_flight).await?;
         up.flush().await?;
         let mut client = self.stream;
-        // A reset/close is the normal end of a proxied session, not an error.
-        let _ = tokio::io::copy_bidirectional(&mut client, &mut up).await;
+        // A reset/close is the normal end of a proxied session, not an error; a
+        // stalled prober is torn down by the total timeout.
+        let _ = tokio::time::timeout(
+            DECOY_SPLICE_TIMEOUT,
+            tokio::io::copy_bidirectional(&mut client, &mut up),
+        )
+        .await;
         Ok(())
     }
 
