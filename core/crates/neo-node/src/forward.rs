@@ -230,13 +230,13 @@ mod tests {
     /// Bind a relay that accepts exactly one onion connection and returns the
     /// outcome of handling it. Returns the bound address and a handle to await.
     async fn relay_once(
-        identity_bytes: Vec<u8>,
+        identity_bytes: impl AsRef<[u8]> + Send + 'static,
         resolver: HashMap<NodeId, String>,
     ) -> (String, JoinHandle<Outcome>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let handle = tokio::spawn(async move {
-            let identity = NodeIdentity::from_bytes(&identity_bytes).unwrap();
+            let identity = NodeIdentity::from_bytes(identity_bytes.as_ref()).unwrap();
             let (mut stream, mut result) = accept(&listener, &identity).await.unwrap();
             // Consume the connection-mode frame the peer sends first.
             let mode = result

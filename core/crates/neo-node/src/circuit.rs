@@ -297,11 +297,32 @@ pub async fn serve_circuit<R: NextHop>(
     }
 }
 
-/// Policy governing what an exit may splice a TCP connection to. The default
-/// **denies** every non-public destination (loopback, RFC1918, link-local /
-/// metadata, ULA, CGNAT, hostnames) — an SSRF / open-proxy guard. `allow_loopback`
-/// opens localhost for local dev/test only; production leaves it `false`. Port
-/// allowlisting and a full exit policy are M31.
+/// Ports an exit refuses to splice to by default — the reduced-harm baseline. These
+/// are the destinations that generate the abuse complaints (and law-enforcement
+/// attention) that deter people from running exits at all: mail (spam), remote
+/// login / admin (brute-force scanning), file sharing, and plaintext DNS
+/// (amplification / exfiltration). Blocking them turns an exit from an open proxy
+/// into a low-risk web egress. (A configurable allow/deny list — HTTPS-only,
+/// operator-curated — is the rest of M31.)
+const DENIED_EXIT_PORTS: &[u16] = &[
+    22,  // SSH
+    23,  // Telnet
+    25,  // SMTP (spam — Tor blocks this too)
+    53,  // plaintext DNS
+    135, // MS RPC
+    137, 138, 139, // NetBIOS
+    445, // SMB
+    465, 587,  // SMTP submission
+    3389, // RDP
+    6667, // IRC (botnet C2)
+];
+
+/// Policy governing what an exit may splice a connection to. The default **denies**
+/// every non-public destination (loopback, RFC1918, link-local / metadata, ULA,
+/// CGNAT, hostnames) — an SSRF / open-proxy guard — **and** the abuse-prone ports in
+/// [`DENIED_EXIT_PORTS`]. `allow_loopback` opens localhost for local dev/test only;
+/// production leaves it `false`. A full configurable exit policy (allowlists,
+/// HTTPS-only) is M31.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ExitPolicy {
     /// Permit loopback splice targets (local dev/test only).
@@ -310,6 +331,30 @@ pub struct ExitPolicy {
     /// refuses to splice even if a circuit terminates at it (defence in depth:
     /// only exit-flagged relays should be picked as an exit in the first place).
     pub offer_exit: bool,
+}
+
+impl ExitPolicy {
+    /// Whether this exit will egress to `port`. Refuses the reduced-harm
+    /// [`DENIED_EXIT_PORTS`] set so an exit can't be turned into an open proxy for
+    /// spam / scanning / amplification.
+    pub fn permits_port(&self, port: u16) -> bool {
+        !DENIED_EXIT_PORTS.contains(&port)
+    }
+}
+
+/// Reject a splice target whose port is on the reduced-harm denylist, after the
+/// SSRF check has confirmed it parses as a public `host:port` literal.
+fn check_exit_port(target: &str, policy: &ExitPolicy) -> Result<()> {
+    let port = target
+        .parse::<std::net::SocketAddr>()
+        .map(|sa| sa.port())
+        .map_err(|_| Error::Config("exit target has no parseable port".into()))?;
+    if !policy.permits_port(port) {
+        return Err(Error::Config(format!(
+            "exit refuses port {port} (reduced-harm policy)"
+        )));
+    }
+    Ok(())
 }
 
 /// A middle relay: strip one forward layer toward the exit, add one return layer
@@ -394,6 +439,8 @@ async fn exit_splice(
             "exit refuses to splice to non-public target {target}"
         )));
     }
+    // Reduced-harm port policy: refuse abuse-prone ports (spam/scan/amplification).
+    check_exit_port(target, &policy)?;
     let tcp = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         crate::netif::connect_scoped(target),
@@ -494,6 +541,8 @@ async fn exit_splice_udp(
             "exit refuses to splice UDP to non-public target {target}"
         )));
     }
+    // Reduced-harm port policy (e.g. block plaintext DNS:53 amplification over UDP).
+    check_exit_port(target, &policy)?;
     let udp = tokio::net::UdpSocket::bind("0.0.0.0:0")
         .await
         .map_err(|e| Error::Config(format!("exit UDP bind failed: {e}")))?;
@@ -585,6 +634,28 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
     use tokio::net::TcpListener;
+
+    #[test]
+    fn exit_port_policy_blocks_abuse_ports() {
+        let policy = ExitPolicy::default();
+        // Web egress is fine.
+        assert!(policy.permits_port(443));
+        assert!(policy.permits_port(80));
+        assert!(policy.permits_port(8080));
+        // Abuse-prone ports are refused (reduced-harm default).
+        for p in [22u16, 23, 25, 53, 445, 465, 587, 3389, 6667] {
+            assert!(!policy.permits_port(p), "port {p} must be denied");
+        }
+        // The splice-level guard rejects a denied port and accepts a web port.
+        assert!(
+            check_exit_port("1.1.1.1:25", &policy).is_err(),
+            "SMTP refused"
+        );
+        assert!(
+            check_exit_port("1.1.1.1:443", &policy).is_ok(),
+            "HTTPS allowed"
+        );
+    }
     use tokio::task::JoinHandle;
 
     fn hop_of(identity: &NodeIdentity, addr: &str) -> Hop {
@@ -597,13 +668,13 @@ mod tests {
     }
 
     async fn spawn_serve(
-        id_bytes: Vec<u8>,
+        id_bytes: impl AsRef<[u8]> + Send + 'static,
         resolver: HashMap<NodeId, String>,
     ) -> (String, JoinHandle<Result<()>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let handle = tokio::spawn(async move {
-            let identity = NodeIdentity::from_bytes(&id_bytes).unwrap();
+            let identity = NodeIdentity::from_bytes(id_bytes.as_ref()).unwrap();
             let (stream, result) = accept(&listener, &identity).await.unwrap();
             let replay = Mutex::new(ReplayCache::new());
             // Go through the real relay dispatch so the mode frame is consumed.

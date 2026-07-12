@@ -212,13 +212,13 @@ mod tests {
 
     /// Spawn a relay/exit that handles one circuit connection.
     async fn spawn_hop(
-        identity_bytes: Vec<u8>,
+        identity_bytes: impl AsRef<[u8]> + Send + 'static,
         resolver: Resolver,
     ) -> (String, JoinHandle<Result<()>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let handle = tokio::spawn(async move {
-            let identity = NodeIdentity::from_bytes(&identity_bytes).unwrap();
+            let identity = NodeIdentity::from_bytes(identity_bytes.as_ref()).unwrap();
             let (mut stream, mut result) = accept(&listener, &identity).await.unwrap();
             let replay = Mutex::new(ReplayCache::new());
             handle_circuit(

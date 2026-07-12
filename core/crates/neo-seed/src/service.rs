@@ -440,20 +440,19 @@ async fn post_register(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    let ip = client_ip(&headers, peer.ip(), &state.trusted_proxies);
-    if !state.check_and_stamp_cooldown(ip) {
-        return (StatusCode::TOO_MANY_REQUESTS, "slow down\n".to_string());
-    }
-
+    // Parse and prove-work FIRST, before touching any rate-limit state. A
+    // malformed body or a request with no/invalid proof-of-work is rejected without
+    // consuming the per-IP cooldown quota — otherwise an attacker (or a broken
+    // client) could spend an honest relay's quota when they share a source IP (NAT /
+    // the fronting proxy). Parse + one BLAKE3 PoW check are cheap; the body size is
+    // already bounded by the route's body limit.
     let record = match PeerRecord::from_bytes(&body) {
         Ok(r) => r,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("bad record: {e}\n")),
     };
 
     // Registration proof-of-work (M36): a coarse anti-flood gate bound to the
-    // record's identity. Checked before the (cheap) key cooldown and the (more
-    // expensive) signature verification inside `admit`, so an unsolved flood is
-    // rejected early.
+    // record's identity.
     if state.require_registration_pow {
         match parse_pow_header(&headers) {
             Some(nonce)
@@ -473,6 +472,11 @@ async fn post_register(
         }
     }
 
+    // Only now spend rate-limit quota, on a well-formed, PoW-valid request.
+    let ip = client_ip(&headers, peer.ip(), &state.trusted_proxies);
+    if !state.check_and_stamp_cooldown(ip) {
+        return (StatusCode::TOO_MANY_REQUESTS, "slow down\n".to_string());
+    }
     // Per-key cooldown: bounds one identity's registration rate across IPs.
     if !state.check_and_stamp_key_cooldown(record.id) {
         return (StatusCode::TOO_MANY_REQUESTS, "slow down\n".to_string());

@@ -24,7 +24,7 @@ use curve25519_dalek::Scalar;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use ml_kem::{Encoded, EncodedSizeUser, KemCore, MlKem768};
 use x25519_dalek::{PublicKey as KexPublic, StaticSecret as KexSecret};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 /// ML-KEM secret (decapsulation) key type for the chosen parameter set.
 type KemDecapKey = <MlKem768 as KemCore>::DecapsulationKey;
@@ -245,13 +245,18 @@ impl NodeIdentity {
     /// Layout: `[0..32]` Ed25519 seed, `[32..64]` X25519 secret scalar, then the
     /// ML-KEM-768 decapsulation key (fixed length for the parameter set). The
     /// Ristretto routing key is re-derived, not stored.
-    pub fn to_bytes(&self) -> Vec<u8> {
+    ///
+    /// Returns a [`Zeroizing`] buffer: this is raw **secret** key material, so the
+    /// serialized copy is wiped from memory when the caller drops it (rather than
+    /// lingering in freed heap after being written to disk). It derefs to a byte
+    /// slice, so callers use it exactly like a `Vec<u8>`.
+    pub fn to_bytes(&self) -> Zeroizing<Vec<u8>> {
         let kem_bytes = self.kem.as_bytes();
         let mut out = Vec::with_capacity(CLASSICAL_SEED_LEN + kem_bytes.len());
         out.extend_from_slice(&self.signing.to_bytes());
         out.extend_from_slice(&self.kex.to_bytes());
         out.extend_from_slice(kem_bytes.as_ref());
-        out
+        Zeroizing::new(out)
     }
 
     /// Reconstruct a secret identity from [`to_bytes`](Self::to_bytes) output.
@@ -292,7 +297,7 @@ mod tests {
         let id = NodeIdentity::generate().unwrap();
         let restored = NodeIdentity::from_bytes(&id.to_bytes()).expect("from_bytes");
         assert_eq!(id.public().id, restored.public().id);
-        assert_eq!(id.to_bytes(), restored.to_bytes());
+        assert_eq!(*id.to_bytes(), *restored.to_bytes());
         // The derived Ristretto routing key survives a round-trip too.
         assert_eq!(id.sphinx_public(), restored.sphinx_public());
     }

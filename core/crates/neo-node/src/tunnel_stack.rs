@@ -367,11 +367,14 @@ mod tests {
         }
     }
 
-    async fn spawn_serve(id_bytes: Vec<u8>, resolver: HashMap<NodeId, String>) -> String {
+    async fn spawn_serve(
+        id_bytes: impl AsRef<[u8]> + Send + 'static,
+        resolver: HashMap<NodeId, String>,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         tokio::spawn(async move {
-            let identity = NodeIdentity::from_bytes(&id_bytes).unwrap();
+            let identity = NodeIdentity::from_bytes(id_bytes.as_ref()).unwrap();
             let (stream, result) = accept(&listener, &identity).await.unwrap();
             let replay = Mutex::new(ReplayCache::new());
             let _ = crate::serve::serve_connection(

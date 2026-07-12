@@ -267,7 +267,7 @@ mod tests {
     fn tunnels_a_packet_to_a_peer_and_back() {
         let server_id = NodeIdentity::generate().unwrap();
         let client_id = NodeIdentity::generate().unwrap();
-        let client_secret = client_id.to_bytes();
+        let client_secret = client_id.to_bytes().to_vec();
 
         let rt = runtime();
         let listener = rt

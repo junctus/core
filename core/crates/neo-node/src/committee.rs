@@ -1245,14 +1245,14 @@ mod tests {
     }
 
     async fn spawn_committee_hop(
-        identity_bytes: Vec<u8>,
+        identity_bytes: impl AsRef<[u8]> + Send + 'static,
         share: KeyShare,
         resolver: HashMap<NodeId, String>,
     ) -> (String, tokio::task::JoinHandle<Result<()>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let handle = tokio::spawn(async move {
-            let identity = NodeIdentity::from_bytes(&identity_bytes).unwrap();
+            let identity = NodeIdentity::from_bytes(identity_bytes.as_ref()).unwrap();
             let (stream, result) = crate::run::accept(&listener, &identity).await.unwrap();
             let replay = Mutex::new(ReplayCache::new());
             // Route through the real serve dispatcher so the FRAME_COMMITTEE mode
@@ -1319,12 +1319,12 @@ mod tests {
     /// Serve committee circuits in a loop until the runtime shuts down (test only).
     fn serve_committee_loop(
         listener: tokio::net::TcpListener,
-        identity_bytes: Vec<u8>,
+        identity_bytes: impl AsRef<[u8]> + Send + 'static,
         share: KeyShare,
         resolver: HashMap<NodeId, String>,
     ) {
         tokio::spawn(async move {
-            let identity = NodeIdentity::from_bytes(&identity_bytes).unwrap();
+            let identity = NodeIdentity::from_bytes(identity_bytes.as_ref()).unwrap();
             let replay = Mutex::new(ReplayCache::new());
             while let Ok((stream, _)) = listener.accept().await {
                 let (stream, result) =

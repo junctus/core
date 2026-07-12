@@ -26,8 +26,10 @@ uniffi::setup_scaffolding!();
 /// Returns an empty vector only if the OS RNG is unavailable (catastrophic).
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 pub fn generate_identity() -> Vec<u8> {
+    // The secret must cross the FFI boundary as a plain Vec for the platform to
+    // persist it (unavoidable); the in-Rust `Zeroizing` copy is wiped when it drops.
     NodeIdentity::generate()
-        .map(|identity| identity.to_bytes())
+        .map(|identity| identity.to_bytes().to_vec())
         .unwrap_or_default()
 }
 
