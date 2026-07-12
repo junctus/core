@@ -51,8 +51,10 @@ impl From<NeoPrivacy> for PrivacyLevel {
     }
 }
 
-/// Why a tunnel operation failed. Coarse on purpose — the shell logs `message`
-/// and surfaces a connect failure to the OS.
+/// Why a tunnel operation failed. Coarse on purpose — the shell logs `detail`
+/// and surfaces a connect failure to the OS. (The field is `detail`, not
+/// `message`, because a UniFFI error field named `message` collides with
+/// `Throwable.message` in the generated Kotlin.)
 #[cfg_attr(feature = "uniffi", derive(uniffi::Error))]
 #[derive(Debug, thiserror::Error)]
 pub enum NeoTunnelError {
@@ -60,11 +62,11 @@ pub enum NeoTunnelError {
     #[error("invalid identity secret")]
     Identity,
     /// Dialing the peer or completing the handshake failed.
-    #[error("connect failed: {message}")]
-    Connect { message: String },
+    #[error("connect failed: {detail}")]
+    Connect { detail: String },
     /// Fetching or verifying the relay snapshot from the mirrors failed.
-    #[error("discovery failed: {message}")]
-    Discovery { message: String },
+    #[error("discovery failed: {detail}")]
+    Discovery { detail: String },
     /// The session has been closed.
     #[error("tunnel session is closed")]
     Closed,
@@ -115,7 +117,7 @@ impl NeoTunnelSession {
         let (stream, handshake) = rt
             .block_on(neo_node::run::connect(&peer_addr, &identity))
             .map_err(|e| NeoTunnelError::Connect {
-                message: e.to_string(),
+                detail: e.to_string(),
             })?;
         let peer_key = handshake.peer.to_bytes().to_vec();
 
@@ -236,7 +238,9 @@ impl NeoTunnelSession {
     }
 
     /// Tear down the tunnel and stop its background tasks. Idempotent.
-    pub fn close(&self) {
+    /// Named `shutdown` (not `close`) to avoid colliding with the `close()` that
+    /// UniFFI generates for `AutoCloseable` in the Kotlin bindings.
+    pub fn shutdown(&self) {
         self.close_inner()
     }
 }
@@ -324,7 +328,7 @@ mod tests {
         let session = tunnel_connect(client_secret, addr, NeoPrivacy::Off).expect("connect");
         session.submit_outbound(vec![b"ping-through-the-tunnel".to_vec()]);
         let got = session.drain_inbound(4, 5_000);
-        session.close();
+        session.shutdown();
         assert_eq!(got, vec![b"ping-through-the-tunnel".to_vec()]);
         assert_eq!(session.peer_key().len(), 32);
     }

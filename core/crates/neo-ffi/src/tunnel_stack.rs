@@ -135,7 +135,7 @@ async fn fetch_relays(
         .timeout(FETCH_TIMEOUT)
         .build()
         .map_err(|e| NeoTunnelError::Discovery {
-            message: e.to_string(),
+            detail: e.to_string(),
         })?;
     let now = now_unix();
     let mut last = "no mirrors configured".to_string();
@@ -164,7 +164,7 @@ async fn fetch_relays(
             Err(e) => last = format!("{mirror}: {e}"),
         }
     }
-    Err(NeoTunnelError::Discovery { message: last })
+    Err(NeoTunnelError::Discovery { detail: last })
 }
 
 /// A live multi-hop tunnel. Drive it from the OS packet loop exactly like
@@ -201,10 +201,10 @@ impl NeoTunnelStackSession {
         let mut witnesses = Vec::with_capacity(witnesses_hex.len());
         for hex_key in &witnesses_hex {
             let raw = hex::decode(hex_key.trim()).map_err(|_| NeoTunnelError::Discovery {
-                message: format!("witness key is not valid hex: {hex_key}"),
+                detail: format!("witness key is not valid hex: {hex_key}"),
             })?;
             let key: [u8; 32] = raw.try_into().map_err(|_| NeoTunnelError::Discovery {
-                message: "witness key must be 32 bytes".to_string(),
+                detail: "witness key must be 32 bytes".to_string(),
             })?;
             witnesses.push(key);
         }
@@ -222,7 +222,7 @@ impl NeoTunnelStackSession {
         // would be dropped. Surface that as a clear connect failure.
         if !relays.iter().any(|r| r.exit) {
             return Err(NeoTunnelError::Discovery {
-                message: format!(
+                detail: format!(
                     "no exit relay in the snapshot ({relay_count} relays) — cannot reach the clearnet"
                 ),
             });
@@ -319,8 +319,10 @@ impl NeoTunnelStackSession {
         self.relay_count
     }
 
-    /// Tear down the tunnel and its stack. Idempotent.
-    pub fn close(&self) {
+    /// Tear down the tunnel and its stack. Idempotent. Named `shutdown` (not
+    /// `close`) to avoid colliding with UniFFI's generated `AutoCloseable.close()`
+    /// in the Kotlin bindings.
+    pub fn shutdown(&self) {
         self.close_inner()
     }
 }
