@@ -117,7 +117,10 @@ mod tests {
         for x in [false, true] {
             let (bit, key) = delta.authenticate(x).unwrap();
             assert_eq!(bit.value(), x);
-            assert!(delta.verify(&bit, &key), "an honest ({x}) authenticated bit verifies");
+            assert!(
+                delta.verify(&bit, &key),
+                "an honest ({x}) authenticated bit verifies"
+            );
         }
     }
 
@@ -128,10 +131,13 @@ mod tests {
         let delta = GlobalKey::random().unwrap();
         let (bit, key) = delta.authenticate(true).unwrap();
         let forged = AuthBit {
-            x: false, // flip the bit …
+            x: false,     // flip the bit …
             mac: bit.mac, // … keep the MAC
         };
-        assert!(!delta.verify(&forged, &key), "flipping the bit must fail verification");
+        assert!(
+            !delta.verify(&forged, &key),
+            "flipping the bit must fail verification"
+        );
     }
 
     #[test]
@@ -165,7 +171,10 @@ mod tests {
             let bx = b1.xor(&b2);
             let kx = k1.xor(&k2);
             assert_eq!(bx.value(), x1 ^ x2);
-            assert!(delta.verify(&bx, &kx), "XORed authenticated bit still verifies");
+            assert!(
+                delta.verify(&bx, &kx),
+                "XORed authenticated bit still verifies"
+            );
         }
     }
 }

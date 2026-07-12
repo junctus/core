@@ -370,16 +370,29 @@ plaintext are **never assembled at a single party** — built and verified botto
     which iterates the same tag circuit by Horner and is a documented remaining step (see the deferred list).
   - `dualex` — **dual-execution**: a cheating garbler is caught by an output-equality check.
   Crate: `neo-mpc`.
-- Deferred/honest (well-scoped steps, not a redesign): **full** malicious security (authenticated garbling
-  removes dual-execution's ≤1-bit leak); the **EC point→bit share conversion** (DECO's sub-protocol) that
-  feeds the shared ECDHE secret into the key-schedule circuit; and **live wiring** to a real TLS socket on
-  the server's actual curve with full HKDF/AEAD framing.
-- Tests (21): OT delivers only the chosen message; IKNP extends correctly past `k`; every gate garbles over
-  all inputs; garbled adder matches native add with OT-split inputs; ChaCha/SHA-256/Poly1305 references match
-  their KATs and the circuits match the references; ECDHE is additively shared and matches the server;
-  keystream / key-schedule / MAC each run under 2PC into shares (no share alone reveals the secret); a
-  a **record seals under 2PC** and its single-block tag verifies against a stock Poly1305 (full RFC 8439
-  AEAD framing is deferred); dual-execution agrees honestly and catches a cheating garbler.
+- Progress on the four deferred steps — two done, two partial, each a verified brick, still semi-honest:
+  - ✅ **Full RFC 8439 AEAD under 2PC** — `session::seal_aead_shared` composes multi-block ChaCha20 with a
+    **multi-block Poly1305** (`poly1305::tag_shared_multi`, Horner over the AAD/ciphertext/length blocks, key
+    shared, message public); verifies **byte-for-byte against the stock `chacha20poly1305` crate**.
+  - ✅ **TLS 1.3 record framing** — `session::seal_tls13_record_shared` derives the per-record nonce
+    (`static_iv ⊕ seq`, KAT-pinned), appends the content-type, AADs the record header, and emits the exact
+    on-the-wire `TLSCiphertext` a stock TLS 1.3 stack decrypts.
+  - 🔨 **DECO EC point→bit conversion (half)** — `convert::a2b_shared` does the **arithmetic→boolean** half
+    (additive field-element share → bit-share, verified vs an independent reference). The harder half —
+    additive EC *point* shares → an additive *x-coordinate* share (EC addition under MPC on the real curve) —
+    **remains research**.
+  - 🔨 **Authenticated garbling foundation** — `auth` implements the **IT-MAC authenticated-bit** primitive
+    (verify, flip-detection, forgery-resistance, XOR-homomorphism), the base of WRK17. The full protocol
+    (aBits from correlated OT, `aAND` triples, distributed garbling, online phase) — and thus **malicious
+    security** — is **not** built; the session path is still semi-honest with dual-execution's ≤1-bit leak.
+- Still deferred: the EC point-share half of the conversion, the full WRK17 protocol, and **live wiring** to a
+  real TLS socket on the server's actual curve (which needs the EC conversion first).
+- Tests (26): OT delivers only the chosen message; IKNP extends past `k`; every gate garbles over all inputs;
+  garbled adder matches native add with OT-split inputs; ChaCha/SHA-256/Poly1305 references match their KATs
+  and the circuits match; ECDHE is additively shared and matches the server; keystream / key-schedule / MAC
+  each run under 2PC into shares; the **full ChaCha20-Poly1305 AEAD** and a **TLS 1.3 record** seal under 2PC
+  and match the stock crate; A2B reconstructs a field element from additive shares; IT-MAC bits verify,
+  reject a flip, resist forgery, and stay authenticated under XOR; dual-execution catches a cheating garbler.
 
 ---
 

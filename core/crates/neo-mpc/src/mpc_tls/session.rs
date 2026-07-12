@@ -15,12 +15,14 @@
 //!    locally and only their XOR — the real record ciphertext — is ever assembled.
 //!    **Neither party ever holds the plaintext or the keystream.**
 //!
-//! Beyond these three, [`seal_record_shared`] composes the whole **ChaCha20-
-//! Poly1305 AEAD under 2PC** (keystream + Poly1305 tag + SHA-256 key schedule all
-//! in-circuit). The parties are modelled as in-process functions running the real
-//! OT and garbling; the network transport is the caller's. See the parent module
-//! for the honest boundary (full malicious security, EC share conversion, live
-//! server).
+//! Beyond these three, [`seal_record_shared`] composes ChaCha20 + a single-block
+//! Poly1305 under 2PC, and [`seal_aead_shared`] the **full RFC 8439 ChaCha20-
+//! Poly1305 AEAD** (multi-block Poly1305 over AAD + ciphertext + length block,
+//! matched against the stock crate), which [`seal_tls13_record_shared`] frames into
+//! a real **TLS 1.3 record**. The parties are modelled as in-process functions
+//! running the real OT and garbling; the network transport is the caller's. See the
+//! parent module for the honest boundary (full malicious security, EC point-share
+//! conversion, live server).
 
 use std::collections::HashSet;
 
@@ -152,11 +154,10 @@ pub fn combine_ciphertext(share1: &[u8], share2: &[u8]) -> Vec<u8> {
 /// the keystream, or the plaintext**. Returns the public record `(ciphertext, tag)`.
 ///
 /// **Not the RFC 8439 AEAD tag.** The tag here is a single-block Poly1305 over the
-/// bare 16-byte ciphertext; the RFC AEAD tag additionally MACs the AAD and a final
-/// `len(AAD) ‖ len(CT)` length block. So this verifies against a stock **Poly1305**
-/// of the ciphertext, **not** against a stock ChaCha20-Poly1305 AEAD. Full RFC
-/// framing (AAD + length block) iterates the same [`poly1305::tag_shared`] circuit
-/// (Horner) and is the remaining step.
+/// bare 16-byte ciphertext; it verifies against a stock **Poly1305**, not a stock
+/// ChaCha20-Poly1305 AEAD. For the full AEAD (AAD + multi-block ciphertext + length
+/// block, matched against the stock crate) use [`seal_aead_shared`]; this simpler
+/// form is kept for the single-block record path.
 pub fn seal_record_shared(
     key_a: &[u8; 32],
     key_b: &[u8; 32],
@@ -418,7 +419,10 @@ mod tests {
         expected.extend_from_slice(&sealed);
 
         assert_eq!(&record[..3], &[0x17, 0x03, 0x03], "TLS 1.3 record header");
-        assert_eq!(record, expected, "2PC TLS record == stock AEAD + RFC framing");
+        assert_eq!(
+            record, expected,
+            "2PC TLS record == stock AEAD + RFC framing"
+        );
     }
 
     #[test]

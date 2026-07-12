@@ -124,16 +124,15 @@ mod tests {
         // regimes.
         let m: u64 = 0x7FFF_FFFF_FFFF_FFE7;
         let cases = [
-            (1u64, 2u64),           // no wrap
-            (m - 1, m - 1),         // wraps: 2m-2 → m-2
-            (m - 10, 100),          // wraps just over m
-            (m / 2, m / 2 + 3),     // wraps
-            (0, m - 1),             // no wrap, max
+            (1u64, 2u64),       // no wrap
+            (m - 1, m - 1),     // wraps: 2m-2 → m-2
+            (m - 10, 100),      // wraps just over m
+            (m / 2, m / 2 + 3), // wraps
+            (0, m - 1),         // no wrap, max
         ];
         for (a, b) in cases {
             let x = ((a as u128 + b as u128) % m as u128) as u64;
-            let (out_a, out_b) =
-                a2b_shared(&u64_le32(a), &u64_le32(b), &u64_le32(m)).unwrap();
+            let (out_a, out_b) = a2b_shared(&u64_le32(a), &u64_le32(b), &u64_le32(m)).unwrap();
             let recovered: [u8; 32] = core::array::from_fn(|i| out_a[i] ^ out_b[i]);
             assert_eq!(le32_u64(&recovered), x, "A2B: ({a} + {b}) mod m");
             assert!(
