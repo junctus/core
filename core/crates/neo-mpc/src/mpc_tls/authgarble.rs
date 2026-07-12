@@ -290,6 +290,111 @@ fn const_share(c: bool, d: &Deltas) -> AShare {
     AShare { g, e }
 }
 
+fn rand_v() -> Result<V> {
+    Ok(V {
+        dg: rand16()?,
+        de: rand16()?,
+        b: rand_bit()?,
+    })
+}
+
+/// WRK17/KRRW18 **leaky AND triple** — the malicious `F_pre` step. From random
+/// authenticated bits `{α_A}` (A's half), `{α_B}` (B's half), and `{β}`, produce a
+/// triple `{α}, {β}, {αβ}` with `α = α_A ⊕ α_B`, using `{αβ} = {α_A·β} ⊕ {α_B·β}`.
+/// Each half is a garbled-row trick: for `{α_B·β}`, A (holding the label `X = {α_B}`'s
+/// `Δ_A`-share) picks random `Z` and sends `r0 = H(X)⊕Z`, `r1 = H(X⊕Δ_A)⊕Y⊕Z`
+/// (`Y = {β}`'s A-share); B, knowing `α_B`, opens the row for its key and gets
+/// `Z ⊕ α_B·β·(Δ_A,Δ_B,1)`. `{α_A·β}` is symmetric (B garbles over `Δ_B`).
+///
+/// The triple is **correct**; its residual leakage (a garbler corrupting a row learns
+/// `α` with prob ≤ ½, else the honest party aborts) is removed by
+/// [`bucketed_and_triples`]. `β` never leaks.
+pub fn leaky_and(alpha_a: &AShare, alpha_b: &AShare, beta: &AShare, d: &Deltas) -> Result<Triple> {
+    // {α_B·β}: A garbles with the Δ_A-key of {α_B}; B evaluates knowing α_B.
+    let x = alpha_b.g.dg; // label X (A's Δ_A-share of α_B)
+    let z = rand_v()?; // A's random output share
+    let r0 = h(&x).xor(z);
+    let r1 = h(&x16(x, d.g)).xor(beta.g).xor(z); // H(X⊕Δ_A) ⊕ Y ⊕ Z
+    let b_key = alpha_b.e.dg; // B's key = X ⊕ α_B·Δ_A
+    let ab_beta = AShare {
+        g: z,
+        e: if alpha_b.value() {
+            r1.xor(h(&b_key)).xor(beta.e)
+        } else {
+            r0.xor(h(&b_key))
+        },
+    };
+
+    // {α_A·β}: B garbles with the Δ_B-key of {α_A}; A evaluates knowing α_A.
+    let xp = alpha_a.e.de; // label X' (B's Δ_B-share of α_A)
+    let zp = rand_v()?; // B's random output share
+    let r0p = h(&xp).xor(zp);
+    let r1p = h(&x16(xp, d.e)).xor(beta.e).xor(zp); // H(X'⊕Δ_B) ⊕ Y' ⊕ Z'
+    let a_key = alpha_a.g.de; // A's key = X' ⊕ α_A·Δ_B
+    let aa_beta = AShare {
+        g: if alpha_a.value() {
+            r1p.xor(h(&a_key)).xor(beta.g)
+        } else {
+            r0p.xor(h(&a_key))
+        },
+        e: zp,
+    };
+
+    Ok(Triple(
+        alpha_a.xor(alpha_b),  // {α}
+        *beta,                 // {β}
+        ab_beta.xor(&aa_beta), // {αβ}
+    ))
+}
+
+/// WRK17 bucket **combine** of two triples `t0={α⁰,β⁰,α⁰β⁰}`, `t1={α¹,β¹,α¹β¹}` into
+/// `{α⁰⊕α¹, β⁰, (α⁰⊕α¹)β⁰}` — halving the corruption probability. Opens `β = β⁰⊕β¹`
+/// (MAC-checked; hidden by the random `β¹` one-time pad), then a local combination.
+pub fn combine(t0: &Triple, t1: &Triple, d: &Deltas) -> Result<Triple> {
+    let beta = t0.1.xor(&t1.1).open(d)?; // β = β⁰ ⊕ β¹
+    let mut z = t0.2.xor(&t1.2); // α⁰β⁰ ⊕ α¹β¹
+    if beta {
+        z = z.xor(&t1.0); // ⊕ β·{α¹}
+    }
+    Ok(Triple(t0.0.xor(&t1.0), t0.1, z)) // {α}, {β⁰}, {αβ⁰}
+}
+
+/// Generate `n` malicious-secure AND triples: `n·bucket` [`leaky_and`] triples over
+/// fresh random authenticated bits, a public random shuffle, then fold each bucket of
+/// `bucket` with [`combine`] (corruption prob ≤ `2^{-bucket}`). The random bits are
+/// dealt here (dealer model); a deployment draws them from the aBit generation over
+/// [`kos`](super::kos).
+pub fn bucketed_and_triples(n: usize, bucket: usize, d: &Deltas) -> Result<Vec<Triple>> {
+    assert!(bucket >= 1, "bucket size must be ≥ 1");
+    let mut leaky = Vec::with_capacity(n * bucket);
+    for _ in 0..n * bucket {
+        let alpha_a = AShare::deal(rand_bit()?, d)?;
+        let alpha_b = AShare::deal(rand_bit()?, d)?;
+        let beta = AShare::deal(rand_bit()?, d)?;
+        leaky.push(leaky_and(&alpha_a, &alpha_b, &beta, d)?);
+    }
+    shuffle(&mut leaky)?;
+    let mut out = Vec::with_capacity(n);
+    for chunk in leaky.chunks(bucket) {
+        let mut acc = chunk[0];
+        for t in &chunk[1..] {
+            acc = combine(&acc, t, d)?;
+        }
+        out.push(acc);
+    }
+    Ok(out)
+}
+
+fn shuffle<T>(items: &mut [T]) -> Result<()> {
+    for i in (1..items.len()).rev() {
+        let mut buf = [0u8; 8];
+        getrandom::getrandom(&mut buf).map_err(|e| Error::Rng(e.to_string()))?;
+        let j = (u64::from_le_bytes(buf) % (i as u64 + 1)) as usize;
+        items.swap(i, j);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,5 +509,95 @@ mod tests {
             res.is_err(),
             "a corrupted garbled row must abort the evaluation"
         );
+    }
+
+    #[test]
+    fn leaky_and_produces_correct_triples() {
+        // The malicious F_pre leaky-AND: for random α_A, α_B, β, the triple satisfies
+        // α = α_A⊕α_B, and αβ = α∧β, and every share opens (MACs valid).
+        let d = Deltas::random().unwrap();
+        for aa in [false, true] {
+            for ab in [false, true] {
+                for bv in [false, true] {
+                    let alpha_a = AShare::deal(aa, &d).unwrap();
+                    let alpha_b = AShare::deal(ab, &d).unwrap();
+                    let beta = AShare::deal(bv, &d).unwrap();
+                    let t = leaky_and(&alpha_a, &alpha_b, &beta, &d).unwrap();
+                    let (a, b, c) = (
+                        t.0.open(&d).unwrap(),
+                        t.1.open(&d).unwrap(),
+                        t.2.open(&d).unwrap(),
+                    );
+                    assert_eq!(a, aa ^ ab, "α = α_A ⊕ α_B");
+                    assert_eq!(b, bv, "β preserved");
+                    assert_eq!(c, a & b, "leaky-AND triple is a correct AND");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn combine_yields_a_correct_triple() {
+        let d = Deltas::random().unwrap();
+        for a0 in [false, true] {
+            for b0 in [false, true] {
+                for a1 in [false, true] {
+                    for b1 in [false, true] {
+                        let t = combine(&deal_triple(a0, b0, &d), &deal_triple(a1, b1, &d), &d)
+                            .unwrap();
+                        let (a, b, c) = (
+                            t.0.open(&d).unwrap(),
+                            t.1.open(&d).unwrap(),
+                            t.2.open(&d).unwrap(),
+                        );
+                        assert_eq!(a, a0 ^ a1, "combined α = α⁰⊕α¹");
+                        assert_eq!(b, b0, "combined β = β⁰");
+                        assert_eq!(c, a & b, "combined triple is a correct AND");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bucketing_yields_correct_triples() {
+        let d = Deltas::random().unwrap();
+        for bucket in [1usize, 2, 3] {
+            for t in bucketed_and_triples(4, bucket, &d).unwrap() {
+                let (a, b, c) = (
+                    t.0.open(&d).unwrap(),
+                    t.1.open(&d).unwrap(),
+                    t.2.open(&d).unwrap(),
+                );
+                assert_eq!(
+                    c,
+                    a & b,
+                    "bucketed triple (bucket={bucket}) is a correct AND"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malicious_fpre_feeds_authenticated_garbling_end_to_end() {
+        // The complete malicious 2PC online: triples produced by the leaky-AND + bucketing
+        // malicious F_pre drive the authenticated-garbling evaluation of a real circuit.
+        let d = Deltas::random().unwrap();
+        let circuit = adder4();
+        for (x, y) in [(0u8, 0u8), (9, 6), (15, 15), (11, 4)] {
+            let bits: Vec<bool> = (0..4)
+                .map(|i| (x >> i) & 1 == 1)
+                .chain((0..4).map(|i| (y >> i) & 1 == 1))
+                .collect();
+            let inputs: Vec<AShare> = bits.iter().map(|&v| AShare::deal(v, &d).unwrap()).collect();
+            let triples = bucketed_and_triples(circuit.and_gates(), 2, &d).unwrap();
+            let out = eval_garbled(&circuit, &inputs, &triples, &d).unwrap();
+            let got: u8 = (0..5).filter(|&i| out[i]).map(|i| 1u8 << i).sum();
+            assert_eq!(
+                got,
+                x + y,
+                "F_pre (leaky-AND+bucketing) → authenticated garbling: {x}+{y}"
+            );
+        }
     }
 }

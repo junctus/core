@@ -37,8 +37,13 @@
 //!   part). The correlation-robust hash is BLAKE3, as elsewhere.
 //! - Both parties are modelled **in-process** (as the rest of this crate); the check
 //!   messages `(x, t)` are one extra flight a deployment sends over the wire.
+//! - **Roy22 caveat (for the audit):** this is the *original* KOS15 correlation check.
+//!   Roy (SoftSpokenOT, CRYPTO 2022) found a **subtle gap** in KOS15's proof that stood
+//!   for ~a decade; the fix is small and uses the same random-linear-combination idea.
+//!   This module ships the pedagogically-standard KOS15 form (as in the reference it
+//!   follows); an auditor should apply the Roy22 correction before production reliance.
 //! - Correctness and cheating-receiver **detection** are what the tests establish;
-//!   the formal malicious-OT guarantee is KOS's proof + the external audit.
+//!   the formal malicious-OT guarantee is KOS's proof (with the Roy22 fix) + the audit.
 
 use neo_core::{Error, Result};
 

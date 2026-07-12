@@ -406,20 +406,23 @@ plaintext are **never assembled at a single party** — built and verified botto
     HMAC-SHA256 with a **shared secret + public label**, run inside the garbled SHA-256 circuit
     (ipad/opad key blocks carry the shared key; message/padding blocks are public constants). Matched
     **byte-for-byte against the vetted `hmac`/`hkdf` crates** across block-boundary-crossing lengths.
-  - ✅ **WRK17/KRRW18 authenticated garbling — the constant-round malicious online** (`authgarble`),
-    implemented from the published construction: every wire a doubly-authenticated `{x}=[x·(Δ_G,Δ_E,1)]`,
-    XOR local, each AND a **half-gate pair** (garbler sends `r=H(X⊕Δ_G)⊕H(X)⊕Y`; `xy=(x⊕α)y⊕(y⊕β)α⊕αβ` via a
-    preprocessing triple), opens MAC-checked, a **corrupted garbled row ⇒ abort**. Correct over all inputs ×
-    triple values; a 4-bit adder evaluates correctly; tamper aborts. **This completes the malicious 2PC stack**
-    — malicious OT (`kos`) → malicious `F_pre` (`wrk17` bucketing) → malicious online (`authgarble`) — at the
-    correctness/abort level.
-- Still deferred before end-to-end malicious security: an **MtA consistency check** for ECtF (the EC-conversion
-  path), the exact efficiency-optimised WRK17 **leaky-AND hash** (bucketing already yields correct de-leaked
-  triples), the **formal proofs** + the **external audit**, and the **live wiring** (a real TLS 1.3 handshake
-  state machine + record layer against an actual server — systems integration, not a primitive). That *security*
-  **cannot be established by correctness tests**; the live session path stays semi-honest with dual-execution's
-  ≤1-bit leak until it lands.
-- Tests (54): OT delivers only the chosen message; IKNP extends past `k`; **KOS delivers honestly, its
+  - ✅ **The complete WRK17/KRRW18 malicious 2PC** (`authgarble`), implemented from the published construction
+    and tied together **end-to-end**: the malicious `F_pre` — **leaky-AND triples** (`leaky_and`: garbled rows
+    `r0=H(X)⊕Z`, `r1=H(X⊕Δ_A)⊕Y⊕Z`; A garbles `{α_B·β}`, B garbles `{α_A·β}`, `{αβ}` = their XOR) plus
+    **bucketing** (`combine` = the WRK17 `{α⁰⊕α¹,β⁰,αβ⁰}` fold over random-shuffled buckets) — feeding the
+    **constant-round authenticated-garbling online** (every wire a doubly-authenticated `{x}=[x·(Δ_A,Δ_B,1)]`,
+    each AND a half-gate pair `r=H(X⊕Δ_A)⊕H(X)⊕Y`, a **corrupted garbled row ⇒ abort**). Tested: the AND gate
+    and leaky-AND/combine are correct over all inputs × triple values; a 4-bit adder evaluates correctly;
+    tamper aborts; and **end-to-end, bucketed leaky-AND triples drive the garbled adder correctly**. So the
+    whole stack — malicious OT (`kos`) → malicious `F_pre` (leaky-AND + bucketing) → malicious online
+    (authenticated garbling) — is built and correctness/abort-tested.
+- Still deferred before end-to-end malicious security: an **MtA consistency check** for ECtF's *field*
+  multiplication (the EC-conversion path — a different, DKLs-style construction than the bit triples above),
+  the **formal proofs** + the **external audit** (`kos` ships original KOS15; an auditor applies the Roy22
+  fix), and the **live wiring** (a real TLS 1.3 handshake state machine + record layer against an actual
+  server — systems integration, not a primitive). That *security* **cannot be established by correctness
+  tests**; the live session path stays semi-honest with dual-execution's ≤1-bit leak until it lands.
+- Tests (58): OT delivers only the chosen message; IKNP extends past `k`; **KOS delivers honestly, its
   `GF(2¹²⁸)` is a field, and inconsistent-receiver attacks abort the correlation check**; every gate garbles over all inputs;
   garbled adder matches native add with OT-split inputs; ChaCha/SHA-256/Poly1305 references match their KATs
   and the circuits match; ECDHE is additively shared and matches the server; keystream / key-schedule / MAC
@@ -434,7 +437,8 @@ plaintext are **never assembled at a single party** — built and verified botto
   triple, the WRK17 combine is correct over all 16 input pairs, bucketing yields correct triples, and a 4-bit
   adder evaluates correctly under authenticated shares (and aborts on a tampered wire)**; **authenticated
   garbling evaluates the AND gate correctly over all inputs × triple values, runs a 4-bit adder, and aborts on
-  a corrupted garbled row**; dual-execution catches a cheating garbler.
+  a corrupted garbled row; leaky-AND + combine are correct over all inputs, and end-to-end the bucketed
+  leaky-AND F_pre drives the garbled adder correctly**; dual-execution catches a cheating garbler.
 
 ---
 

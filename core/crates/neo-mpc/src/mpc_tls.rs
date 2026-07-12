@@ -76,7 +76,7 @@ pub mod poly1305;
 pub mod sha256;
 pub mod wrk17;
 
-pub use authgarble::{eval_garbled, AShare, Deltas};
+pub use authgarble::{bucketed_and_triples, eval_garbled, leaky_and, AShare, Deltas};
 pub use convert::{a2b_shared, premaster_hash_from_point_shares};
 pub use ectf::ectf;
 pub use garble::{decode, evaluate, GarbledCircuit, Garbler};

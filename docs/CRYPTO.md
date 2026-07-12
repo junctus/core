@@ -107,16 +107,19 @@ A **3-message, key-confirmed** PQ-hybrid AKE (`neo-crypto::handshake`):
   ✅ the **TLS 1.3 key schedule under 2PC** (`hkdf::hkdf_expand_label_shared`) — `HKDF-Expand-Label` /
   HMAC-SHA256 with a **shared secret + public label** inside the garbled SHA-256 circuit, matched byte-for-byte
   against the vetted `hmac`/`hkdf` crates;
-  ✅ the **constant-round malicious online** (`authgarble`) — WRK17/KRRW18 **authenticated garbling**
-  implemented from the published construction: every wire a doubly-authenticated `{x}=[x·(Δ_G,Δ_E,1)]`, each
-  AND a half-gate pair (`r = H(X⊕Δ_G)⊕H(X)⊕Y`), a **corrupted garbled row ⇒ abort**. AND correct over all
-  inputs × triple values, a 4-bit adder evaluates correctly, tamper aborts. This makes the 2PC stack —
-  malicious OT (`kos`) → malicious `F_pre` (`wrk17` bucketing) → malicious online (`authgarble`) — complete at
-  the correctness/abort level; the *formal* proof + **external audit** are the security gate (not
-  test-establishable). Remaining: an **MtA consistency check** for ECtF (the EC-conversion path), the exact
-  (efficiency-optimised) WRK17 **leaky-AND hash** (bucketing already gives correct de-leaked triples), and
-  **live wiring** (a real TLS 1.3 handshake state machine + record layer against an actual server — systems
-  integration, not a primitive), plus a **succinct** ZK shuffle. Honest,
+  ✅ the **complete WRK17/KRRW18 malicious 2PC**, implemented from the published construction and tied together
+  end-to-end (`authgarble`): the malicious `F_pre` — **leaky-AND triples** (`leaky_and`: garbled rows
+  `r0=H(X)⊕Z`, `r1=H(X⊕Δ_A)⊕Y⊕Z`) plus **bucketing** (`combine` + `bucketed_and_triples`, random-shuffled
+  buckets) — feeding the **constant-round authenticated-garbling online** (every wire a doubly-authenticated
+  `{x}=[x·(Δ_A,Δ_B,1)]`, each AND a half-gate pair, a **corrupted garbled row ⇒ abort**). Tested exhaustively
+  at the gate/triple level, and **end-to-end**: bucketed leaky-AND triples drive the garbled evaluation of a
+  4-bit adder correctly. So the whole stack — malicious OT (`kos`) → malicious `F_pre` (leaky-AND + bucketing)
+  → malicious online (authenticated garbling) — is built and correctness/abort-tested; the **formal proofs +
+  external audit** are the security gate (not test-establishable), and `kos` ships original KOS15 (an auditor
+  applies the Roy22 fix). Remaining: an **MtA consistency check** for ECtF's *field* multiplication (the
+  EC-conversion path — a different, DKLs-style construction), and **live wiring** (a real TLS 1.3 handshake
+  state machine + record layer against an actual server — systems integration, not a primitive), plus a
+  **succinct** ZK shuffle. Honest,
   tested cores.
 - **Wire-level transport integration** — wiring the REALITY decoy to a genuine upstream TLS site and
   embedding the flight in a true TLS ClientHello; `Camouflage` today mimics observable shape, not full
