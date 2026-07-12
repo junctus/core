@@ -251,6 +251,59 @@ pub fn seal_aead_shared(
     Ok((ciphertext, tag))
 }
 
+/// Seal one **TLS 1.3 record** under 2PC (RFC 8446 §5.2) — the "wiring to a real TLS
+/// socket" framing on top of [`seal_aead_shared`]. Appends the real `content_type`
+/// to the shared plaintext (forming the `TLSInnerPlaintext`), derives the
+/// per-record nonce `static_iv XOR seq` (§5.3), authenticates the record header as
+/// the AEAD AAD, and AEAD-seals under 2PC. Returns the exact bytes a TLS 1.3 peer
+/// puts on the wire: `opaque_type(0x17) ‖ 0x0303 ‖ length ‖ ciphertext ‖ tag`, which
+/// a stock TLS 1.3 stack decrypts.
+///
+/// The plaintext `content` is shared between the parties; `content_type`, `iv`, and
+/// `seq` are public. Semi-honest, like [`seal_aead_shared`].
+pub fn seal_tls13_record_shared(
+    key_a: &[u8; 32],
+    key_b: &[u8; 32],
+    static_iv: &[u8; 12],
+    seq: u64,
+    content_type: u8,
+    pt_a: &[u8],
+    pt_b: &[u8],
+) -> Result<Vec<u8>> {
+    if pt_a.len() != pt_b.len() {
+        return Err(Error::Crypto("plaintext shares differ in length".into()));
+    }
+    // TLSInnerPlaintext = content ‖ content_type (no zero padding). The content is
+    // shared; the public content_type goes in share A, zero in share B.
+    let mut inner_a = pt_a.to_vec();
+    inner_a.push(content_type);
+    let mut inner_b = pt_b.to_vec();
+    inner_b.push(0);
+
+    let nonce = tls13_nonce(static_iv, seq);
+    // TLSCiphertext length = TLSInnerPlaintext + 16-byte tag; AAD = the 5-byte header.
+    let length = (inner_a.len() + 16) as u16;
+    let header = [0x17, 0x03, 0x03, (length >> 8) as u8, length as u8];
+
+    let (ciphertext, tag) = seal_aead_shared(key_a, key_b, &nonce, &header, &inner_a, &inner_b)?;
+    let mut record = Vec::with_capacity(5 + ciphertext.len() + 16);
+    record.extend_from_slice(&header);
+    record.extend_from_slice(&ciphertext);
+    record.extend_from_slice(&tag);
+    Ok(record)
+}
+
+/// The TLS 1.3 per-record nonce (RFC 8446 §5.3): the 64-bit record sequence number,
+/// big-endian, left-padded to the 12-byte IV length and XORed with the static IV.
+fn tls13_nonce(static_iv: &[u8; 12], seq: u64) -> [u8; 12] {
+    let mut nonce = *static_iv;
+    let seq_be = seq.to_be_bytes(); // 8 bytes, into the low 8 of the 12-byte nonce
+    for (n, s) in nonce[4..].iter_mut().zip(seq_be) {
+        *n ^= s;
+    }
+    nonce
+}
+
 // ---- internals -------------------------------------------------------------
 
 fn write_key_bits(dst: &mut [bool], key: &[u8; 32]) {
@@ -317,6 +370,55 @@ mod tests {
         let (ct, tag) = seal_aead_shared(&ka, &kb, &nonce, aad, &pa, &pb).unwrap();
         assert_eq!(ct.as_slice(), stock_ct, "2PC ciphertext == stock AEAD");
         assert_eq!(&tag, stock_tag, "2PC tag == full RFC 8439 AEAD tag");
+    }
+
+    #[test]
+    fn tls13_record_under_2pc_frames_and_seals_correctly() {
+        use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+        use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+
+        // Pin the per-record nonce derivation (RFC 8446 §5.3) with an explicit KAT,
+        // so the framing isn't merely self-consistent with the reference below.
+        let iv = [0x11u8; 12];
+        let seq = 5u64;
+        let mut want_nonce = [0x11u8; 12];
+        want_nonce[11] ^= 0x05; // seq 5 lands in the last byte
+        assert_eq!(tls13_nonce(&iv, seq), want_nonce, "nonce = iv XOR seq");
+
+        let key = [0x33u8; 32];
+        let content_type = 0x17u8; // application_data
+        let content: Vec<u8> = (0..50u8).collect();
+
+        // 2PC shares of key + content.
+        let mut ka = [0u8; 32];
+        getrandom::getrandom(&mut ka).unwrap();
+        let kb: [u8; 32] = core::array::from_fn(|i| key[i] ^ ka[i]);
+        let mut pa = vec![0u8; content.len()];
+        getrandom::getrandom(&mut pa).unwrap();
+        let pb: Vec<u8> = content.iter().zip(&pa).map(|(c, a)| c ^ a).collect();
+
+        let record = seal_tls13_record_shared(&ka, &kb, &iv, seq, content_type, &pa, &pb).unwrap();
+
+        // Independent RFC-8446 reference framing + the stock AEAD.
+        let mut inner = content.clone();
+        inner.push(content_type);
+        let length = (inner.len() + 16) as u16;
+        let header = [0x17, 0x03, 0x03, (length >> 8) as u8, length as u8];
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        let sealed = cipher
+            .encrypt(
+                Nonce::from_slice(&want_nonce),
+                Payload {
+                    msg: &inner,
+                    aad: &header,
+                },
+            )
+            .unwrap();
+        let mut expected = header.to_vec();
+        expected.extend_from_slice(&sealed);
+
+        assert_eq!(&record[..3], &[0x17, 0x03, 0x03], "TLS 1.3 record header");
+        assert_eq!(record, expected, "2PC TLS record == stock AEAD + RFC framing");
     }
 
     #[test]
