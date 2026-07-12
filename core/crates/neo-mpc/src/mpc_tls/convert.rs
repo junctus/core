@@ -264,4 +264,47 @@ mod tests {
             "2PC pipeline yields SHA-256 of P-256's real (G+2G) x-coordinate"
         );
     }
+
+    #[test]
+    fn shared_ecdhe_point_shares_feed_the_premaster_pipeline() {
+        // DECO shared ECDHE on real P-256: the client scalar is additively split
+        // c = c1 + c2; each party computes its point share Zi = ci·S locally from the
+        // server's public S, so Z1 + Z2 = c·S is the ECDHE secret — and neither party
+        // holds it. The pipeline then hashes its x-coordinate under 2PC. (A *live*
+        // handshake that sends C = c·G to a real server and receives S is the remaining
+        // step-4 integration; here S is a fixed public point.)
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        use p256::{ProjectivePoint, Scalar};
+
+        let be: [u8; 32] = {
+            let mut b = p256_prime_le();
+            b.reverse();
+            b
+        };
+        let s_pub = ProjectivePoint::GENERATOR * Scalar::from(5u64); // "server" public S = 5G
+        let c1 = Scalar::from(1_234_567u64);
+        let c2 = Scalar::from(7_654_321u64);
+        let z1 = (s_pub * c1).to_affine(); // party 1's point share c1·S
+        let z2 = (s_pub * c2).to_affine(); // party 2's point share c2·S
+        let z = (s_pub * (c1 + c2)).to_affine(); // the real ECDHE secret (c1+c2)·S
+
+        let coords = |pt: &p256::AffinePoint| -> ([u8; 32], [u8; 32]) {
+            let e = pt.to_encoded_point(false);
+            (
+                <[u8; 32]>::try_from(e.x().unwrap().as_slice()).unwrap(),
+                <[u8; 32]>::try_from(e.y().unwrap().as_slice()).unwrap(),
+            )
+        };
+        let (x1, y1) = coords(&z1);
+        let (x2, y2) = coords(&z2);
+        let (zx, _) = coords(&z);
+
+        let (h_a, h_b) = premaster_hash_from_point_shares((&x1, &y1), (&x2, &y2), &be).unwrap();
+        let got: [u8; 32] = core::array::from_fn(|i| h_a[i] ^ h_b[i]);
+        assert_eq!(
+            got,
+            super::super::sha256::sha256(&zx),
+            "pipeline hashes the real shared-ECDHE secret's x-coordinate under 2PC"
+        );
+    }
 }
