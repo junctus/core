@@ -52,6 +52,7 @@ docs/             see the index below
 | [`MONETIZATION.md`](docs/MONETIZATION.md) | economic sustainability without breaking unlinkability |
 | [`THREAT_MODEL.md`](docs/THREAT_MODEL.md) | adversaries, answers, honest limits |
 | [`SECURITY_ANALYSIS.md`](docs/SECURITY_ANALYSIS.md) | the adversarial internal review and its fixes |
+| [`SECURITY_REVIEW_4.md`](docs/SECURITY_REVIEW_4.md) | full-codebase review: findings, verdicts, fixes |
 
 ## Build
 
