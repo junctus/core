@@ -370,34 +370,41 @@ plaintext are **never assembled at a single party** — built and verified botto
     which iterates the same tag circuit by Horner and is a documented remaining step (see the deferred list).
   - `dualex` — **dual-execution**: a cheating garbler is caught by an output-equality check.
   Crate: `neo-mpc`.
-- Progress on the four deferred steps — two done, two partial, each a verified brick, still semi-honest:
+- The four deferred steps are now all built and tested (each a verified brick; semi-honest / malicious-*detecting*):
   - ✅ **Full RFC 8439 AEAD under 2PC** — `session::seal_aead_shared` composes multi-block ChaCha20 with a
     **multi-block Poly1305** (`poly1305::tag_shared_multi`, Horner over the AAD/ciphertext/length blocks, key
     shared, message public); verifies **byte-for-byte against the stock `chacha20poly1305` crate**.
   - ✅ **TLS 1.3 record framing** — `session::seal_tls13_record_shared` derives the per-record nonce
     (`static_iv ⊕ seq`, KAT-pinned), appends the content-type, AADs the record header, and emits the exact
     on-the-wire `TLSCiphertext` a stock TLS 1.3 stack decrypts.
-  - 🔨 **DECO EC point→bit conversion** — `convert::a2b_shared` does the **arithmetic→boolean** half
-    (additive field-element share → bit-share, verified vs an independent reference), and `mta::mta` supplies
-    the **Gilboa MtA** (multiplicative→additive over the scalar field, `u+v ≡ a·b`, on the crate's real OT) —
-    the workhorse DECO's ECtF composes. The remaining assembly — composing MtA into the full **ECtF**
-    (point-share → x-coordinate share on the *real curve*, with the field ops) — is unbuilt.
-  - 🔨 **Authenticated garbling foundation** — `auth` implements the **IT-MAC authenticated-bit** primitive
-    (verify, flip-detection, forgery-resistance, XOR-homomorphism) *and* `generate_authenticated_bits`, the
-    **F_pre** step that produces those bits from **correlated OT**. The rest of WRK17 — `aAND` triples +
-    bucketing, distributed authenticated garbling, the online phase, and the consistency checks that provide
-    **malicious security** — is **not** built. Crucially, that security **cannot be established by correctness
-    tests**; the session path stays semi-honest with dual-execution's ≤1-bit leak until the full protocol +
-    the external audit.
-- Still deferred: the ECtF assembly (real-curve point→x-coordinate), the rest of the WRK17 protocol, and
-  **live wiring** to a real TLS socket on the server's actual curve (which needs the EC conversion first). All
-  the 2PC-TLS gadgets are **semi-honest**.
-- Tests (26): OT delivers only the chosen message; IKNP extends past `k`; every gate garbles over all inputs;
+  - ✅ **DECO EC point→field conversion (ECtF)** — `ectf::ectf` converts additive **point** shares into an
+    additive **x-coordinate** share under 2PC: `Δx²`, `Δy²` and a **masked inversion** (Bar-Ilan–Beaver),
+    every share-product a **Gilboa MtA over `F_p`** (`mta_fp`, on the crate's real IKNP OT). Its test
+    **validates the reconstructed x-coordinate against P-256 point addition computed by the vetted `p256`
+    crate** — an independent oracle, on the real P-256 prime. Its A2B partner (`convert::a2b_shared`) closes
+    the point→bit bridge. Semi-honest; `F_p` via variable-time `num-bigint` (a constant-time field is the
+    production step).
+  - ✅ **WRK17 authenticated-share core (`wrk17`)** — the malicious-security *machinery*: TinyOT-style
+    **both-directions IT-MAC shares** `⟨x⟩` (XOR/NOT local, **open re-checks both MACs**), **OT-generated
+    `aAND` triples** (`rand_triples`, cross terms via 1-bit OT, then authenticated), the **sacrifice check**
+    (`verify_triple`), the **bucket combine**, and an **authenticated circuit evaluation** (`eval_authenticated`,
+    Beaver ANDs with MAC-checked opens) — so **any tampered wire aborts**. It is malicious-**detecting** and
+    tested as such. It is **not** end-to-end malicious-secure: the OT under it is semi-honest IKNP (needs a
+    KOS-checked OT), WRK17's constant-round garbled online + formal proof remain, and — as always — that
+    *security* **cannot be established by correctness tests**. The live session path stays semi-honest with
+    dual-execution's ≤1-bit leak until the KOS OT + full protocol + the external audit.
+- Still deferred: a **maliciously-secure (KOS) OT** under ECtF/WRK17, WRK17's constant-round garbled online +
+  formal proof, a constant-time `F_p`, and **live wiring** to a real TLS socket on the server's actual curve.
+- Tests (39): OT delivers only the chosen message; IKNP extends past `k`; every gate garbles over all inputs;
   garbled adder matches native add with OT-split inputs; ChaCha/SHA-256/Poly1305 references match their KATs
   and the circuits match; ECDHE is additively shared and matches the server; keystream / key-schedule / MAC
   each run under 2PC into shares; the **full ChaCha20-Poly1305 AEAD** and a **TLS 1.3 record** seal under 2PC
-  and match the stock crate; A2B reconstructs a field element from additive shares; IT-MAC bits verify,
-  reject a flip, resist forgery, and stay authenticated under XOR; dual-execution catches a cheating garbler.
+  and match the stock crate; A2B reconstructs a field element from additive shares; **MtA over `F_p` gives
+  additive shares of the product**; **ECtF's x-coordinate share reconstructs P-256's real point addition**;
+  IT-MAC bits verify, reject a flip, resist forgery, and stay authenticated under XOR; **WRK17 shares open
+  correctly, a tampered share aborts, OT triples satisfy `c=a∧b`, the sacrifice check catches a corrupted
+  triple, and a 4-bit adder evaluates correctly under authenticated shares (and aborts on a tampered wire)**;
+  dual-execution catches a cheating garbler.
 
 ---
 
@@ -674,13 +681,15 @@ Why it matters: overlays starve from the free-rider and Sybil traps; a token-fre
 Why it matters: no VPN, Tor, or mixnet can produce a verifiable fact-proof about a TLS session because
 they all terminate or relay plaintext somewhere — neo's 2PC-TLS is the only stack where the record key
 and plaintext are provably never assembled at one party.
-- Plan: finish the two explicitly-deferred steps of the M24 2PC-TLS core (`neo-mpc::mpc_tls`, which
-  already seals a ChaCha20-Poly1305 record under 2PC verified against a reference, with DECO-style
-  additively-shared ECDHE): the **EC point→bit share conversion** that feeds the shared ECDHE secret into
-  the SHA-256 key-schedule circuit, and **live HKDF/AEAD wiring** to a real TLS socket on the server's
-  actual curve. Then a selective-opening circuit proves one fact ("balance > X", "account age > 2y")
-  while the session bytes are never assembled anywhere. Also delivers the real distrusted-exit browsing
-  mode and the plaintext-free forward leg M28 needs.
+- Plan: the M24 2PC-TLS core (`neo-mpc::mpc_tls`) now has both deferred sub-protocols built and tested —
+  the **EC point→field conversion** (`ectf`, validated against `p256`) that turns the shared ECDHE point
+  into the x-coordinate share feeding the SHA-256 key-schedule circuit, and the **WRK17 authenticated-share
+  core** (`wrk17`, MAC-checked, malicious-*detecting*). What M33 still needs on top: a **maliciously-secure
+  (KOS) OT** under both, WRK17's constant-round garbled online + formal proof (for real malicious security,
+  not just detection), and **live HKDF/AEAD wiring** to a real TLS socket on the server's actual curve. Then
+  a selective-opening circuit proves one fact ("balance > X", "account age > 2y") while the session bytes are
+  never assembled anywhere. Also delivers the real distrusted-exit browsing mode and the plaintext-free
+  forward leg M28 needs.
 - Why a game-changer: TLSNotary/DECO-grade oracle attestation delivered as an anonymity-network-native
   capability — portable KYC / proof-of-income / proof-of-humanity / whistleblower evidence that is
   provably from the real site, a category normal privacy tools structurally cannot enter.

@@ -63,7 +63,11 @@ A **3-message, key-confirmed** PQ-hybrid AKE (`neo-crypto::handshake`):
   **under 2PC into XOR-shares** — the ChaCha keystream, the SHA-256 key schedule, the Poly1305 tag, and an
   end-to-end **ChaCha20-Poly1305 record**, so the record key, keystream, and plaintext are **never
   assembled at any one party**. **dualex** adds a dual-execution check that catches a cheating garbler.
-  Semi-honest core; see Outstanding for the remaining hardening.
+  The **DECO EC point→field conversion** (`ectf`, Gilboa MtA over `F_p` + masked inversion, validated against
+  the vetted `p256` crate) and the **WRK17 authenticated-share core** (`wrk17`: IT-MAC shares, OT-generated
+  `aAND` triples, MAC-checked authenticated evaluation that aborts on tamper) are both built and tested — the
+  latter a malicious-*detection* layer. Semi-honest / malicious-detecting core; see Outstanding for the
+  remaining hardening (a KOS OT and the audit gate before end-to-end malicious security).
 - **Persistent circuit tunnels** (`neo-node::circuit`) — a long-lived Sphinx circuit carrying a
   bidirectional byte stream as **counter-keyed onion cells** (no keystream reuse) with a **per-cell
   end-to-end MAC**, and a real **TCP splice** at the exit — TCP-over-onion, integrity to parity with the
@@ -78,16 +82,22 @@ A **3-message, key-confirmed** PQ-hybrid AKE (`neo-crypto::handshake`):
 ## Outstanding
 
 - **Two-party MPC-TLS** runs the **full ChaCha20-Poly1305 AEAD and SHA-256 key schedule under 2PC**
-  (`neo-mpc::mpc_tls`), semi-honest, with OT extension and a dual-execution cheating-garbler check. On the
-  four remaining steps, two are now done and two are partial (each verified, still semi-honest):
+  (`neo-mpc::mpc_tls`), semi-honest, with OT extension and a dual-execution cheating-garbler check. Both of
+  the deferred sub-protocols are now built and tested (still semi-honest / malicious-*detecting*):
   ✅ the **full RFC 8439 AEAD** (multi-block Poly1305, matched byte-for-byte against the stock crate) and
-  ✅ **TLS 1.3 record framing** (nonce/AAD/content-type, a real `TLSCiphertext`); 🔨 the DECO EC point→bit
-  conversion — its **A2B** half (`convert::a2b_shared`) plus the **Gilboa MtA** workhorse (`mta::mta`, over
-  the crate's real OT) — and 🔨 the WRK17 foundation — the **IT-MAC authenticated-bit** primitive plus its
-  **correlated-OT generation** (`auth`). Still research: composing MtA into the full **ECtF** (real-curve
-  point→x-coordinate), the rest of the **WRK17 protocol** (and thus **malicious** security — its correctness
-  is testable but its *security* is not, and the session still carries dual-execution's ≤1-bit leak), and
-  **live wiring** to a real TLS socket. A **succinct** ZK shuffle is likewise research. Honest, tested cores.
+  ✅ **TLS 1.3 record framing** (nonce/AAD/content-type, a real `TLSCiphertext`);
+  ✅ the **DECO EC point→field conversion** — `ectf::ectf` composes **Gilboa MtA over `F_p`** (on the crate's
+  real OT) and a masked inversion into an additive x-coordinate share, its test **validated against P-256
+  point addition from the vetted `p256` crate**; its A2B partner (`convert::a2b_shared`) closes the point→bit
+  bridge;
+  ✅ the **WRK17 authenticated-share core** (`wrk17`) — TinyOT-style IT-MAC shares, **OT-generated `aAND`
+  triples**, an authenticated circuit evaluation whose every open is **MAC-checked** so any tampered wire
+  **aborts**, plus the **sacrifice check** — a real, tested malicious-*detection* layer (verified against a
+  4-bit adder and by tamper-abort tests).
+  What remains before **end-to-end malicious** security: a **maliciously-secure (KOS) OT** under both ECtF and
+  WRK17, WRK17's formal proof + its constant-round garbled online, and the **external audit** — until then the
+  live session path still carries dual-execution's ≤1-bit leak. Also open: **live wiring** to a real TLS
+  socket, a constant-time `F_p` for ECtF, and a **succinct** ZK shuffle. Honest, tested cores.
 - **Wire-level transport integration** — wiring the REALITY decoy to a genuine upstream TLS site and
   embedding the flight in a true TLS ClientHello; `Camouflage` today mimics observable shape, not full
   QUIC/DTLS protocol crypto (a real QUIC transport lives behind the `quic` feature).

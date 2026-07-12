@@ -31,16 +31,22 @@
 //! ## Honest boundary
 //!
 //! This is a **real 2PC core** with the full ChaCha20-Poly1305 AEAD and SHA-256
-//! key schedule running inside the garbled circuit. What a production,
-//! against-a-live-server deployment still needs — each a known, well-scoped step,
-//! not a redesign:
-//! - **Full malicious security**: dual-execution here catches a cheating garbler
-//!   with the standard ≤ 1-bit leak; authenticated garbling (WRK17) removes even
-//!   that.
-//! - **EC share conversion**: turning the additive *point* share from
-//!   [`session::shared_ecdhe`] into the *bit* share the key-schedule circuit
-//!   consumes is DECO's specialised sub-protocol (elliptic-curve ops under MPC);
-//!   here the key-schedule circuit runs on an already-bit-shared secret.
+//! key schedule running inside the garbled circuit. Two of the sub-protocols that a
+//! production deployment needs are now built and tested (still semi-honest / awaiting
+//! audit), and what remains is well-scoped, not a redesign:
+//! - **EC share conversion** — *built*: [`ectf`] is DECO's ECtF, converting the
+//!   additive *point* share from [`session::shared_ecdhe`] into an additive
+//!   x-coordinate share under 2PC (Gilboa MtA over `F_p` on the real OT, masked
+//!   inversion). Its test validates against **P-256 point addition from the vetted
+//!   `p256` crate**. What remains is A2B ([`convert`]) on the real curve prime and
+//!   feeding the key-schedule circuit; and a constant-time field for production.
+//! - **Malicious-security machinery** — *built*: [`wrk17`] is the WRK17
+//!   authenticated-share core — TinyOT-style IT-MAC shares, OT-generated `aAND`
+//!   triples, an authenticated circuit evaluation whose every open is **MAC-checked**
+//!   (tamper ⇒ abort), and the sacrifice check. It is malicious-**detecting** and
+//!   tested as such; it is **not** end-to-end malicious-secure — that needs a
+//!   maliciously-secure (KOS) OT under it and the formal WRK17 proof (see the module).
+//!   Until then the live session path still uses [`dualex`]'s ≤ 1-bit leak.
 //! - **Live wiring**: a real TLS socket on the server's actual curve
 //!   (X25519/P-256 x-only) rather than Ristretto, and HKDF/AEAD framing (AAD,
 //!   length blocks) iterated through the same circuits.
@@ -50,14 +56,20 @@ pub mod auth;
 pub mod circuit;
 pub mod convert;
 pub mod dualex;
+pub mod ectf;
 pub mod garble;
 pub mod mta;
 pub mod ot;
 pub mod ot_ext;
 pub mod poly1305;
 pub mod sha256;
+pub mod wrk17;
 
+pub use ectf::ectf;
 pub use garble::{decode, evaluate, GarbledCircuit, Garbler};
+pub use wrk17::{
+    eval_authenticated, rand_shares, rand_triples, verify_triple, Keys, Share, Triple,
+};
 
 mod session;
 pub use session::{
