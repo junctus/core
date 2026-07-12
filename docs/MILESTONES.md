@@ -377,16 +377,21 @@ plaintext are **never assembled at a single party** — built and verified botto
   - ✅ **TLS 1.3 record framing** — `session::seal_tls13_record_shared` derives the per-record nonce
     (`static_iv ⊕ seq`, KAT-pinned), appends the content-type, AADs the record header, and emits the exact
     on-the-wire `TLSCiphertext` a stock TLS 1.3 stack decrypts.
-  - 🔨 **DECO EC point→bit conversion (half)** — `convert::a2b_shared` does the **arithmetic→boolean** half
-    (additive field-element share → bit-share, verified vs an independent reference). The harder half —
-    additive EC *point* shares → an additive *x-coordinate* share (EC addition under MPC on the real curve) —
-    **remains research**.
+  - 🔨 **DECO EC point→bit conversion** — `convert::a2b_shared` does the **arithmetic→boolean** half
+    (additive field-element share → bit-share, verified vs an independent reference), and `mta::mta` supplies
+    the **Gilboa MtA** (multiplicative→additive over the scalar field, `u+v ≡ a·b`, on the crate's real OT) —
+    the workhorse DECO's ECtF composes. The remaining assembly — composing MtA into the full **ECtF**
+    (point-share → x-coordinate share on the *real curve*, with the field ops) — is unbuilt.
   - 🔨 **Authenticated garbling foundation** — `auth` implements the **IT-MAC authenticated-bit** primitive
-    (verify, flip-detection, forgery-resistance, XOR-homomorphism), the base of WRK17. The full protocol
-    (aBits from correlated OT, `aAND` triples, distributed garbling, online phase) — and thus **malicious
-    security** — is **not** built; the session path is still semi-honest with dual-execution's ≤1-bit leak.
-- Still deferred: the EC point-share half of the conversion, the full WRK17 protocol, and **live wiring** to a
-  real TLS socket on the server's actual curve (which needs the EC conversion first).
+    (verify, flip-detection, forgery-resistance, XOR-homomorphism) *and* `generate_authenticated_bits`, the
+    **F_pre** step that produces those bits from **correlated OT**. The rest of WRK17 — `aAND` triples +
+    bucketing, distributed authenticated garbling, the online phase, and the consistency checks that provide
+    **malicious security** — is **not** built. Crucially, that security **cannot be established by correctness
+    tests**; the session path stays semi-honest with dual-execution's ≤1-bit leak until the full protocol +
+    the external audit.
+- Still deferred: the ECtF assembly (real-curve point→x-coordinate), the rest of the WRK17 protocol, and
+  **live wiring** to a real TLS socket on the server's actual curve (which needs the EC conversion first). All
+  the 2PC-TLS gadgets are **semi-honest**.
 - Tests (26): OT delivers only the chosen message; IKNP extends past `k`; every gate garbles over all inputs;
   garbled adder matches native add with OT-split inputs; ChaCha/SHA-256/Poly1305 references match their KATs
   and the circuits match; ECDHE is additively shared and matches the server; keystream / key-schedule / MAC

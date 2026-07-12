@@ -81,12 +81,13 @@ A **3-message, key-confirmed** PQ-hybrid AKE (`neo-crypto::handshake`):
   (`neo-mpc::mpc_tls`), semi-honest, with OT extension and a dual-execution cheating-garbler check. On the
   four remaining steps, two are now done and two are partial (each verified, still semi-honest):
   ✅ the **full RFC 8439 AEAD** (multi-block Poly1305, matched byte-for-byte against the stock crate) and
-  ✅ **TLS 1.3 record framing** (nonce/AAD/content-type, a real `TLSCiphertext`); 🔨 the **arithmetic→boolean
-  half** of DECO's EC point→bit conversion (`convert::a2b_shared`), and 🔨 the **IT-MAC authenticated-bit**
-  primitive underlying WRK17 (`auth`). Still research: the **EC point-share half** of the conversion (EC
-  addition under MPC on the real curve), the **full WRK17 protocol** (and thus **malicious** security — the
-  session path still carries dual-execution's ≤1-bit leak), and **live wiring** to a real TLS socket. A
-  **succinct** ZK shuffle is likewise research. The current constructions are honest, tested cores.
+  ✅ **TLS 1.3 record framing** (nonce/AAD/content-type, a real `TLSCiphertext`); 🔨 the DECO EC point→bit
+  conversion — its **A2B** half (`convert::a2b_shared`) plus the **Gilboa MtA** workhorse (`mta::mta`, over
+  the crate's real OT) — and 🔨 the WRK17 foundation — the **IT-MAC authenticated-bit** primitive plus its
+  **correlated-OT generation** (`auth`). Still research: composing MtA into the full **ECtF** (real-curve
+  point→x-coordinate), the rest of the **WRK17 protocol** (and thus **malicious** security — its correctness
+  is testable but its *security* is not, and the session still carries dual-execution's ≤1-bit leak), and
+  **live wiring** to a real TLS socket. A **succinct** ZK shuffle is likewise research. Honest, tested cores.
 - **Wire-level transport integration** — wiring the REALITY decoy to a genuine upstream TLS site and
   embedding the flight in a true TLS ClientHello; `Camouflage` today mimics observable shape, not full
   QUIC/DTLS protocol crypto (a real QUIC transport lives behind the `quic` feature).
