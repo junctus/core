@@ -32,8 +32,10 @@
 //! all. No relay can read or forge the stream; only the exit and client can.
 //!
 //! **Honest scope:** cells are variable-length here (length hiding is the
-//! transport layer's job — `neo-transport` bucketing / the mixer). Congestion
-//! control and multiplexing many streams over one circuit are the next layer.
+//! transport layer's job — `neo-transport` bucketing / the mixer). Multiplexing
+//! many streams over one circuit now rides on top ([`crate::mux`], with per-stream
+//! flow control); aggregate cross-stream congestion control is the remaining
+//! refinement.
 
 use std::sync::Mutex;
 

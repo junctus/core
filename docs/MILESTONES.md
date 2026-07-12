@@ -304,10 +304,20 @@ with the exit splicing a real TCP connection to a target.
   so no keystream reuse — with a **per-cell end-to-end MAC** keyed by the exit's secret, so a middle
   relay that mauls a cell is caught at the endpoint. The exit **splices a TCP connection** and pumps
   bytes both ways: real TCP-over-onion tunneling. Crate: `neo-node`.
-- Deferred/honest: cells are variable-length (length hiding is the transport layer's job); congestion
-  control and multiplexing many streams over one circuit are the next layer.
+- Done (stream multiplexing): `neo-node::mux` runs **many independent logical streams over one circuit**
+  (the shape a SOCKS proxy / full VPN return path needs), each opened on demand to its own target, with
+  **per-stream byte flow control** (a semaphore window: a sender acquires permits, the receiver returns
+  them as `WINDOW` credit as it consumes) so one busy stream can't starve another or make a peer buffer
+  without bound. It is a small framing protocol *over* the circuit's reliable, integrity-checked cell
+  channel, so it adds no crypto and inherits all of it; each `OPEN` is SSRF- and reduced-harm-port-checked
+  like the single-stream exit. The `serve_circuit` exit dispatches to `serve_mux` on the `"mux"` target.
+- Deferred/honest: cells are variable-length (length hiding is the transport layer's job); **aggregate
+  cross-stream congestion control** (sharing the circuit's capacity fairly across streams) is the remaining
+  refinement above per-stream flow control.
 - Tests: onion+MAC layering unit test; a **real TCP byte stream** round-trips through a 2-hop circuit to
-  a localhost echo server; a malicious middle relay mauling a return cell is rejected by the client.
+  a localhost echo server; a malicious middle relay mauling a return cell is rejected by the client; the
+  mux frame codec + two independent streams + a >3-window payload (flow-control replenish) + a
+  policy-refused reset, and **two streams multiplexed over a real 2-hop onion circuit**.
 
 ### M22 — MPC-TLS threshold decryption ✅ (no single point of plaintext assembly for decrypt)
 Advance M20 past "key assembled at decrypt": remove the single point where the committee reconstructs.
@@ -354,8 +364,10 @@ plaintext are **never assembled at a single party** — built and verified botto
     `GF(2¹³⁰−5)` (verified vs the RFC 8439 KAT). Each garbled circuit is checked against its plaintext oracle.
   - `session` — a DECO-style **additively-shared ECDHE** (neither party learns the pre-master `Z`); the
     ChaCha20 keystream **and** Poly1305 tag computed **under 2PC into XOR-shares**; the SHA-256 **key schedule
-    under 2PC**; and an end-to-end **ChaCha20-Poly1305 record sealed under 2PC** where neither party ever
-    holds the key, keystream, or plaintext.
+    under 2PC**; and a **record sealed under 2PC** where neither party ever holds the key, keystream, or
+    plaintext. *Precisely:* the tag is a **single-block Poly1305** of the ciphertext, so it verifies against
+    a stock Poly1305 — **not** yet the full RFC 8439 AEAD (AAD + multi-block ciphertext + the length block),
+    which iterates the same tag circuit by Horner and is a documented remaining step (see the deferred list).
   - `dualex` — **dual-execution**: a cheating garbler is caught by an output-equality check.
   Crate: `neo-mpc`.
 - Deferred/honest (well-scoped steps, not a redesign): **full** malicious security (authenticated garbling
@@ -366,8 +378,8 @@ plaintext are **never assembled at a single party** — built and verified botto
   all inputs; garbled adder matches native add with OT-split inputs; ChaCha/SHA-256/Poly1305 references match
   their KATs and the circuits match the references; ECDHE is additively shared and matches the server;
   keystream / key-schedule / MAC each run under 2PC into shares (no share alone reveals the secret); a
-  **ChaCha20-Poly1305 record seals under 2PC** and verifies against a stock implementation; dual-execution
-  agrees honestly and catches a cheating garbler.
+  a **record seals under 2PC** and its single-block tag verifies against a stock Poly1305 (full RFC 8439
+  AEAD framing is deferred); dual-execution agrees honestly and catches a cheating garbler.
 
 ---
 
