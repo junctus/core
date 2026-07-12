@@ -2,14 +2,15 @@
 
 A dispersed, post-quantum, verifiable, censorship-resistant privacy overlay — a "new kind of VPN".
 
-> **Status:** the network **runs end to end** — zero-config discovery finds relays
-> ([`docs/DISCOVERY.md`](docs/DISCOVERY.md)) and real onion traffic is forwarded through live multi-hop
-> circuits with a layered return path. The core (M0–M9), the frontier tier (M10–M13: anonymous
-> credits, VRF paths, committee exit, PIR + ZK shuffle), and the hardening/expansion tier (M14–M20:
-> a full internal security review with every finding fixed, plus streaming, NAT traversal, DoH
-> bootstrap) all have working, tested implementations. **Not audited** — do not rely on neo for
-> real-world safety. See [`docs/MILESTONES.md`](docs/MILESTONES.md) for status and
-> [`docs/SECURITY_ANALYSIS.md`](docs/SECURITY_ANALYSIS.md) for the review.
+> **Status:** the network is **live** — a discovery seed (discovery.junctus.org) and two attested
+> relay/exit nodes run in production, and a native macOS VPN client ([`../neo-mac`](../neo-mac)) connects
+> and browses through them. M0–M25, M28, and M36 are shipped and tested: the core, the frontier tier
+> (anonymous credits, VRF paths, committee exit, PIR + ZK shuffle), streaming/NAT/DoH bootstrap, three
+> rounds of internal security review with every finding fixed, and — the flagship — a **complete,
+> adversarially-verified malicious-secure two-party MPC-TLS crypto stack** (M24). The two gates before
+> real-world use are the **external cryptography audit** and **live MPC-TLS integration** (the crypto is
+> built; wiring it to a real TLS session is systems work). **Not audited** — do not rely on neo for
+> real-world safety. See [`docs/MILESTONES.md`](docs/MILESTONES.md) for status.
 
 ## What makes it different
 
@@ -22,9 +23,13 @@ single node — or any group smaller than `k` — only ever holds a meaningless 
 - **Post-quantum from day one** — PQ-hybrid handshakes and onion packets.
 - **Committee exit (MPC-TLS)** — a k-of-n committee jointly performs each clearnet request, so no
   single node knows destination + content or is the sole originator.
+- **Malicious-secure two-party MPC-TLS** — a complete, adversarially-verified 2PC stack (KOS malicious
+  OT → authenticated garbling → SPDZ field arithmetic → the EC-point→pre-master bridge → HKDF key
+  schedule, all under 2PC) so a TLS session's key and plaintext are *never assembled at one party*. Built
+  and tested; live-session integration and the external audit are the remaining gates.
 - **Anonymous bandwidth credits** — unlinkable, token-free credits that resist Sybil attacks and
   free-riding at once.
-- **Verifiable privacy** — PIR/oblivious discovery, VRF-unbiasable paths, ZK proof-of-mixing.
+- **Verifiable privacy** — PIR/oblivious discovery, VRF-unbiasable paths, ZK verifiable shuffle.
 
 There are real, honest limits (the anonymity trilemma; "no responsible exit" is fully achievable only
 inside the overlay; a young network has a small anonymity set). See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
@@ -40,19 +45,22 @@ deploy/discovery/ one-command discovery-seed deployment (systemd + Caddy)
 docs/             see the index below
 ```
 
+The native **macOS VPN app** (the furthest-along client — connects and browses today) lives in the
+sibling repo [`../neo-mac`](../neo-mac): a UniFFI-bound core inside a NetworkExtension packet tunnel.
+
 ## Docs
 
 | Doc | What |
 |-----|------|
 | [`ARCHITECTURE.md`](docs/ARCHITECTURE.md) | the design, the crate map, the request flow |
-| [`MILESTONES.md`](docs/MILESTONES.md) | roadmap and live status (M0–M20 + audit gate) |
+| [`MILESTONES.md`](docs/MILESTONES.md) | roadmap and live status (M0–M36 + audit gate) |
 | [`PROTOCOL.md`](docs/PROTOCOL.md) | the per-flow wire pipeline and exit models |
 | [`CRYPTO.md`](docs/CRYPTO.md) | primitives and the constructions built on them |
 | [`DISCOVERY.md`](docs/DISCOVERY.md) | zero-config discovery, witnessed snapshots, Sybil/eclipse |
 | [`MONETIZATION.md`](docs/MONETIZATION.md) | economic sustainability without breaking unlinkability |
 | [`THREAT_MODEL.md`](docs/THREAT_MODEL.md) | adversaries, answers, honest limits |
-| [`SECURITY_ANALYSIS.md`](docs/SECURITY_ANALYSIS.md) | the adversarial internal review and its fixes |
-| [`SECURITY_REVIEW_4.md`](docs/SECURITY_REVIEW_4.md) | full-codebase review: findings, verdicts, fixes |
+| [`SECURITY_ANALYSIS.md`](docs/SECURITY_ANALYSIS.md) | the standing internal review + fix ledger |
+| [`SECURITY_REVIEW_3.md`](docs/SECURITY_REVIEW_3.md), [`SECURITY_REVIEW_4.md`](docs/SECURITY_REVIEW_4.md) | point-in-time review rounds (findings, verdicts, fixes) |
 
 ## Build
 

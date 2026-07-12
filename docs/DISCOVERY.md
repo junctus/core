@@ -230,7 +230,9 @@ signatures on the snapshot, so the DoH transport and the DNS are untrusted.
 - **Witnesses are a small trusted set** (like Tor directory authorities).
   Dissolving that trust is exactly what frontier milestones M11 (VRF-verifiable
   path selection) and M13 (PIR discovery + proof-of-mixing) are for.
-- **Sybil resistance is partial (M36).** Subnet caps + diverse selection + a
-  registration PoW raise concentration cost but don't eliminate it — an adversary
-  with many distinct `/24`s (or a `/16`, or an IPv6 block) still Sybils. Per-ASN
-  caps and bandwidth-weighted selection are deferred.
+- **Sybil resistance is partial (M36).** Per-`/24` **and per-ASN** admission caps
+  (the latter opt-in via `neo seed --asn-db`), diverse selection, and a NodeId-bound
+  registration PoW raise concentration cost but don't eliminate it — an adversary with
+  many distinct `/24`s across many ASNs (or a `/16`, or an IPv6 block) still Sybils.
+  **Continuous uptime/bandwidth-weighted selection is deferred** (needs a snapshot
+  wire-format bump — M40).

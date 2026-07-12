@@ -850,6 +850,66 @@ not this one: M4.5 prevents *forging/hijacking* relays, M11 makes selection *unb
 
 ---
 
+## Next wave ⬜ (post-live-network: from research stack → real, operable, trustworthy)
+
+The core crypto and the frontier research are shipped; the live network runs. The highest-leverage work
+now is turning that into something people can *use, operate, and trust*, and closing the last named gaps
+to end-to-end malicious security and a live MPC-TLS session. These are **achievable engineering** (not
+open research), sequenced roughly by leverage-per-effort. (Several finish or re-scope an existing ⬜:
+noted inline.)
+
+- **M37 — Local SOCKS5/HTTP-CONNECT proxy front-end** ⬜ ("point any app at neo") · ~1–2 wk. The built,
+  tested multi-stream mux circuit (`neo-node::mux`) is only reachable via `neo send` / the Mac FFI. Add
+  `neo proxy --listen 127.0.0.1:1080` (SOCKS5 + HTTP CONNECT on loopback) that opens a logical stream per
+  connection over a discovered mux circuit (reuse `serve_mux`, the exit SSRF/port guard). Instantly makes
+  any browser/CLI usable — no new crypto or wire protocol.
+- **M38 — Wire ECtF onto the SPDZ Beaver online** ⬜ · ~1–2 wk. The one named internal wiring between
+  today's stack and **end-to-end malicious** EC conversion: replace `ectf`'s four `mul_shared` calls with
+  `spdz::beaver_mul` over authenticated `[x]` shares so a tampered multiplicand *aborts* via `sacrifice()`.
+  Both endpoints are built + tested; lowest-effort, highest-certainty security upgrade on the list.
+- **M39 — Operator observability** ⬜ · ~1–1.5 wk. Two relays, a seed and committee nodes run in
+  production behind one `/healthz` string. Add a **localhost-only** (127.0.0.1) Prometheus `/metrics` +
+  tiny status page: circuits served, bytes relayed, exit-reject rate by reason, dial-back pass/fail,
+  attested-vs-registered, per-subnet/ASN cap headroom, committee quorum. (Never `0.0.0.0` — a metrics port
+  is itself a fingerprint.)
+- **M40 — Seed HA: 2nd independent seed + k-of-n witness quorum + persisted registry** ⬜ · ~2 wk. The
+  live trust root is a **single** witness key on a **single** seed (a bootstrap SPOF; the wire formats
+  already allow up to 16 witnesses). Persist the seed registry to disk (survive restart), stand up a 2nd
+  seed on a different provider/ASN with its own witness key, and move clients to k-of-n snapshot
+  verification (start 2-of-2) via a staged trust-set migration that never strands existing clients.
+- **M41 — Exit-policy engine + traffic governor** ⬜ (finishes **M31**; its SSRF/enforcement half landed
+  in M25 and DNS was un-blocked here) · ~1 wk. Turn the hardcoded denylist into named presets
+  (`--exit-policy reduced|web|custom`), operator allow/deny TOML, and a per-destination token-bucket
+  governor. The exit-supply unlock.
+- **M42 — `neo doctor`: connectivity + leak self-test** ⬜ ("am I actually protected?") · ~1 wk. Build a
+  real circuit, report apparent exit IP/geo through the overlay, check DNS-resolves-through-the-tunnel (no
+  OS leak), verify the snapshot is fresh/witness-valid and above the anonymity-set floor. Surface it via
+  FFI so the Mac client shows it.
+- **M43 — One-command relay onboarding** ⬜ · ~1.5 wk. Turn "build from source on the target box" (with
+  its OOM/glibc/PATH gotchas) into a CI release pipeline: signed static musl binaries (x86_64 + aarch64) +
+  SHA-256SUMS + minisign/cosign + a distroless container + a hardened `neo relay-setup`. Grows exit supply.
+- **M44 — Audit-readiness package** ⬜ · ~1.5 wk. Directly compresses the hard gate: a frozen
+  `AUDIT_SCOPE.md` (exact crates/commits in/out, each labelled built/proven/deployed), a threat-model→code
+  traceability matrix, a reproducible build, and a consolidated KAT/test-vector corpus. No new runtime
+  code; high leverage.
+- **M45 — Live 2PC-TLS: drive the complete stack against a real TLS 1.3 server** ⬜ (the gap between
+  "crypto complete" and "MPC-TLS works"; unblocks the **M33** attestor) · ~4–6 wk. Replace
+  `session.rs::shared_ecdhe`'s in-process simulation with a real TLS 1.3 handshake driver both parties
+  jointly execute over a socket — real ClientHello with the split-scalar key share, real ServerHello
+  parse, the server's actual transcript-hash feeding the HKDF schedule, `seal_tls13_record_shared` on the
+  wire. All the crypto exists; this is the state machine + record framing + the two-party channel harness.
+- **M46 — Native mobile app-store builds** ⬜ (finishes **M8**'s deferred half) · ~3–4 wk. iOS xcframework
+  + Android AAR from the UniFFI core, the on-device packet loop (NEPacketTunnelProvider / VpnService →
+  the existing FFI netstack), a notarized TestFlight build and a signed APK/AAB. Mobile is where
+  censorship-circumvention demand is highest and today has zero installable artifact.
+
+Also re-scoped by the above: **M27** (REALITY) — the remaining flagship piece is proxying the upstream's
+genuine ServerHello on the authenticated path (byte-identical handshake), ~3–4 wk of systems work reusing
+`reverse_proxy_decoy` + the ClientHello codec; **M30** (fixed-cell constant-rate) and **M33** (attestor)
+become concretely achievable once M45 lands.
+
+---
+
 ## Audit gate ⬜
 External security + cryptography audit **before anyone relies on neo for real safety.** This is a hard
 gate, not a milestone to rush past.

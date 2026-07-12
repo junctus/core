@@ -7,10 +7,10 @@
 | Adversary | Capability | neo's answer | Honest limit |
 |-----------|-----------|--------------|--------------|
 | Local network / ISP | sees your link, does DPI | everything encrypted; transport mimics mainstream TLS/QUIC | traffic *volume* still observable |
-| On-path censor | blocks by IP/SNI/protocol, active probing | decentralized DoH rendezvous; obfuscation ladder | REALITY-grade active-probe defense deferred (M6+) |
+| On-path censor | blocks by IP/SNI/protocol, active probing | decentralized DoH rendezvous; obfuscation ladder; REALITY-style authenticate/decoy split (M23) | full-session TLS indistinguishability still open — the auth path sends no ServerHello (M27) |
 | Colluding relays | run several nodes on your path | k-of-n slicing: fewer than k shares reveal nothing; onion layering | collusion ≥ k on one request's paths degrades it |
 | Global passive observer | watches all links at once | cover traffic + Poisson timing mixing (M5) | costs latency/bandwidth; imperfect at tiny scale |
-| Malicious exit | inspects/tamperss with clearnet traffic | fresh per-request exits (M7); MPC-TLS committee (M12) | plaintext to a clearnet site is inherently visible to *some* egress |
+| Malicious exit | inspects/tampers with clearnet traffic | fresh per-request exits (M7); committee exit + threshold-decrypt (M12/M28); malicious-secure 2PC-TLS crypto stack (M24) | plaintext to a clearnet site is inherently visible to *some* egress; live MPC-TLS integration pending |
 | Sybil attacker | floods fake nodes to map/deanonymize | bandwidth credits make identities costly (M10); VRF paths (M11) | open problem; residual risk during bootstrap |
 | Quantum "harvest now" | records today, decrypts later | PQ-hybrid handshake + onion packets from day one | depends on PQ primitive assumptions |
 
@@ -42,5 +42,6 @@ Properties asserted by tests today across `neo-crypto`, `neo-slicing`, `neo-node
 The full adversarial internal review — including two PoC-confirmed CRITICAL Sphinx breaks (now fixed)
 and every HIGH/MEDIUM finding with its fix — is in [`SECURITY_ANALYSIS.md`](SECURITY_ANALYSIS.md).
 
-Still ahead: REALITY-grade active-probe transport defense (M6+); NAT hole-punching validated on real
-NAT (M16); and — the hard gate — the **external security + cryptography audit**.
+Still ahead: REALITY **full-session** indistinguishability (the auth path completes only the ClientHello
+— M27); live MPC-TLS integration against a real server (M45; the crypto stack is built + verified, M24);
+and — the hard gate — the **external security + cryptography audit**.
