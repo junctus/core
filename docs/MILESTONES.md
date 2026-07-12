@@ -376,4 +376,35 @@ become concretely achievable once M45 lands.
 External security + cryptography audit **before anyone relies on neo for real safety.** This is a hard
 gate, not a milestone to rush past.
 
+---
+
+## Priority order (remaining work)
+
+Recommended sequence for everything still 🔨/⬜, ordered by leverage-per-effort and dependencies. The
+product waves (A–B) are mostly *outside* the crypto audit scope, so they run **in parallel** with the
+audit path (C). Two existing items are subsumed: **M31** → M41, **M8**'s deferred half → M46.
+
+**Wave A — make it usable & operable** *(low effort, high daily value; do first)*
+1. **M37** — SOCKS5 / HTTP-CONNECT front-end · point any app at neo (the mux circuit is built, just unexposed).
+2. **M39** — operator observability · stop flying blind on the live seed/relays/committee.
+3. **M41** — exit-policy engine + governor · the exit-supply unlock (already started — DNS un-blocked; finishes M31).
+4. **M42** — `neo doctor` connectivity + leak self-test · user trust ("am I actually protected?").
+5. **M38** — wire ECtF → SPDZ Beaver · small, high-certainty; completes **end-to-end malicious** EC conversion.
+
+**Wave B — resilience & supply** *(remove single points of failure, grow the network)*
+6. **M40** — 2nd independent seed + k-of-n witness quorum · kills the single-seed/single-witness bootstrap SPOF.
+7. **M43** — one-command signed relay onboarding · grow exit supply (signed static binaries + container).
+8. **M46** — client store distribution · notarized macOS + iOS TestFlight + Play AAB (clients already ship).
+
+**Wave C — the audit path & the flagship** *(the gates before real reliance; can overlap A–B)*
+9. **M44** — audit-readiness package · freeze scope + threat-model→code map; compresses the hard gate.
+10. **Audit gate** — engage the external cryptography audit · start once M38 + M44 land; the hard gate.
+11. **M27** — REALITY full-session indistinguishability *(🔨 in progress)* · the flagship censorship property.
+
+**Wave D — flagship capability & research horizon** *(larger / longer; sequence by appetite)*
+12. **M45** — live 2PC-TLS against a real server · the gap between "crypto complete" and "MPC-TLS works".
+13. **M33** — attestor (verifiable facts about a private TLS session) · category-defining; **gated on M45**.
+14. **M30** — fixed-cell constant-rate circuits · close the metadata size/timing tell.
+15. **M32** Relaykit credit economy · **M34** self-healing bootstrap · **M29** bridge-in-a-QR · **M35** enumeration-resistant bridge distribution.
+
 [`RelayReceipt`]: ../core/crates/neo-credits/src/earn.rs
