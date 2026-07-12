@@ -43,13 +43,15 @@
 //!   chained by [`convert::premaster_hash_from_point_shares`]: EC point shares →
 //!   `SHA-256(x-coordinate)` under 2PC, x never assembled — validated against the
 //!   vetted `p256` and NIST-KAT SHA-256.
-//! - **Malicious-security machinery** — *built*: [`wrk17`] is the WRK17
-//!   authenticated-share core — TinyOT-style IT-MAC shares, OT-generated `aAND`
-//!   triples, an authenticated circuit evaluation whose every open is **MAC-checked**
-//!   (tamper ⇒ abort), and the sacrifice check. It is malicious-**detecting** and
-//!   tested as such; it is **not** end-to-end malicious-secure — that needs a
-//!   maliciously-secure (KOS) OT under it and the formal WRK17 proof (see the module).
-//!   Until then the live session path still uses [`dualex`]'s ≤ 1-bit leak.
+//! - **Malicious-secure 2PC stack** — *built*: malicious OT ([`kos`], KOS correlation
+//!   check) → malicious `F_pre` ([`wrk17`]: aBits over KOS, `aAND` triples via
+//!   bucketing) → the **constant-round malicious online** ([`authgarble`]: WRK17/KRRW18
+//!   **authenticated garbling** — every wire a doubly-authenticated `{x}`, each AND a
+//!   half-gate pair, a corrupted garbled row ⇒ abort). Correctness + the abort mechanism
+//!   are tested; [`wrk17`] also has the equivalent interactive online. The **formal**
+//!   malicious-security theorem is the papers' proof + the external audit — not
+//!   established by these correctness tests. (Still open in the *EC-conversion* path: an
+//!   MtA consistency check for [`ectf`]; the session's older path uses [`dualex`].)
 //! - **Key schedule** — *built*: [`hkdf::hkdf_expand_label_shared`] runs TLS 1.3's
 //!   `HKDF-Expand-Label` (HMAC-SHA256, shared secret + public label) under 2PC,
 //!   matched byte-for-byte against the vetted `hmac`/`hkdf` crates.
@@ -59,6 +61,7 @@
 //! - The **external audit** gate, as everywhere in neo.
 
 pub mod auth;
+pub mod authgarble;
 pub mod circuit;
 pub mod convert;
 pub mod dualex;
@@ -73,6 +76,7 @@ pub mod poly1305;
 pub mod sha256;
 pub mod wrk17;
 
+pub use authgarble::{eval_garbled, AShare, Deltas};
 pub use convert::{a2b_shared, premaster_hash_from_point_shares};
 pub use ectf::ectf;
 pub use garble::{decode, evaluate, GarbledCircuit, Garbler};

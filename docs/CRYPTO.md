@@ -106,13 +106,17 @@ A **3-message, key-confirmed** PQ-hybrid AKE (`neo-crypto::handshake`):
   (open `y1⊕y2`, fold to `(⟨x1⊕x2⟩,⟨y1⟩,⟨z1⊕z2⊕d·x2⟩)`) over random buckets; combine verified exhaustively;
   ✅ the **TLS 1.3 key schedule under 2PC** (`hkdf::hkdf_expand_label_shared`) — `HKDF-Expand-Label` /
   HMAC-SHA256 with a **shared secret + public label** inside the garbled SHA-256 circuit, matched byte-for-byte
-  against the vetted `hmac`/`hkdf` crates.
-  What remains before **end-to-end malicious** security: the exact WRK17 **leaky-AND hash** primitive (bounds
-  the selective failure to one bit — its *security* is not test-establishable, so not shipped as verified), an
-  **MtA consistency check** for ECtF, WRK17's **constant-round garbled online** + formal proof, and the
-  **external audit** — until then the live session path still carries dual-execution's ≤1-bit leak. Also open:
+  against the vetted `hmac`/`hkdf` crates;
+  ✅ the **constant-round malicious online** (`authgarble`) — WRK17/KRRW18 **authenticated garbling**
+  implemented from the published construction: every wire a doubly-authenticated `{x}=[x·(Δ_G,Δ_E,1)]`, each
+  AND a half-gate pair (`r = H(X⊕Δ_G)⊕H(X)⊕Y`), a **corrupted garbled row ⇒ abort**. AND correct over all
+  inputs × triple values, a 4-bit adder evaluates correctly, tamper aborts. This makes the 2PC stack —
+  malicious OT (`kos`) → malicious `F_pre` (`wrk17` bucketing) → malicious online (`authgarble`) — complete at
+  the correctness/abort level; the *formal* proof + **external audit** are the security gate (not
+  test-establishable). Remaining: an **MtA consistency check** for ECtF (the EC-conversion path), the exact
+  (efficiency-optimised) WRK17 **leaky-AND hash** (bucketing already gives correct de-leaked triples), and
   **live wiring** (a real TLS 1.3 handshake state machine + record layer against an actual server — systems
-  integration, not a primitive) and a **succinct** ZK shuffle. Honest,
+  integration, not a primitive), plus a **succinct** ZK shuffle. Honest,
   tested cores.
 - **Wire-level transport integration** — wiring the REALITY decoy to a genuine upstream TLS site and
   embedding the flight in a true TLS ClientHello; `Camouflage` today mimics observable shape, not full

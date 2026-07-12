@@ -406,14 +406,20 @@ plaintext are **never assembled at a single party** — built and verified botto
     HMAC-SHA256 with a **shared secret + public label**, run inside the garbled SHA-256 circuit
     (ipad/opad key blocks carry the shared key; message/padding blocks are public constants). Matched
     **byte-for-byte against the vetted `hmac`/`hkdf` crates** across block-boundary-crossing lengths.
-- Still deferred before end-to-end malicious security: the exact WRK17 **leaky-AND hash** primitive (bounds the
-  selective failure to one bit — *security* not test-establishable, so not shipped as verified), an **MtA
-  consistency check** for ECtF, WRK17's **constant-round garbled online** + formal proof, and the **external
-  audit**; plus the **live wiring** (a real TLS 1.3 handshake state machine + record layer against an actual
-  server — systems integration, not a primitive). That *security*
+  - ✅ **WRK17/KRRW18 authenticated garbling — the constant-round malicious online** (`authgarble`),
+    implemented from the published construction: every wire a doubly-authenticated `{x}=[x·(Δ_G,Δ_E,1)]`,
+    XOR local, each AND a **half-gate pair** (garbler sends `r=H(X⊕Δ_G)⊕H(X)⊕Y`; `xy=(x⊕α)y⊕(y⊕β)α⊕αβ` via a
+    preprocessing triple), opens MAC-checked, a **corrupted garbled row ⇒ abort**. Correct over all inputs ×
+    triple values; a 4-bit adder evaluates correctly; tamper aborts. **This completes the malicious 2PC stack**
+    — malicious OT (`kos`) → malicious `F_pre` (`wrk17` bucketing) → malicious online (`authgarble`) — at the
+    correctness/abort level.
+- Still deferred before end-to-end malicious security: an **MtA consistency check** for ECtF (the EC-conversion
+  path), the exact efficiency-optimised WRK17 **leaky-AND hash** (bucketing already yields correct de-leaked
+  triples), the **formal proofs** + the **external audit**, and the **live wiring** (a real TLS 1.3 handshake
+  state machine + record layer against an actual server — systems integration, not a primitive). That *security*
   **cannot be established by correctness tests**; the live session path stays semi-honest with dual-execution's
   ≤1-bit leak until it lands.
-- Tests (50): OT delivers only the chosen message; IKNP extends past `k`; **KOS delivers honestly, its
+- Tests (54): OT delivers only the chosen message; IKNP extends past `k`; **KOS delivers honestly, its
   `GF(2¹²⁸)` is a field, and inconsistent-receiver attacks abort the correlation check**; every gate garbles over all inputs;
   garbled adder matches native add with OT-split inputs; ChaCha/SHA-256/Poly1305 references match their KATs
   and the circuits match; ECDHE is additively shared and matches the server; keystream / key-schedule / MAC
@@ -426,8 +432,9 @@ plaintext are **never assembled at a single party** — built and verified botto
   IT-MAC bits verify, reject a flip, resist forgery, and stay authenticated under XOR; **WRK17 shares open
   correctly, a tampered share aborts, OT triples satisfy `c=a∧b`, the sacrifice check catches a corrupted
   triple, the WRK17 combine is correct over all 16 input pairs, bucketing yields correct triples, and a 4-bit
-  adder evaluates correctly under authenticated shares (and aborts on a tampered wire)**;
-  dual-execution catches a cheating garbler.
+  adder evaluates correctly under authenticated shares (and aborts on a tampered wire)**; **authenticated
+  garbling evaluates the AND gate correctly over all inputs × triple values, runs a 4-bit adder, and aborts on
+  a corrupted garbled row**; dual-execution catches a cheating garbler.
 
 ---
 
