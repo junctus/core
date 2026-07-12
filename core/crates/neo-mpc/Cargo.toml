@@ -13,8 +13,10 @@ blake3.workspace = true
 curve25519-dalek.workspace = true
 chacha20poly1305.workspace = true
 getrandom.workspace = true
-num-bigint.workspace = true
+crypto-bigint.workspace = true
 
 [dev-dependencies]
-# Independent oracle for the ECtF conversion test only (not a runtime dependency).
+# Test-only: p256 is the independent ECtF oracle; num-bigint is an independent
+# reconstruction reference (a second, different bignum library) in the tests.
 p256.workspace = true
+num-bigint.workspace = true

@@ -108,7 +108,8 @@ A **3-message, key-confirmed** PQ-hybrid AKE (`neo-crypto::handshake`):
   the selective failure to one bit — its *security* is not test-establishable, so not shipped as verified), an
   **MtA consistency check** for ECtF, WRK17's **constant-round garbled online** + formal proof, and the
   **external audit** — until then the live session path still carries dual-execution's ≤1-bit leak. Also open:
-  **live wiring** to a real TLS socket, a constant-time `F_p` for ECtF, and a **succinct** ZK shuffle. Honest,
+  **live wiring** to a real TLS socket and a **succinct** ZK shuffle (ECtF's `F_p` is now constant-time via
+  `crypto-bigint`). Honest,
   tested cores.
 - **Wire-level transport integration** — wiring the REALITY decoy to a genuine upstream TLS site and
   embedding the flight in a true TLS ClientHello; `Camouflage` today mimics observable shape, not full

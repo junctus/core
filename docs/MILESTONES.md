@@ -384,8 +384,9 @@ plaintext are **never assembled at a single party** — built and verified botto
     crate** — an independent oracle, on the real P-256 prime. `convert::a2b_shared` runs A2B **on the real
     256-bit P-256 prime**, and `convert::premaster_hash_from_point_shares` **chains ectf → a2b → the SHA-256
     key-schedule circuit end-to-end** — EC point shares → `SHA-256(x-coordinate)` under 2PC, the x-coordinate
-    **never assembled**, validated against `p256` and the NIST-KAT SHA-256 reference. Semi-honest; `F_p` via
-    variable-time `num-bigint` (a constant-time field is the production step).
+    **never assembled**, validated against `p256` and the NIST-KAT SHA-256 reference. Semi-honest at the MtA
+    layer; `F_p` runs over **`crypto-bigint`'s constant-time** Montgomery residues (no timing leak of the
+    shares), cross-checked against both `p256` and `num-bigint`.
   - ✅ **WRK17 authenticated-share core (`wrk17`)** — the malicious-security *machinery*: TinyOT-style
     **both-directions IT-MAC shares** `⟨x⟩` (XOR/NOT local, **open re-checks both MACs**), **OT-generated
     `aAND` triples** (`rand_triples`, cross terms via 1-bit OT, then authenticated), the **sacrifice check**
@@ -403,7 +404,7 @@ plaintext are **never assembled at a single party** — built and verified botto
     sizes 1..3. Bucketing removes *leakage*, not incorrectness — the correctness gate is `verify_triple`.
 - Still deferred before end-to-end malicious security: the exact WRK17 **leaky-AND hash** primitive (bounds the
   selective failure to one bit — *security* not test-establishable, so not shipped as verified), an **MtA
-  consistency check** for ECtF, WRK17's **constant-round garbled online** + formal proof, a constant-time `F_p`,
+  consistency check** for ECtF, WRK17's **constant-round garbled online** + formal proof,
   **live wiring** to a real TLS socket on the server's actual curve, and the **external audit**. That *security*
   **cannot be established by correctness tests**; the live session path stays semi-honest with dual-execution's
   ≤1-bit leak until it lands.
