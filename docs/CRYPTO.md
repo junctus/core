@@ -116,10 +116,13 @@ A **3-message, key-confirmed** PQ-hybrid AKE (`neo-crypto::handshake`):
   4-bit adder correctly. So the whole stack — malicious OT (`kos`) → malicious `F_pre` (leaky-AND + bucketing)
   → malicious online (authenticated garbling) — is built and correctness/abort-tested; the **formal proofs +
   external audit** are the security gate (not test-establishable), and `kos` ships original KOS15 (an auditor
-  applies the Roy22 fix). Remaining: an **MtA consistency check** for ECtF's *field* multiplication (the
-  EC-conversion path — a different, DKLs-style construction), and **live wiring** (a real TLS 1.3 handshake
-  state machine + record layer against an actual server — systems integration, not a primitive), plus a
-  **succinct** ZK shuffle. Honest,
+  applies the Roy22 fix);
+  ✅ the **SPDZ authenticated arithmetic** for ECtF's *field* multiplication (`spdz`) — MASCOT/SPDZ shares
+  `[x]` (additive shares of `x` and `α·x`), MAC-checked opens, **Beaver multiplication**, and the **triple
+  sacrifice** check (a tampered share or a corrupted product aborts); the malicious-detection analog of the
+  boolean `wrk17`, over the constant-time `F_p`. Remaining: **wiring** ECtF's `mul_shared` onto this Beaver
+  online, **live wiring** (a real TLS 1.3 handshake state machine + record layer against an actual server —
+  systems integration, not a primitive), and a **succinct** ZK shuffle. Honest,
   tested cores.
 - **Wire-level transport integration** — wiring the REALITY decoy to a genuine upstream TLS site and
   embedding the flight in a true TLS ClientHello; `Camouflage` today mimics observable shape, not full

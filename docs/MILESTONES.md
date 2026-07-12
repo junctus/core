@@ -416,13 +416,17 @@ plaintext are **never assembled at a single party** — built and verified botto
     tamper aborts; and **end-to-end, bucketed leaky-AND triples drive the garbled adder correctly**. So the
     whole stack — malicious OT (`kos`) → malicious `F_pre` (leaky-AND + bucketing) → malicious online
     (authenticated garbling) — is built and correctness/abort-tested.
-- Still deferred before end-to-end malicious security: an **MtA consistency check** for ECtF's *field*
-  multiplication (the EC-conversion path — a different, DKLs-style construction than the bit triples above),
-  the **formal proofs** + the **external audit** (`kos` ships original KOS15; an auditor applies the Roy22
-  fix), and the **live wiring** (a real TLS 1.3 handshake state machine + record layer against an actual
+  - ✅ **SPDZ authenticated arithmetic for the ECtF field path** (`spdz`) — MASCOT/SPDZ shares `[x]` (additive
+    shares of `x` and `α·x` under a global MAC key), MAC-checked **open**, **Beaver multiplication**, and the
+    **triple sacrifice** check. The malicious-detection analog of boolean `wrk17`, over the constant-time
+    `F_p`. Tested: Beaver products correct; a tampered share (even one consistent under only its own `α`
+    share) and a corrupted triple both abort.
+- Still deferred before end-to-end malicious security: **wiring** ECtF's `mul_shared` onto the `spdz` Beaver
+  online, the **formal proofs** + the **external audit** (`kos` ships original KOS15; an auditor applies the
+  Roy22 fix), and the **live wiring** (a real TLS 1.3 handshake state machine + record layer against an actual
   server — systems integration, not a primitive). That *security* **cannot be established by correctness
   tests**; the live session path stays semi-honest with dual-execution's ≤1-bit leak until it lands.
-- Tests (58): OT delivers only the chosen message; IKNP extends past `k`; **KOS delivers honestly, its
+- Tests (62): OT delivers only the chosen message; IKNP extends past `k`; **KOS delivers honestly, its
   `GF(2¹²⁸)` is a field, and inconsistent-receiver attacks abort the correlation check**; every gate garbles over all inputs;
   garbled adder matches native add with OT-split inputs; ChaCha/SHA-256/Poly1305 references match their KATs
   and the circuits match; ECDHE is additively shared and matches the server; keystream / key-schedule / MAC
@@ -438,7 +442,8 @@ plaintext are **never assembled at a single party** — built and verified botto
   adder evaluates correctly under authenticated shares (and aborts on a tampered wire)**; **authenticated
   garbling evaluates the AND gate correctly over all inputs × triple values, runs a 4-bit adder, and aborts on
   a corrupted garbled row; leaky-AND + combine are correct over all inputs, and end-to-end the bucketed
-  leaky-AND F_pre drives the garbled adder correctly**; dual-execution catches a cheating garbler.
+  leaky-AND F_pre drives the garbled adder correctly; SPDZ Beaver products are correct and a tampered
+  share / corrupted triple abort**; dual-execution catches a cheating garbler.
 
 ---
 

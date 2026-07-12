@@ -40,11 +40,12 @@
 //!   crate** — an independent oracle, not our own reference. It runs on the real
 //!   P-256 prime.
 //! - **OT is now KOS** ([`kos`](super::kos)), maliciously-secure — so a cheating
-//!   receiver in the MtA OTs aborts. This is *necessary but not sufficient* for a
-//!   malicious ECtF: Gilboa MtA also needs its own **consistency check** (a malicious
-//!   sender could use an inconsistent `a` across the bit-OTs, à la DKLs), which is not
-//!   yet built. The composition is malicious at the OT layer, semi-honest at the MtA
-//!   layer.
+//!   receiver in the MtA OTs aborts. For the *sender*-consistency half, [`spdz`](super::spdz)
+//!   adds the MASCOT/SPDZ machinery — authenticated arithmetic shares with a global MAC,
+//!   MAC-checked opens, Beaver multiplication, and the **triple sacrifice** check (a
+//!   maliciously wrong product is caught). What remains is **wiring** this ECtF's
+//!   [`mul_shared`] onto the authenticated Beaver online (rather than direct MtA); the
+//!   pieces are built and tested.
 //! - The `F_p` arithmetic runs over **`crypto-bigint`'s constant-time** Montgomery
 //!   residues (`DynResidue`), not variable-time bignum — so field ops don't leak the
 //!   secret shares through timing. The protocol is field-implementation-agnostic; the

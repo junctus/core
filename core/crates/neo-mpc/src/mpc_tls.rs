@@ -50,8 +50,9 @@
 //!   half-gate pair, a corrupted garbled row ⇒ abort). Correctness + the abort mechanism
 //!   are tested; [`wrk17`] also has the equivalent interactive online. The **formal**
 //!   malicious-security theorem is the papers' proof + the external audit — not
-//!   established by these correctness tests. (Still open in the *EC-conversion* path: an
-//!   MtA consistency check for [`ectf`]; the session's older path uses [`dualex`].)
+//!   established by these correctness tests. The *EC-conversion* path's arithmetic
+//!   analog is [`spdz`] (MASCOT/SPDZ authenticated `F_p` shares, Beaver mult, triple
+//!   sacrifice); wiring [`ectf`]'s `mul_shared` onto it is the remaining integration.
 //! - **Key schedule** — *built*: [`hkdf::hkdf_expand_label_shared`] runs TLS 1.3's
 //!   `HKDF-Expand-Label` (HMAC-SHA256, shared secret + public label) under 2PC,
 //!   matched byte-for-byte against the vetted `hmac`/`hkdf` crates.
@@ -74,9 +75,11 @@ pub mod ot;
 pub mod ot_ext;
 pub mod poly1305;
 pub mod sha256;
+pub mod spdz;
 pub mod wrk17;
 
 pub use authgarble::{bucketed_and_triples, eval_garbled, leaky_and, AShare, Deltas};
+pub use spdz::{beaver_mul, sacrifice};
 pub use convert::{a2b_shared, premaster_hash_from_point_shares};
 pub use ectf::ectf;
 pub use garble::{decode, evaluate, GarbledCircuit, Garbler};
