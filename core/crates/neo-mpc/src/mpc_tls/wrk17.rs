@@ -24,9 +24,11 @@
 //!
 //! # Preprocessing (`F_pre`) — authenticated randoms and `aAND` triples
 //!
-//! - [`rand_shares`] draws random `⟨r⟩` from **correlated OT** ([`ot_ext`]): each
-//!   party's random bit is the OT choice against the other's `(K, K⊕Δ)` pair, so it
-//!   receives exactly `K ⊕ bit·Δ` — the MAC — under one fixed `Δ`.
+//! - [`rand_shares`] draws random `⟨r⟩` from **correlated, maliciously-secure OT**
+//!   ([`kos`]): each party's random bit is the OT choice against the other's
+//!   `(K, K⊕Δ)` pair, so it receives exactly `K ⊕ bit·Δ` — the MAC — under one fixed
+//!   `Δ`. Running the aBit generation over KOS is what **closes the selective-failure
+//!   channel on `Δ`** (the aBit consistency check).
 //! - [`rand_triples`] produces `⟨a⟩,⟨b⟩,⟨c⟩` with `c = a∧b`: the two cross terms of
 //!   `(aa⊕ab)(ba⊕bb)` are each a 1-bit OT (XOR-shares of a bit product), the diagonal
 //!   terms are local, and the resulting `c` is then authenticated. Correct triples,
@@ -49,9 +51,12 @@
 //! its malicious-**detection** mechanism (MAC-checked opens + the sacrifice check).
 //! It is **not**, and is not claimed to be, an audited malicious-secure protocol:
 //!
-//! 1. **The OT underneath is semi-honest IKNP** ([`ot_ext`]). A fully malicious-secure
-//!    instantiation needs a maliciously-secure (KOS-checked) OT and the `aBit`
-//!    consistency check; on semi-honest OT the composition is not end-to-end malicious.
+//! 1. **The OT layer is now KOS** ([`kos`]) — maliciously-secure, so the aBit and
+//!    triple-cross-term OTs abort on a cheating receiver (the aBit consistency check).
+//!    What still stands between this and *end-to-end* malicious security: WRK17's
+//!    malicious **triple generation** (leaky-AND + bucketing — [`verify_triple`] and
+//!    [`combine_shared_y`] are the pieces, not yet the full generator) and KOS's own
+//!    honest-base-OT assumption.
 //! 2. **Round complexity**: WRK17's headline is a *constant-round garbled* online.
 //!    Realized here is the equivalent **interactive** authenticated-share online (same
 //!    `F_pre`, same MAC-check security machinery, one round per AND-depth layer). The
@@ -65,7 +70,7 @@
 use neo_core::{Error, Result};
 
 use super::circuit::{Circuit, Gate};
-use super::ot_ext;
+use super::kos;
 
 /// MAC / global-key length in bytes (κ = 128 bits).
 pub const KAPPA: usize = 16;
@@ -232,7 +237,7 @@ fn cot(bits: &[bool], delta: &Mac) -> Result<(Vec<Mac>, Vec<Mac>)> {
         keys.push(k);
         pairs.push((k, xor16(k, *delta)));
     }
-    let macs = ot_ext::extend(bits, &pairs)?;
+    let macs = kos::extend(bits, &pairs)?;
     Ok((macs, keys))
 }
 
@@ -280,7 +285,7 @@ pub fn rand_triples(n: usize, keys: &Keys) -> Result<Vec<Triple>> {
     let msg1: Vec<(Mac, Mac)> = (0..n)
         .map(|i| (bit_msg(r1[i]), bit_msg(r1[i] ^ bb[i])))
         .collect();
-    let recv1 = ot_ext::extend(&aa, &msg1)?;
+    let recv1 = kos::extend(&aa, &msg1)?;
     let cross1_a: Vec<bool> = recv1.iter().map(|m| m[0] & 1 == 1).collect();
     let cross1_b = &r1;
 
@@ -289,7 +294,7 @@ pub fn rand_triples(n: usize, keys: &Keys) -> Result<Vec<Triple>> {
     let msg2: Vec<(Mac, Mac)> = (0..n)
         .map(|i| (bit_msg(r2[i]), bit_msg(r2[i] ^ ba[i])))
         .collect();
-    let recv2 = ot_ext::extend(&ab, &msg2)?;
+    let recv2 = kos::extend(&ab, &msg2)?;
     let cross2_b: Vec<bool> = recv2.iter().map(|m| m[0] & 1 == 1).collect();
     let cross2_a = &r2;
 

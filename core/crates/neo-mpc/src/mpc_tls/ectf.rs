@@ -20,7 +20,7 @@
 //! Everything is built from one gadget: **multiply two additively-shared field
 //! elements into additive shares of the product** ([`mul_shared`]), whose only
 //! interactive part is [`mta_fp`] — **Gilboa MtA over `F_p`**, run on the crate's
-//! real IKNP OT ([`ot_ext`](super::ot_ext)). With it:
+//! maliciously-secure OT ([`kos`](super::kos)). With it:
 //!
 //! 1. `Δx = x2 − x1`, `Δy = y2 − y1` are additive shares for free (A holds `−x1,−y1`,
 //!    B holds `x2, y2`).
@@ -39,10 +39,12 @@
 //!   x-coordinate share against **P-256 point addition computed by the vetted `p256`
 //!   crate** — an independent oracle, not our own reference. It runs on the real
 //!   P-256 prime.
-//! - **Semi-honest**, like the whole 2PC session: `mta_fp` rides the semi-honest
-//!   [`ot_ext`](super::ot_ext) with no consistency check; malicious security needs a
-//!   maliciously-secure (KOS-checked) OT and MtA consistency check — the same
-//!   still-unbuilt hardening the rest of the stack awaits.
+//! - **OT is now KOS** ([`kos`](super::kos)), maliciously-secure — so a cheating
+//!   receiver in the MtA OTs aborts. This is *necessary but not sufficient* for a
+//!   malicious ECtF: Gilboa MtA also needs its own **consistency check** (a malicious
+//!   sender could use an inconsistent `a` across the bit-OTs, à la DKLs), which is not
+//!   yet built. The composition is malicious at the OT layer, semi-honest at the MtA
+//!   layer.
 //! - The `F_p` arithmetic uses `num-bigint` (variable-time). A production build wants
 //!   a **constant-time** field; this module demonstrates and validates the *protocol*,
 //!   which is field-implementation-agnostic.
@@ -50,7 +52,7 @@
 use neo_core::{Error, Result};
 use num_bigint::BigUint;
 
-use super::ot_ext;
+use super::kos;
 
 /// ECtF: given party A's point `(x1, y1)` and party B's point `(x2, y2)` — each
 /// coordinate a 32-byte **big-endian** field element in `[0, p)` — return additive
@@ -123,7 +125,7 @@ fn mul_shared(
 /// [`mta`](super::mta::mta) (which is fixed to the Ristretto scalar field) to an
 /// arbitrary 256-bit prime. Each of `b`'s 256 bits drives one OT of the pair
 /// `(tᵢ, tᵢ + a·2ⁱ)`; field elements are 32 bytes, split into a low/high 16-byte half
-/// (two OT columns over the same choice bits) for [`ot_ext`](super::ot_ext).
+/// (two OT columns over the same choice bits) for [`kos`](super::kos).
 fn mta_fp(a: &BigUint, b: &BigUint, p: &BigUint) -> Result<(BigUint, BigUint)> {
     let b_be = to_be32(b);
     let bit = |i: usize| (b_be[31 - i / 8] >> (i % 8)) & 1 == 1; // 2^i, big-endian bytes
@@ -144,8 +146,8 @@ fn mta_fp(a: &BigUint, b: &BigUint, p: &BigUint) -> Result<(BigUint, BigUint)> {
     }
 
     let bits: Vec<bool> = (0..256).map(bit).collect();
-    let lo_recv = ot_ext::extend(&bits, &lo)?;
-    let hi_recv = ot_ext::extend(&bits, &hi)?;
+    let lo_recv = kos::extend(&bits, &lo)?;
+    let hi_recv = kos::extend(&bits, &hi)?;
 
     let mut v = BigUint::ZERO;
     for i in 0..256 {

@@ -57,7 +57,9 @@ A **3-message, key-confirmed** PQ-hybrid AKE (`neo-crypto::handshake`):
   **client-combined, DLEQ-proved partials** via Lagrange-in-the-exponent — so **no committee node ever
   assembles the key or plaintext** (for the decrypt direction).
 - **Two-party MPC-TLS** (`neo-mpc::mpc_tls`) — the real 2PC stack, built and tested bottom-up:
-  Chou–Orlandi **oblivious transfer** + **IKNP OT extension**; a **garbled-circuit** engine (free-XOR +
+  Chou–Orlandi **oblivious transfer** + **IKNP OT extension** + **KOS maliciously-secure OT extension**
+  (`kos`: IKNP plus a `GF(2¹²⁸)` correlation check that **aborts on a cheating receiver**; the
+  malicious-security path runs its OT over it); a **garbled-circuit** engine (free-XOR +
   point-and-permute + ZRE15 half-gates); **ChaCha20**, **SHA-256**, and **Poly1305** as boolean circuits
   (each verified against its RFC/NIST KAT); a DECO-style **additively-shared ECDHE**; and — computed
   **under 2PC into XOR-shares** — the ChaCha keystream, the SHA-256 key schedule, the Poly1305 tag, and an
@@ -66,8 +68,9 @@ A **3-message, key-confirmed** PQ-hybrid AKE (`neo-crypto::handshake`):
   The **DECO EC point→field conversion** (`ectf`, Gilboa MtA over `F_p` + masked inversion, validated against
   the vetted `p256` crate) and the **WRK17 authenticated-share core** (`wrk17`: IT-MAC shares, OT-generated
   `aAND` triples, MAC-checked authenticated evaluation that aborts on tamper) are both built and tested — the
-  latter a malicious-*detection* layer. Semi-honest / malicious-detecting core; see Outstanding for the
-  remaining hardening (a KOS OT and the audit gate before end-to-end malicious security).
+  latter a malicious-*detection* layer, both now running their OT over `kos` (so the aBit/MtA/triple OTs
+  abort on a cheating receiver). Semi-honest / malicious-detecting core; see Outstanding for the remaining
+  hardening (malicious triple generation, an MtA consistency check, and the audit gate).
 - **Persistent circuit tunnels** (`neo-node::circuit`) — a long-lived Sphinx circuit carrying a
   bidirectional byte stream as **counter-keyed onion cells** (no keystream reuse) with a **per-cell
   end-to-end MAC**, and a real **TCP splice** at the exit — TCP-over-onion, integrity to parity with the
@@ -93,10 +96,14 @@ A **3-message, key-confirmed** PQ-hybrid AKE (`neo-crypto::handshake`):
   ✅ the **WRK17 authenticated-share core** (`wrk17`) — TinyOT-style IT-MAC shares, **OT-generated `aAND`
   triples**, an authenticated circuit evaluation whose every open is **MAC-checked** so any tampered wire
   **aborts**, plus the **sacrifice check** — a real, tested malicious-*detection* layer (verified against a
-  4-bit adder and by tamper-abort tests).
-  What remains before **end-to-end malicious** security: a **maliciously-secure (KOS) OT** under both ECtF and
-  WRK17, WRK17's formal proof + its constant-round garbled online, and the **external audit** — until then the
-  live session path still carries dual-execution's ≤1-bit leak. Also open: **live wiring** to a real TLS
+  4-bit adder and by tamper-abort tests);
+  ✅ the **KOS maliciously-secure OT extension** (`kos`) — IKNP plus a `GF(2¹²⁸)` correlation check that
+  **aborts on a cheating receiver** (tested); ECtF's MtA and WRK17's aBit/triple OTs now run over it, closing
+  the OT layer's selective-failure channel (the aBit consistency check).
+  What remains before **end-to-end malicious** security: WRK17's **malicious triple generation** (leaky-AND +
+  bucketing — the sacrifice check and combine are built, not the full generator), an **MtA consistency check**
+  for ECtF, WRK17's **constant-round garbled online** + formal proof, and the **external audit** — until then
+  the live session path still carries dual-execution's ≤1-bit leak. Also open: **live wiring** to a real TLS
   socket, a constant-time `F_p` for ECtF, and a **succinct** ZK shuffle. Honest, tested cores.
 - **Wire-level transport integration** — wiring the REALITY decoy to a genuine upstream TLS site and
   embedding the flight in a true TLS ClientHello; `Camouflage` today mimics observable shape, not full

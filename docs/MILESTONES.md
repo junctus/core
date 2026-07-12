@@ -389,13 +389,20 @@ plaintext are **never assembled at a single party** — built and verified botto
     `aAND` triples** (`rand_triples`, cross terms via 1-bit OT, then authenticated), the **sacrifice check**
     (`verify_triple`), the **bucket combine**, and an **authenticated circuit evaluation** (`eval_authenticated`,
     Beaver ANDs with MAC-checked opens) — so **any tampered wire aborts**. It is malicious-**detecting** and
-    tested as such. It is **not** end-to-end malicious-secure: the OT under it is semi-honest IKNP (needs a
-    KOS-checked OT), WRK17's constant-round garbled online + formal proof remain, and — as always — that
-    *security* **cannot be established by correctness tests**. The live session path stays semi-honest with
-    dual-execution's ≤1-bit leak until the KOS OT + full protocol + the external audit.
-- Still deferred: a **maliciously-secure (KOS) OT** under ECtF/WRK17, WRK17's constant-round garbled online +
-  formal proof, a constant-time `F_p`, and **live wiring** to a real TLS socket on the server's actual curve.
-- Tests (39): OT delivers only the chosen message; IKNP extends past `k`; every gate garbles over all inputs;
+    tested as such. It is **not yet** end-to-end malicious-secure (see the next brick + what's deferred).
+  - ✅ **KOS maliciously-secure OT extension (`kos`)** — IKNP plus a `GF(2¹²⁸)` **correlation check** (Gilboa
+    weights bound to the `u` columns by Fiat–Shamir) that **aborts on a cheating receiver**; a receiver trying
+    to leak `t` bits of `s` is caught except w.p. `2⁻ᵗ`. Tested: honest delivery, `GF(2¹²⁸)` is a field, and
+    inconsistent-receiver attacks abort. **ECtF's MtA and WRK17's aBit/triple OTs now run over `kos`**, closing
+    the OT layer's selective-failure channel (the aBit consistency check).
+- Still deferred before end-to-end malicious security: WRK17's **malicious triple generation** (leaky-AND +
+  bucketing — the sacrifice check + combine are built, not the full generator), an **MtA consistency check**
+  for ECtF, WRK17's **constant-round garbled online** + formal proof, a constant-time `F_p`, **live wiring** to
+  a real TLS socket on the server's actual curve, and the **external audit**. That *security* **cannot be
+  established by correctness tests**; the live session path stays semi-honest with dual-execution's ≤1-bit leak
+  until it lands.
+- Tests (44): OT delivers only the chosen message; IKNP extends past `k`; **KOS delivers honestly, its
+  `GF(2¹²⁸)` is a field, and inconsistent-receiver attacks abort the correlation check**; every gate garbles over all inputs;
   garbled adder matches native add with OT-split inputs; ChaCha/SHA-256/Poly1305 references match their KATs
   and the circuits match; ECDHE is additively shared and matches the server; keystream / key-schedule / MAC
   each run under 2PC into shares; the **full ChaCha20-Poly1305 AEAD** and a **TLS 1.3 record** seal under 2PC
@@ -684,9 +691,11 @@ and plaintext are provably never assembled at one party.
 - Plan: the M24 2PC-TLS core (`neo-mpc::mpc_tls`) now has both deferred sub-protocols built and tested —
   the **EC point→field conversion** (`ectf`, validated against `p256`) that turns the shared ECDHE point
   into the x-coordinate share feeding the SHA-256 key-schedule circuit, and the **WRK17 authenticated-share
-  core** (`wrk17`, MAC-checked, malicious-*detecting*). What M33 still needs on top: a **maliciously-secure
-  (KOS) OT** under both, WRK17's constant-round garbled online + formal proof (for real malicious security,
-  not just detection), and **live HKDF/AEAD wiring** to a real TLS socket on the server's actual curve. Then
+  core** (`wrk17`, MAC-checked, malicious-*detecting*), both now running their OT over **KOS maliciously-secure
+  OT** (`kos`, aborts on a cheating receiver). What M33 still needs on top: WRK17's **malicious triple
+  generation** (leaky-AND + bucketing) and **constant-round garbled online** + formal proof (for real malicious
+  security, not just detection), an **MtA consistency check** for ECtF, and **live HKDF/AEAD wiring** to a real
+  TLS socket on the server's actual curve. Then
   a selective-opening circuit proves one fact ("balance > X", "account age > 2y") while the session bytes are
   never assembled anywhere. Also delivers the real distrusted-exit browsing mode and the plaintext-free
   forward leg M28 needs.

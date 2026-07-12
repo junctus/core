@@ -12,7 +12,10 @@
 //! It is built bottom-up from real primitives, each verified before the next:
 //! 1. [`ot`] — 1-of-2 **oblivious transfer** (Chou–Orlandi), so the evaluator can
 //!    fetch labels for its own input bits blindly; [`ot_ext`] — **IKNP OT
-//!    extension** turning `k` base OTs into arbitrarily many cheap ones.
+//!    extension** turning `k` base OTs into arbitrarily many cheap ones; [`kos`] —
+//!    **KOS maliciously-secure OT extension** (IKNP + a `GF(2^κ)` correlation check
+//!    that aborts on a cheating receiver). The malicious-security path ([`wrk17`],
+//!    [`ectf`]) runs its OT over [`kos`].
 //! 2. [`garble`] — a **garbled-circuit** engine (free-XOR, point-and-permute,
 //!    ZRE15 half-gate AND): general 2PC of any boolean circuit.
 //! 3. [`circuit`] — boolean circuits for the pieces TLS needs: a 32-bit adder, the
@@ -58,6 +61,7 @@ pub mod convert;
 pub mod dualex;
 pub mod ectf;
 pub mod garble;
+pub mod kos;
 pub mod mta;
 pub mod ot;
 pub mod ot_ext;

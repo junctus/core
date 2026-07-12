@@ -30,7 +30,7 @@
 
 use neo_core::{Error, Result};
 
-use super::ot_ext;
+use super::kos;
 
 /// MAC / global-key length in bytes (`κ = 128` bits).
 pub const KAPPA: usize = 16;
@@ -114,13 +114,13 @@ impl BitKey {
 /// verifier draws one global `Δ` and per-bit random keys `Kᵢ` and offers each OT the
 /// pair `(Kᵢ, Kᵢ⊕Δ)`; the holder, *choosing with its bit `xᵢ`*, receives exactly
 /// `Mᵢ = Kᵢ ⊕ (xᵢ·Δ)` — the authenticated-bit relation, under one shared `Δ`. Runs
-/// over the crate's real IKNP OT ([`ot_ext`]). Returns the verifier's global key +
-/// per-bit keys and the holder's authenticated bits.
+/// over the crate's **maliciously-secure OT** ([`kos`]). Returns the verifier's global
+/// key + per-bit keys and the holder's authenticated bits.
 ///
-/// **Semi-honest.** [`ot_ext`] has no receiver-consistency check (a malicious holder
-/// could leak bits of `Δ` via a selective-failure channel), so this is *not* the
-/// malicious-secure aBit generation — that adds a correlation / KOS-style check and
-/// is part of the still-unbuilt full WRK17 protocol.
+/// Running over [`kos`] closes the selective-failure channel on `Δ` (a malicious
+/// holder sending inconsistent OT choices aborts) — the aBit consistency check. The
+/// load-bearing aBit generator on the malicious-security path is [`wrk17`](super::wrk17)'s;
+/// this remains the standalone IT-MAC brick, now over the same malicious OT.
 pub fn generate_authenticated_bits(
     bits: &[bool],
 ) -> Result<(GlobalKey, Vec<BitKey>, Vec<AuthBit>)> {
@@ -134,7 +134,7 @@ pub fn generate_authenticated_bits(
         pairs.push((k, xor(k, delta.0))); // (K, K⊕Δ)
     }
     // The holder's bits are the OT choices; it receives Mᵢ = pairs[i][xᵢ].
-    let macs = ot_ext::extend(bits, &pairs)?;
+    let macs = kos::extend(bits, &pairs)?;
     let auth_bits = bits
         .iter()
         .zip(&macs)

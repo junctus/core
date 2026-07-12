@@ -12,18 +12,20 @@
 //! Construction: **Gilboa's OT-based MtA**. Write `b = Σ bᵢ·2ⁱ`. For each bit the
 //! sender offers, via 1-of-2 OT, `(tᵢ, tᵢ + a·2ⁱ)` for a fresh random `tᵢ`; the
 //! receiver, choosing with `bᵢ`, gets `mᵢ = tᵢ + bᵢ·a·2ⁱ`. Then `u = −Σ tᵢ` and
-//! `v = Σ mᵢ` satisfy `u + v = Σ bᵢ·a·2ⁱ = a·b`. Runs over the crate's real IKNP OT
-//! ([`ot_ext`]); scalars are 32 bytes so each OT message is split into a low/high
-//! 16-byte half (two OT columns sharing the same choice bits).
+//! `v = Σ mᵢ` satisfy `u + v = Σ bᵢ·a·2ⁱ = a·b`. Runs over the crate's
+//! **maliciously-secure OT** ([`kos`]); scalars are 32 bytes so each OT message is
+//! split into a low/high 16-byte half (two OT columns sharing the same choice bits).
 //!
-//! **Semi-honest.** Gilboa MtA over the semi-honest [`ot_ext`] has no consistency
-//! check; the malicious-secure MtA (a check that the receiver used consistent bits /
-//! the sender consistent `a`) is part of the still-unbuilt full protocol.
+//! **OT is malicious ([`kos`]); the MtA *protocol* is still semi-honest**: an MtA
+//! consistency check (that the receiver used consistent choice bits and the sender a
+//! consistent `a` across the two columns, à la DKLs) is the remaining hardening. The
+//! real-field version used by the conversion is [`ectf::mta_fp`](super::ectf); this is
+//! the Ristretto-scalar sibling.
 
 use curve25519_dalek::Scalar;
 use neo_core::{Error, Result};
 
-use super::ot_ext;
+use super::kos;
 
 /// Multiplicative-to-additive share conversion over `Z_l`: given `a` (party A) and
 /// `b` (party B), returns additive shares `(u, v)` with `u + v ≡ a·b (mod l)`.
@@ -52,8 +54,8 @@ pub fn mta(a: &Scalar, b: &Scalar) -> Result<(Scalar, Scalar)> {
     }
 
     // Two OT columns over the same choice bits recover both halves of `mᵢ`.
-    let lo_recv = ot_ext::extend(&bits, &lo_pairs)?;
-    let hi_recv = ot_ext::extend(&bits, &hi_pairs)?;
+    let lo_recv = kos::extend(&bits, &lo_pairs)?;
+    let hi_recv = kos::extend(&bits, &hi_pairs)?;
 
     let mut v = zero;
     for i in 0..256 {
