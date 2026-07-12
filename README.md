@@ -61,7 +61,6 @@ The shipping GUI/app clients live in sibling repos, on the same shared Rust core
 | [`PROTOCOL.md`](docs/PROTOCOL.md) | the per-flow wire pipeline and exit models |
 | [`CRYPTO.md`](docs/CRYPTO.md) | primitives and the constructions built on them |
 | [`DISCOVERY.md`](docs/DISCOVERY.md) | zero-config discovery, witnessed snapshots, Sybil/eclipse |
-| [`MONETIZATION.md`](docs/MONETIZATION.md) | economic sustainability without breaking unlinkability |
 | [`THREAT_MODEL.md`](docs/THREAT_MODEL.md) | adversaries, answers, honest limits |
 | [`SECURITY_REVIEW.md`](docs/SECURITY_REVIEW.md) | the living internal security review — cumulative findings across all rounds + their fixes |
 

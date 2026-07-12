@@ -132,7 +132,7 @@ The reviews actively tried to break these across every round and could not. They
 These are honest standing limits the code already states and remain open work items — known, not silently present:
 - **DKG is crash-fault-tolerant, not Byzantine-tolerant.** A member reporting inconsistent qualified-set views can split honest members onto different keys (a liveness, not a secrecy, regression). Needs a broadcast/agreement primitive.
 - **M27 REALITY is not full-session-indistinguishable.** The authenticated path doesn't complete a real TLS handshake, and the fingerprint is one fixed non-browser profile (`MILESTONES.md` M27).
-- **Proof-of-relay receipts are client-attested / forgeable** (`neo-credits::earn`); credits stay anti-free-riding utility with no cash value until hardened (`MONETIZATION.md`, `MILESTONES.md` M32/M36).
+- **Proof-of-relay receipts are client-attested / forgeable** (`neo-credits::earn`); credits stay anti-free-riding utility with no cash value until hardened (`MILESTONES.md` M32/M36).
 
 ## Closing note
 
