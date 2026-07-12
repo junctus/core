@@ -51,6 +51,7 @@ pub mod circuit;
 pub mod convert;
 pub mod dualex;
 pub mod garble;
+pub mod mta;
 pub mod ot;
 pub mod ot_ext;
 pub mod poly1305;

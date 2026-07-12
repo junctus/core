@@ -30,6 +30,8 @@
 
 use neo_core::{Error, Result};
 
+use super::ot_ext;
+
 /// MAC / global-key length in bytes (`κ = 128` bits).
 pub const KAPPA: usize = 16;
 
@@ -107,6 +109,41 @@ impl BitKey {
     }
 }
 
+/// Generate authenticated bits for `bits` (the holder's) from **correlated OT** —
+/// the `F_pre` step of WRK17 that turns oblivious transfer into IT-MACs. The
+/// verifier draws one global `Δ` and per-bit random keys `Kᵢ` and offers each OT the
+/// pair `(Kᵢ, Kᵢ⊕Δ)`; the holder, *choosing with its bit `xᵢ`*, receives exactly
+/// `Mᵢ = Kᵢ ⊕ (xᵢ·Δ)` — the authenticated-bit relation, under one shared `Δ`. Runs
+/// over the crate's real IKNP OT ([`ot_ext`]). Returns the verifier's global key +
+/// per-bit keys and the holder's authenticated bits.
+///
+/// **Semi-honest.** [`ot_ext`] has no receiver-consistency check (a malicious holder
+/// could leak bits of `Δ` via a selective-failure channel), so this is *not* the
+/// malicious-secure aBit generation — that adds a correlation / KOS-style check and
+/// is part of the still-unbuilt full WRK17 protocol.
+pub fn generate_authenticated_bits(
+    bits: &[bool],
+) -> Result<(GlobalKey, Vec<BitKey>, Vec<AuthBit>)> {
+    let delta = GlobalKey::random()?;
+    let mut keys = Vec::with_capacity(bits.len());
+    let mut pairs = Vec::with_capacity(bits.len());
+    for _ in bits {
+        let mut k = [0u8; KAPPA];
+        getrandom::getrandom(&mut k).map_err(|e| Error::Rng(e.to_string()))?;
+        keys.push(k);
+        pairs.push((k, xor(k, delta.0))); // (K, K⊕Δ)
+    }
+    // The holder's bits are the OT choices; it receives Mᵢ = pairs[i][xᵢ].
+    let macs = ot_ext::extend(bits, &pairs)?;
+    let auth_bits = bits
+        .iter()
+        .zip(&macs)
+        .map(|(&x, &mac)| AuthBit { x, mac })
+        .collect();
+    let bit_keys = keys.into_iter().map(BitKey).collect();
+    Ok((delta, bit_keys, auth_bits))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +195,23 @@ mod tests {
                 assert!(!delta.verify(&forged, &key), "a wrong Δ-guess is rejected");
             }
         }
+    }
+
+    #[test]
+    fn authenticated_bits_generated_from_ot_verify_under_one_delta() {
+        // The F_pre step: run correlated OT over the crate's real IKNP and confirm
+        // every generated authenticated bit verifies under the single global Δ, and
+        // that the XOR-homomorphism carries across OT-produced bits.
+        let bits = [true, false, true, true, false, false, true, false, true];
+        let (delta, keys, abits) = generate_authenticated_bits(&bits).unwrap();
+        assert_eq!(abits.len(), bits.len());
+        for ((&x, ab), k) in bits.iter().zip(&abits).zip(&keys) {
+            assert_eq!(ab.value(), x);
+            assert!(delta.verify(ab, k), "OT-generated aBit ({x}) verifies");
+        }
+        let bx = abits[0].xor(&abits[2]);
+        let kx = keys[0].xor(&keys[2]);
+        assert!(delta.verify(&bx, &kx), "XOR of OT-generated bits verifies");
     }
 
     #[test]
