@@ -103,13 +103,16 @@ A **3-message, key-confirmed** PQ-hybrid AKE (`neo-crypto::handshake`):
   **aborts on a cheating receiver** (tested); ECtF's MtA and WRK17's aBit/triple OTs now run over it, closing
   the OT layer's selective-failure channel (the aBit consistency check);
   ✅ WRK17's **bucketing / leakage removal** (`wrk17::combine` + `bucketed_triples`) — the real WRK17 combine
-  (open `y1⊕y2`, fold to `(⟨x1⊕x2⟩,⟨y1⟩,⟨z1⊕z2⊕d·x2⟩)`) over random buckets; combine verified exhaustively.
+  (open `y1⊕y2`, fold to `(⟨x1⊕x2⟩,⟨y1⟩,⟨z1⊕z2⊕d·x2⟩)`) over random buckets; combine verified exhaustively;
+  ✅ the **TLS 1.3 key schedule under 2PC** (`hkdf::hkdf_expand_label_shared`) — `HKDF-Expand-Label` /
+  HMAC-SHA256 with a **shared secret + public label** inside the garbled SHA-256 circuit, matched byte-for-byte
+  against the vetted `hmac`/`hkdf` crates.
   What remains before **end-to-end malicious** security: the exact WRK17 **leaky-AND hash** primitive (bounds
   the selective failure to one bit — its *security* is not test-establishable, so not shipped as verified), an
   **MtA consistency check** for ECtF, WRK17's **constant-round garbled online** + formal proof, and the
   **external audit** — until then the live session path still carries dual-execution's ≤1-bit leak. Also open:
-  **live wiring** to a real TLS socket and a **succinct** ZK shuffle (ECtF's `F_p` is now constant-time via
-  `crypto-bigint`). Honest,
+  **live wiring** (a real TLS 1.3 handshake state machine + record layer against an actual server — systems
+  integration, not a primitive) and a **succinct** ZK shuffle. Honest,
   tested cores.
 - **Wire-level transport integration** — wiring the REALITY decoy to a genuine upstream TLS site and
   embedding the flight in a true TLS ClientHello; `Camouflage` today mimics observable shape, not full

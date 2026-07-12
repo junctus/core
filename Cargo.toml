@@ -50,6 +50,7 @@ reed-solomon-erasure = "4"
 # API-compatible drop-in for the `Sharks`/`Share`/`dealer`/`recover` surface used.
 blahaj = "0.6"
 hkdf = "0.12"
+hmac = "0.12"
 sha2 = "0.10"
 getrandom = "0.2"
 ed25519-dalek = "2"

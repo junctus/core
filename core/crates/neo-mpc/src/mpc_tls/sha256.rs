@@ -18,7 +18,7 @@ use super::circuit::{Builder, Circuit};
 use super::garble;
 
 /// SHA-256 initial hash values.
-const H0: [u32; 8] = [
+pub(crate) const H0: [u32; 8] = [
     0x6a09_e667,
     0xbb67_ae85,
     0x3c6e_f372,
@@ -195,7 +195,11 @@ pub fn sha256_compress_circuit() -> Circuit {
 }
 
 /// The compression as circuit gates over 32-bit words (LSB-first wire vectors).
-fn compress_circuit(b: &mut Builder, h_in: &[Vec<usize>], block: &[Vec<usize>]) -> Vec<Vec<usize>> {
+pub(crate) fn compress_circuit(
+    b: &mut Builder,
+    h_in: &[Vec<usize>],
+    block: &[Vec<usize>],
+) -> Vec<Vec<usize>> {
     // Message schedule W[0..64].
     let mut w: Vec<Vec<usize>> = block.to_vec();
     for t in 16..64 {

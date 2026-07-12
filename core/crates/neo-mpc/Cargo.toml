@@ -16,7 +16,10 @@ getrandom.workspace = true
 crypto-bigint.workspace = true
 
 [dev-dependencies]
-# Test-only: p256 is the independent ECtF oracle; num-bigint is an independent
-# reconstruction reference (a second, different bignum library) in the tests.
+# Test-only oracles: p256 (independent ECtF), num-bigint (a second bignum library
+# for the field reconstruction), hmac/hkdf/sha2 (vetted refs for the 2PC key schedule).
 p256.workspace = true
 num-bigint.workspace = true
+hmac.workspace = true
+hkdf.workspace = true
+sha2.workspace = true

@@ -37,12 +37,12 @@
 //! key schedule running inside the garbled circuit. Two of the sub-protocols that a
 //! production deployment needs are now built and tested (still semi-honest / awaiting
 //! audit), and what remains is well-scoped, not a redesign:
-//! - **EC share conversion** — *built*: [`ectf`] is DECO's ECtF, converting the
-//!   additive *point* share from [`session::shared_ecdhe`] into an additive
-//!   x-coordinate share under 2PC (Gilboa MtA over `F_p` on the real OT, masked
-//!   inversion). Its test validates against **P-256 point addition from the vetted
-//!   `p256` crate**. What remains is A2B ([`convert`]) on the real curve prime and
-//!   feeding the key-schedule circuit; and a constant-time field for production.
+//! - **EC point → pre-master, end to end** — *built*: [`ectf`] (DECO's ECtF, Gilboa
+//!   MtA over a **constant-time** `F_p`, masked inversion) → [`convert::a2b_shared`]
+//!   (A2B on the **real 256-bit curve prime**) → the SHA-256 key-schedule circuit,
+//!   chained by [`convert::premaster_hash_from_point_shares`]: EC point shares →
+//!   `SHA-256(x-coordinate)` under 2PC, x never assembled — validated against the
+//!   vetted `p256` and NIST-KAT SHA-256.
 //! - **Malicious-security machinery** — *built*: [`wrk17`] is the WRK17
 //!   authenticated-share core — TinyOT-style IT-MAC shares, OT-generated `aAND`
 //!   triples, an authenticated circuit evaluation whose every open is **MAC-checked**
@@ -50,9 +50,12 @@
 //!   tested as such; it is **not** end-to-end malicious-secure — that needs a
 //!   maliciously-secure (KOS) OT under it and the formal WRK17 proof (see the module).
 //!   Until then the live session path still uses [`dualex`]'s ≤ 1-bit leak.
-//! - **Live wiring**: a real TLS socket on the server's actual curve
-//!   (X25519/P-256 x-only) rather than Ristretto, and HKDF/AEAD framing (AAD,
-//!   length blocks) iterated through the same circuits.
+//! - **Key schedule** — *built*: [`hkdf::hkdf_expand_label_shared`] runs TLS 1.3's
+//!   `HKDF-Expand-Label` (HMAC-SHA256, shared secret + public label) under 2PC,
+//!   matched byte-for-byte against the vetted `hmac`/`hkdf` crates.
+//! - **Live wiring** — *remaining*: driving all this from a real TLS 1.3 handshake
+//!   state machine + record layer against an actual server (both parties jointly
+//!   playing the client). Systems integration, not a new primitive.
 //! - The **external audit** gate, as everywhere in neo.
 
 pub mod auth;
@@ -61,6 +64,7 @@ pub mod convert;
 pub mod dualex;
 pub mod ectf;
 pub mod garble;
+pub mod hkdf;
 pub mod kos;
 pub mod mta;
 pub mod ot;
@@ -72,6 +76,7 @@ pub mod wrk17;
 pub use convert::{a2b_shared, premaster_hash_from_point_shares};
 pub use ectf::ectf;
 pub use garble::{decode, evaluate, GarbledCircuit, Garbler};
+pub use hkdf::{hkdf_expand_label_shared, hmac_sha256_shared};
 pub use wrk17::{
     bucketed_triples, combine, eval_authenticated, rand_shares, rand_triples, verify_triple, Keys,
     Share, Triple,

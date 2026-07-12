@@ -2697,9 +2697,12 @@ dependencies = [
  "crypto-bigint",
  "curve25519-dalek",
  "getrandom 0.2.17",
+ "hkdf",
+ "hmac",
  "neo-core",
  "num-bigint",
  "p256",
+ "sha2",
 ]
 
 [[package]]
