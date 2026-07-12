@@ -39,8 +39,8 @@ Properties asserted by tests today across `neo-crypto`, `neo-slicing`, `neo-node
   output order from input order.
 - **Fuzz-lite / no-panic-on-garbage** parsers, plus `fuzz/` cargo-fuzz targets for the wire formats.
 
-The full adversarial internal review — including two PoC-confirmed CRITICAL Sphinx breaks (now fixed)
-and every HIGH/MEDIUM finding with its fix — is in [`SECURITY_ANALYSIS.md`](SECURITY_ANALYSIS.md).
+The full adversarial internal review — every finding across all rounds (including two PoC-confirmed
+CRITICAL Sphinx breaks, now fixed) with its fix — is in [`SECURITY_REVIEW.md`](SECURITY_REVIEW.md).
 
 Still ahead: REALITY **full-session** indistinguishability (the auth path completes only the ClientHello
 — M27); live MPC-TLS integration against a real server (M45; the crypto stack is built + verified, M24);

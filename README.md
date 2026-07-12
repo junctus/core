@@ -45,8 +45,12 @@ deploy/discovery/ one-command discovery-seed deployment (systemd + Caddy)
 docs/             see the index below
 ```
 
-The native **macOS VPN app** (the furthest-along client — connects and browses today) lives in the
-sibling repo [`../neo-mac`](../neo-mac): a UniFFI-bound core inside a NetworkExtension packet tunnel.
+The shipping GUI/app clients live in sibling repos, on the same shared Rust core (`neo-netstack` +
+`neo-node`):
+- [`../neo-mac`](../neo-mac) — a **React Native** app shipping **macOS + Android (APK)** today (iOS from
+  the same tree); the furthest-along client — connects and browses.
+- [`../neo-linux`](../neo-linux) — a Rust **terminal app + systemd service** (ships a `.deb`) that routes
+  a whole machine's traffic, one onion circuit per flow.
 
 ## Docs
 
@@ -59,8 +63,7 @@ sibling repo [`../neo-mac`](../neo-mac): a UniFFI-bound core inside a NetworkExt
 | [`DISCOVERY.md`](docs/DISCOVERY.md) | zero-config discovery, witnessed snapshots, Sybil/eclipse |
 | [`MONETIZATION.md`](docs/MONETIZATION.md) | economic sustainability without breaking unlinkability |
 | [`THREAT_MODEL.md`](docs/THREAT_MODEL.md) | adversaries, answers, honest limits |
-| [`SECURITY_ANALYSIS.md`](docs/SECURITY_ANALYSIS.md) | the standing internal review + fix ledger |
-| [`SECURITY_REVIEW_3.md`](docs/SECURITY_REVIEW_3.md), [`SECURITY_REVIEW_4.md`](docs/SECURITY_REVIEW_4.md) | point-in-time review rounds (findings, verdicts, fixes) |
+| [`SECURITY_REVIEW.md`](docs/SECURITY_REVIEW.md) | the living internal security review — cumulative findings across all rounds + their fixes |
 
 ## Build
 

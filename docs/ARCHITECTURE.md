@@ -6,8 +6,10 @@ shape of the system.
 ## What neo is
 
 An information-sliced, onion-layered, timing-mixed, discovery-bootstrapped, post-quantum overlay VPN
-with a verifiable-not-trusted privacy layer: a cryptographic committee exit, anonymous bandwidth
-credits, VRF-unbiasable paths, PIR discovery, and a ZK proof-of-mixing — on desktop, with a mobile FFI.
+with a verifiable-not-trusted privacy layer: a cryptographic committee exit (up to a complete,
+adversarially-verified malicious-secure two-party MPC-TLS crypto stack), anonymous bandwidth credits,
+VRF-unbiasable paths, PIR discovery, and a ZK verifiable shuffle — live on a desktop/macOS client, with
+a mobile FFI.
 
 ## Two layers (kept separate)
 
@@ -38,7 +40,11 @@ client
 ```
 
 No relay ever holds a complete, readable flow (slicing over node-disjoint paths); no hop learns more
-than its next hop (Sphinx); no minority of an exit committee can read the request (threshold VSS).
+than its next hop (Sphinx); no minority of an exit committee can read the request (threshold VSS), and
+the committee *decrypt* path assembles the key/plaintext at no single party (M28). The full two-party
+**MPC-TLS** send path (a TLS session whose key is never assembled at one party) exists as a complete,
+adversarially-verified **crypto stack** (M24) but is **not yet integrated into a live session** (M45) —
+so the committee-exit box above is the live threshold path, not yet the full 2PC-TLS one.
 
 ## Crates
 
@@ -49,22 +55,23 @@ than its next hop (Sphinx); no minority of an exit committee can read the reques
 | `neo-slicing` | encrypt-then-slice k-of-n with per-share authentication | M3 |
 | `neo-mix` | Poisson timing mixing + cover traffic | M5 |
 | `neo-routing` | node-disjoint multipath, VRF-seeded paths, rotating exit policy | M2 · M7 · M11 |
-| `neo-transport` | pluggable length-obfuscated / QUIC transport | M6 |
+| `neo-transport` | length-obfuscated / QUIC transport + REALITY authenticate/decoy split, in-ClientHello codec, decoy reverse-proxy | M6 · M23 · M27 |
 | `neo-discovery` | signed records, witnessed snapshots, libp2p DHT, NAT traversal, PIR, DoH bootstrap | M4 · M4.5 · M16 · M13 · M18 |
-| `neo-seed` | witnessed discovery seed (verify + dial-back + snapshot HTTP service) | M4.5 |
-| `neo-credits` | anonymous bandwidth credits (VOPRF) + proof-of-relay earning | M10 |
-| `neo-mpc` | committee exit: threshold request sharing + verifiable (Feldman VSS) key custody | M12 · M20 |
+| `neo-seed` | witnessed discovery seed (verify + dial-back + snapshot HTTP service) | M4.5 · M36 |
+| `neo-credits` | anonymous bandwidth credits (VOPRF) + proof-of-relay earning | M10 · M17 |
+| `neo-mpc` | committee exit + threshold-decrypt custody, **and the malicious-secure two-party MPC-TLS crypto stack** (KOS OT, authenticated garbling, SPDZ, ECtF→pre-master, HKDF under 2PC) | M12 · M20 · M22 · M24 |
 | `neo-verify` | VRF, unbiasable selection, 2-server PIR, oblivious lookup, ZK verifiable shuffle | M11 · M13 · M19 |
 | `neo-dataplane` | TUN I/O + packet mux | M1 |
-| `neo-node` | the engine: wires it together, runs roles, onion forwarding + streaming | M1 · M4.6 · M15 |
-| `neo-ffi` | UniFFI bindings for mobile shells | M8 |
+| `neo-netstack` | userspace TCP/IP stack (smoltcp) — the TUN → TCP-flow gateway (tun2socks) the VPN clients ride on | M21 |
+| `neo-node` | the engine: wires it together, runs roles, onion forwarding, persistent circuit tunnels + stream mux | M1 · M4.6 · M15 · M21 |
+| `neo-ffi` | UniFFI bindings for mobile / desktop-app shells (e.g. `../neo-mac`) | M8 |
 
 ## Deep dives
 
 - [`DISCOVERY.md`](DISCOVERY.md) — zero-config discovery, witnessed snapshots, Sybil/eclipse/enumeration.
 - [`PROTOCOL.md`](PROTOCOL.md) — the per-flow wire pipeline and exit models.
 - [`CRYPTO.md`](CRYPTO.md) — primitives and the higher-level constructions built on them.
-- [`SECURITY_ANALYSIS.md`](SECURITY_ANALYSIS.md) — the adversarial internal review and its fixes.
+- [`SECURITY_REVIEW.md`](SECURITY_REVIEW.md) — the living internal security review (cumulative findings + fixes).
 - [`THREAT_MODEL.md`](THREAT_MODEL.md) — adversaries, answers, and honest limits.
 
 ## Honest constraints
