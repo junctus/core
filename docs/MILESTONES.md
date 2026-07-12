@@ -395,13 +395,17 @@ plaintext are **never assembled at a single party** — built and verified botto
     to leak `t` bits of `s` is caught except w.p. `2⁻ᵗ`. Tested: honest delivery, `GF(2¹²⁸)` is a field, and
     inconsistent-receiver attacks abort. **ECtF's MtA and WRK17's aBit/triple OTs now run over `kos`**, closing
     the OT layer's selective-failure channel (the aBit consistency check).
-- Still deferred before end-to-end malicious security: WRK17's **malicious triple generation** (leaky-AND +
-  bucketing — the sacrifice check + combine are built, not the full generator), an **MtA consistency check**
-  for ECtF, WRK17's **constant-round garbled online** + formal proof, a constant-time `F_p`, **live wiring** to
-  a real TLS socket on the server's actual curve, and the **external audit**. That *security* **cannot be
-  established by correctness tests**; the live session path stays semi-honest with dual-execution's ≤1-bit leak
-  until it lands.
-- Tests (44): OT delivers only the chosen message; IKNP extends past `k`; **KOS delivers honestly, its
+  - ✅ **WRK17 bucketing / leakage removal** (`wrk17::combine` + `bucketed_triples`) — the real WRK17 combine
+    (open `y1⊕y2`, fold to `(⟨x1⊕x2⟩,⟨y1⟩,⟨z1⊕z2⊕d·x2⟩)`) over random (Fisher–Yates) buckets. `combine`
+    verified **exhaustively** over all 16 input pairs; `bucketed_triples` yields correct AND triples for bucket
+    sizes 1..3. Bucketing removes *leakage*, not incorrectness — the correctness gate is `verify_triple`.
+- Still deferred before end-to-end malicious security: the exact WRK17 **leaky-AND hash** primitive (bounds the
+  selective failure to one bit — *security* not test-establishable, so not shipped as verified), an **MtA
+  consistency check** for ECtF, WRK17's **constant-round garbled online** + formal proof, a constant-time `F_p`,
+  **live wiring** to a real TLS socket on the server's actual curve, and the **external audit**. That *security*
+  **cannot be established by correctness tests**; the live session path stays semi-honest with dual-execution's
+  ≤1-bit leak until it lands.
+- Tests (45): OT delivers only the chosen message; IKNP extends past `k`; **KOS delivers honestly, its
   `GF(2¹²⁸)` is a field, and inconsistent-receiver attacks abort the correlation check**; every gate garbles over all inputs;
   garbled adder matches native add with OT-split inputs; ChaCha/SHA-256/Poly1305 references match their KATs
   and the circuits match; ECDHE is additively shared and matches the server; keystream / key-schedule / MAC
@@ -410,7 +414,8 @@ plaintext are **never assembled at a single party** — built and verified botto
   additive shares of the product**; **ECtF's x-coordinate share reconstructs P-256's real point addition**;
   IT-MAC bits verify, reject a flip, resist forgery, and stay authenticated under XOR; **WRK17 shares open
   correctly, a tampered share aborts, OT triples satisfy `c=a∧b`, the sacrifice check catches a corrupted
-  triple, and a 4-bit adder evaluates correctly under authenticated shares (and aborts on a tampered wire)**;
+  triple, the WRK17 combine is correct over all 16 input pairs, bucketing yields correct triples, and a 4-bit
+  adder evaluates correctly under authenticated shares (and aborts on a tampered wire)**;
   dual-execution catches a cheating garbler.
 
 ---
@@ -692,10 +697,11 @@ and plaintext are provably never assembled at one party.
   the **EC point→field conversion** (`ectf`, validated against `p256`) that turns the shared ECDHE point
   into the x-coordinate share feeding the SHA-256 key-schedule circuit, and the **WRK17 authenticated-share
   core** (`wrk17`, MAC-checked, malicious-*detecting*), both now running their OT over **KOS maliciously-secure
-  OT** (`kos`, aborts on a cheating receiver). What M33 still needs on top: WRK17's **malicious triple
-  generation** (leaky-AND + bucketing) and **constant-round garbled online** + formal proof (for real malicious
-  security, not just detection), an **MtA consistency check** for ECtF, and **live HKDF/AEAD wiring** to a real
-  TLS socket on the server's actual curve. Then
+  OT** (`kos`, aborts on a cheating receiver) with WRK17's **bucketing / leakage removal** (`combine` +
+  `bucketed_triples`) built. What M33 still needs on top: the exact WRK17 **leaky-AND hash** primitive and the
+  **constant-round garbled online** + formal proof (for real malicious security, not just detection), an **MtA
+  consistency check** for ECtF, and **live HKDF/AEAD wiring** to a real TLS socket on the server's actual curve.
+  Then
   a selective-opening circuit proves one fact ("balance > X", "account age > 2y") while the session bytes are
   never assembled anywhere. Also delivers the real distrusted-exit browsing mode and the plaintext-free
   forward leg M28 needs.

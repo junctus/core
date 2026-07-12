@@ -36,7 +36,9 @@
 //! - [`verify_triple`] is the **sacrifice check**: a triple is validated by
 //!   Beaver-multiplying `a·b` with a second (sacrificed) triple and MAC-checked-opening
 //!   the difference to 0 — a maliciously corrupted `c` is caught.
-//! - [`combine_shared_y`] is WRK17's **bucket combine** of two triples sharing `⟨b⟩`.
+//! - [`combine`] + [`bucketed_triples`] are WRK17's **leakage removal**: `combine`
+//!   folds two triples (revealing `y1⊕y2`) into one that is non-leaky if either was;
+//!   `bucketed_triples` random-buckets `n·B` raw triples and folds each bucket.
 //!
 //! # Online — authenticated circuit evaluation
 //!
@@ -54,9 +56,11 @@
 //! 1. **The OT layer is now KOS** ([`kos`]) — maliciously-secure, so the aBit and
 //!    triple-cross-term OTs abort on a cheating receiver (the aBit consistency check).
 //!    What still stands between this and *end-to-end* malicious security: WRK17's
-//!    malicious **triple generation** (leaky-AND + bucketing — [`verify_triple`] and
-//!    [`combine_shared_y`] are the pieces, not yet the full generator) and KOS's own
-//!    honest-base-OT assumption.
+//!    malicious **triple generation** — [`bucketed_triples`] (leakage removal via
+//!    [`combine`]) and [`verify_triple`] (the sacrifice correctness check) are built;
+//!    the exact leaky-AND *hash* primitive that bounds the selective failure to one
+//!    bit is not reimplemented bit-for-bit (its security is not test-establishable) —
+//!    and KOS's own honest-base-OT assumption.
 //! 2. **Round complexity**: WRK17's headline is a *constant-round garbled* online.
 //!    Realized here is the equivalent **interactive** authenticated-share online (same
 //!    `F_pre`, same MAC-check security machinery, one round per AND-depth layer). The
@@ -357,12 +361,60 @@ pub fn verify_triple(t: &Triple, aux: &Triple, keys: &Keys) -> Result<()> {
     Ok(())
 }
 
-/// WRK17 **bucket combine** of two triples that share `⟨b⟩`: returns
-/// `(⟨a1⊕a2⟩, ⟨b⟩, ⟨c1⊕c2⟩)`, itself a correct triple since `(a1⊕a2)·b = c1⊕c2`. In
-/// full WRK17 this is the leakage-removal step (combine a bucket of leaky triples);
-/// its *security* role is not something a correctness test can show.
-pub fn combine_shared_y(t1: &Triple, t2: &Triple) -> Triple {
-    Triple(t1.0.xor(&t2.0), t1.1, t1.2.xor(&t2.2))
+/// WRK17 bucket **combine** of two AND triples into one — the leakage-removal step.
+/// Given `t1 = (⟨x1⟩,⟨y1⟩,⟨z1⟩)` and `t2 = (⟨x2⟩,⟨y2⟩,⟨z2⟩)`, open `d = y1 ⊕ y2`
+/// (MAC-checked) and output `(⟨x1⊕x2⟩, ⟨y1⟩, ⟨z1 ⊕ z2 ⊕ d·x2⟩)`. This is a correct
+/// triple — `(x1⊕x2)·y1 = z1 ⊕ z2 ⊕ d·x2` when both inputs are correct — and it is
+/// **non-leaky if *either* input was**, which is exactly what bucketing exploits.
+/// Revealing `d = y1⊕y2` leaks nothing: the triples' `y`s are uniformly random.
+pub fn combine(t1: &Triple, t2: &Triple, keys: &Keys) -> Result<Triple> {
+    let d = t1.1.xor(&t2.1).open(keys)?; // d = y1 ⊕ y2  (MAC-checked open)
+    let x = t1.0.xor(&t2.0); // x1 ⊕ x2
+    let y = t1.1; // y1
+    let mut z = t1.2.xor(&t2.2); // z1 ⊕ z2
+    if d {
+        z = z.xor(&t2.0); // ⊕ d·x2  (x2 = t2.0)
+    }
+    Ok(Triple(x, y, z))
+}
+
+/// Generate `n` AND triples via WRK17 **bucketing** — the leakage-removal that turns
+/// (possibly-leaky) raw triples into secure ones. Produce `n · bucket` raw triples,
+/// randomly assign them to `n` buckets of size `bucket`, and fold each bucket with
+/// [`combine`]. A combined triple is secure iff **≥ 1** of its `bucket` raw triples is
+/// non-leaky; random assignment makes an all-leaky bucket occur only with the
+/// statistical probability WRK17's analysis bounds via the choice of `bucket`.
+///
+/// **Correctness vs. security.** Bucketing removes *leakage*, not *incorrectness*: if a
+/// malicious party biased a raw triple's `c`, the combined triple is wrong too. Malicious
+/// *correctness* is the job of the leaky-AND / [`verify_triple`] sacrifice check on the
+/// raw triples; this composes with it (correct raw triples in ⇒ correct, de-leaked out).
+pub fn bucketed_triples(n: usize, bucket: usize, keys: &Keys) -> Result<Vec<Triple>> {
+    assert!(bucket >= 1, "bucket size must be ≥ 1");
+    let mut raw = rand_triples(n * bucket, keys)?;
+    shuffle(&mut raw)?;
+    let mut out = Vec::with_capacity(n);
+    for chunk in raw.chunks(bucket) {
+        let mut acc = chunk[0];
+        for t in &chunk[1..] {
+            acc = combine(&acc, t, keys)?;
+        }
+        out.push(acc);
+    }
+    Ok(out)
+}
+
+/// In-place Fisher–Yates shuffle — the random bucket assignment bucketing relies on.
+/// (The `mod` draws a negligibly-biased index for `n ≪ 2⁶⁴`, immaterial to the
+/// statistical bucketing bound.)
+fn shuffle<T>(items: &mut [T]) -> Result<()> {
+    for i in (1..items.len()).rev() {
+        let mut buf = [0u8; 8];
+        getrandom::getrandom(&mut buf).map_err(|e| Error::Rng(e.to_string()))?;
+        let j = (u64::from_le_bytes(buf) % (i as u64 + 1)) as usize;
+        items.swap(i, j);
+    }
+    Ok(())
 }
 
 /// Evaluate `circuit` under authenticated shares: `inputs[i]` is `⟨wireᵢ⟩`, `triples`
@@ -502,23 +554,60 @@ mod tests {
         );
     }
 
+    // Deal an honest, known triple (x, y, x∧y) for combine tests.
+    fn deal_triple(x: bool, y: bool, keys: &Keys) -> Triple {
+        Triple(
+            Share::deal(x, keys).unwrap(),
+            Share::deal(y, keys).unwrap(),
+            Share::deal(x & y, keys).unwrap(),
+        )
+    }
+
     #[test]
-    fn bucket_combine_yields_a_correct_triple() {
+    fn combine_yields_a_correct_triple_for_all_input_pairs() {
+        // The WRK17 combine of any two correct triples is a correct triple.
         let keys = Keys::random().unwrap();
-        // Two triples sharing the same ⟨b⟩, dealt honestly.
-        let shared_b = Share::deal(true, &keys).unwrap();
-        let mk = |av: bool| -> Triple {
-            let a = Share::deal(av, &keys).unwrap();
-            let c = Share::deal(av & shared_b.value(), &keys).unwrap();
-            Triple(a, shared_b, c)
-        };
-        let t1 = mk(true);
-        let t2 = mk(false);
-        let combined = combine_shared_y(&t1, &t2);
-        let a = combined.0.open(&keys).unwrap();
-        let b = combined.1.open(&keys).unwrap();
-        let c = combined.2.open(&keys).unwrap();
-        assert_eq!(c, a & b, "combined triple stays a correct AND");
+        for x1 in [false, true] {
+            for y1 in [false, true] {
+                for x2 in [false, true] {
+                    for y2 in [false, true] {
+                        let t1 = deal_triple(x1, y1, &keys);
+                        let t2 = deal_triple(x2, y2, &keys);
+                        let c = combine(&t1, &t2, &keys).unwrap();
+                        let (a, b, z) = (
+                            c.0.open(&keys).unwrap(),
+                            c.1.open(&keys).unwrap(),
+                            c.2.open(&keys).unwrap(),
+                        );
+                        assert_eq!(a, x1 ^ x2, "combined x = x1⊕x2");
+                        assert_eq!(b, y1, "combined y = y1");
+                        assert_eq!(z, a & b, "combined triple is a correct AND");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bucketing_produces_correct_triples() {
+        // Full bucketed generation over the real (KOS-backed) triple source: every
+        // output triple is a correct AND. (Bucketing removes leakage; correctness is
+        // what a test can establish — see the module boundary.)
+        let keys = Keys::random().unwrap();
+        for bucket in [1usize, 2, 3] {
+            let triples = bucketed_triples(4, bucket, &keys).unwrap();
+            assert_eq!(triples.len(), 4);
+            for t in &triples {
+                let a = t.0.open(&keys).unwrap();
+                let b = t.1.open(&keys).unwrap();
+                let c = t.2.open(&keys).unwrap();
+                assert_eq!(
+                    c,
+                    a & b,
+                    "bucketed triple (bucket={bucket}) is a correct AND"
+                );
+            }
+        }
     }
 
     #[test]

@@ -72,7 +72,8 @@ pub mod wrk17;
 pub use ectf::ectf;
 pub use garble::{decode, evaluate, GarbledCircuit, Garbler};
 pub use wrk17::{
-    eval_authenticated, rand_shares, rand_triples, verify_triple, Keys, Share, Triple,
+    bucketed_triples, combine, eval_authenticated, rand_shares, rand_triples, verify_triple, Keys,
+    Share, Triple,
 };
 
 mod session;
