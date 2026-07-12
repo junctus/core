@@ -473,29 +473,6 @@ Each is buildable on existing crates — no capability here is a from-scratch re
 boundary says so. They are sequenced so the enabling wiring (M26) lands before the features that ride it,
 and every REALITY/MPC milestone depends on the M25 hardening fixes.
 
-### M26 — One-tap local proxy over live circuits ⬜ (the "on" switch)
-Why it matters: today no ordinary app can use neo without writing Rust — this is the single translation
-layer between neo-the-engine and neo-the-product.
-- Plan: build a `NeoSocket` that implements `tokio`'s `AsyncRead`/`AsyncWrite` over
-  `CircuitSink::send` / `CircuitStream::recv` (`neo-node/circuit.rs:110-151`), buffering across the
-  variable-length cell boundary (the existing round-trip test at `circuit.rs` already handles
-  `cell != send` manually — that logic becomes `poll_read`). Wrap it in a localhost **SOCKS5** listener
-  that parses the destination and calls `open_circuit` (`circuit.rs:156`) against a snapshot-discovered
-  path (`neo-discovery` + `neo-routing::select_path`), bound by `neo run --proxy 127.0.0.1:1080`.
-  **Requires first wiring `serve_circuit` into the relay loop** — the desktop relay currently runs the
-  one-shot `handle_onion_shared` (`roles.rs:124`), not the persistent circuit path, so relays must run
-  `serve_circuit` for `open_circuit` to have a peer. Add connection pooling / circuit reuse so per-stream
-  Sphinx+PQ setup latency is amortized.
-- Why a game-changer: a localhost SOCKS proxy + an `AsyncRead`/`AsyncWrite` type makes every browser, the
-  OS proxy toggle, and every Rust HTTP/gRPC/WebSocket library (`hyper`, `tonic`, `rustls`,
-  `tokio-tungstenite`) run **unmodified** over a 3-hop onion — with no TUN, no root, no app-store friction.
-  It is the smallest change with the largest "now it's a product" delta and the correct core for the
-  mobile SDK.
-- Boundary/risk: needs the M25 circuit-cell seq enforcement (replay/reorder) and the exit-policy SSRF fix
-  landed first, since this wires `serve_circuit` into a running node. No return-path congestion control
-  yet, so large downloads may stall; Poisson-mixing latency can trip TLS handshake timeouts unless the
-  `PrivacyLevel` dial is surfaced honestly.
-
 ### M27 — Genuine in-ClientHello REALITY with a live decoy reverse-proxy ⬜ (flagship)
 Why it matters: this converts neo's tested REALITY auth core from "probe-resistant in theory" into the
 actual REALITY threat model — a bridge that *is* a real website to any prober.

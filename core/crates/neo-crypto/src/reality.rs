@@ -221,7 +221,47 @@ impl RealityKey {
         hello.extend_from_slice(&pad);
         Ok((hello, seed))
     }
+
+    /// Author just the fixed **64-byte authenticator prefix** for `epoch`:
+    /// `ephemeral_pubkey ‖ tag`, plus the `session_seed` the server derives on
+    /// acceptance. Unlike [`client_hello`](Self::client_hello) there is no random
+    /// pad — the caller embeds these 64 bytes inside a real TLS ClientHello (M27),
+    /// where the surrounding handshake, not a pad, provides realistic size. The
+    /// ephemeral is a genuine X25519 public key (→ the TLS `key_share`) and the tag
+    /// is uniform (→ the 32-byte `legacy_session_id`); [`classify`](RealitySecret::classify)
+    /// reads exactly this `eph ‖ tag` layout.
+    pub fn client_hello_prefix(&self, epoch: u64) -> Result<([u8; HELLO_PREFIX], [u8; 32])> {
+        let mut esk = Zeroizing::new([0u8; 32]);
+        getrandom::getrandom(esk.as_mut_slice()).map_err(|e| Error::Rng(e.to_string()))?;
+        let ephemeral = StaticSecret::from(*esk);
+        let eph_pub = PublicKey::from(&ephemeral).to_bytes();
+        let shared_secret = ephemeral.diffie_hellman(&PublicKey::from(self.0));
+        if !shared_secret.was_contributory() {
+            return Err(Error::Crypto("REALITY capability key is low-order".into()));
+        }
+        let shared = shared_secret.to_bytes();
+        let tag = auth_tag(&shared, epoch, &eph_pub);
+        let seed = session_seed(&shared, &eph_pub);
+
+        let mut prefix = [0u8; HELLO_PREFIX];
+        prefix[..EPH_LEN].copy_from_slice(&eph_pub);
+        prefix[EPH_LEN..].copy_from_slice(&tag);
+        Ok((prefix, seed))
+    }
+
+    /// The ephemeral public key and tag positions within the 64-byte prefix, for a
+    /// caller placing them into distinct TLS fields: `(eph_pub, tag)`.
+    pub fn split_prefix(prefix: &[u8; HELLO_PREFIX]) -> ([u8; EPH_LEN], [u8; TAG_LEN]) {
+        let mut eph = [0u8; EPH_LEN];
+        let mut tag = [0u8; TAG_LEN];
+        eph.copy_from_slice(&prefix[..EPH_LEN]);
+        tag.copy_from_slice(&prefix[EPH_LEN..]);
+        (eph, tag)
+    }
 }
+
+/// The fixed authenticator-prefix length: `ephemeral_pubkey(32) ‖ tag(32)`.
+pub const REALITY_PREFIX_LEN: usize = HELLO_PREFIX;
 
 /// The authenticator: a PRF over the DH secret, epoch, and ephemeral key. Uniform
 /// to anyone without the DH secret; recomputable only with the server's key.

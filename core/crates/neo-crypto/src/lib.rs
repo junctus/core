@@ -20,7 +20,7 @@ pub use handshake::{
     initiator_finish, initiator_message1, responder_confirm, responder_cookie, responder_process,
     CookieKey, HandshakeResult, Initiator, PendingResponder,
 };
-pub use reality::{RealityKey, RealitySecret, Verdict};
+pub use reality::{RealityKey, RealitySecret, Verdict, REALITY_PREFIX_LEN};
 pub use session::{Opener, Sealer, Session};
 pub use sphinx::{
     create_packet, create_packet_keyed, process, Processed, ReplayCache, SphinxHop, SphinxPacket,

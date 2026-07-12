@@ -33,6 +33,7 @@
 
 #[cfg(feature = "quic")]
 pub mod quic;
+pub mod tls;
 
 use neo_core::{Error, Result};
 use neo_crypto::{RealityKey, RealitySecret, Verdict};
@@ -238,21 +239,25 @@ impl<O: Obfuscation> Transport<O> {
         })
     }
 
-    /// Dial a peer and open with a **REALITY authenticated first flight**: prove
-    /// possession of the pre-shared `key` for `epoch`, then return the connection
-    /// and the shared `session_seed` the server independently derived. The
-    /// authenticator *bytes* are indistinguishable from random to a censor, but the
-    /// flight is sent behind a cleartext length prefix (not yet inside a real TLS
-    /// ClientHello), so full wire indistinguishability is the M27 integration step.
+    /// Dial a peer and open with a **REALITY authenticated first flight** carried
+    /// inside a genuine **TLS 1.3 ClientHello** (M27): prove possession of the
+    /// pre-shared `key` for `epoch`, presenting `server_name` as the SNI (the decoy
+    /// host). Returns the connection and the shared `session_seed` the server
+    /// independently derived on acceptance. The first packet is byte-for-byte an
+    /// ordinary ClientHello — the 64-byte authenticator hides in the `key_share`
+    /// and `session_id`, both of which are uniform-random in any real handshake.
     pub async fn dial_reality(
         &self,
         addr: &str,
         key: &RealityKey,
         epoch: u64,
+        server_name: &str,
     ) -> Result<(Conn<O>, [u8; 32])> {
         let mut stream = TcpStream::connect(addr).await?;
-        let (hello, seed) = key.client_hello(epoch)?;
-        write_blob(&mut stream, &hello).await?;
+        let (prefix, seed) = key.client_hello_prefix(epoch)?;
+        let hello = tls::build_client_hello(&prefix, server_name);
+        stream.write_all(&hello).await?;
+        stream.flush().await?;
         Ok((
             Conn {
                 stream,
@@ -299,16 +304,24 @@ impl<O: Obfuscation> Listener<O> {
         epoch: u64,
     ) -> Result<RealityAccept<O>> {
         let (mut stream, _addr) = self.listener.accept().await?;
-        let hello = read_blob(&mut stream).await?;
+        // Read the client's first TLS record (its ClientHello) whole, keeping the
+        // raw bytes so the decoy path can replay them verbatim to the upstream.
+        let first_flight = read_tls_record(&mut stream).await?;
+        // Extract the REALITY carrier fields, then classify. Anything that isn't a
+        // well-formed ClientHello carrying our layout is a silent Decoy — never an
+        // error, never a distinguishable reaction.
+        let verdict = tls::parse_client_hello(&first_flight)
+            .map(|prefix| secret.classify(&prefix, epoch))
+            .unwrap_or(Verdict::Decoy);
         let conn = Conn {
             stream,
             obfuscation: self.obfuscation.clone(),
         };
-        match secret.classify(&hello, epoch) {
+        match verdict {
             Verdict::Authenticated { session_seed } => {
                 Ok(RealityAccept::Authenticated { conn, session_seed })
             }
-            Verdict::Decoy => Ok(RealityAccept::Decoy { conn }),
+            Verdict::Decoy => Ok(RealityAccept::Decoy { conn, first_flight }),
         }
     }
 
@@ -331,28 +344,34 @@ pub enum RealityAccept<O: Obfuscation> {
     Decoy {
         /// The accepted connection, to run the fallback on.
         conn: Conn<O>,
+        /// The raw first-flight (ClientHello) bytes already read, to be replayed
+        /// verbatim to the decoy upstream so it sees an unbroken TLS handshake.
+        first_flight: Vec<u8>,
     },
 }
 
-/// Write a length-prefixed blob (the raw first flight, before any obfuscation).
-async fn write_blob(stream: &mut TcpStream, blob: &[u8]) -> Result<()> {
-    stream.write_all(&(blob.len() as u32).to_be_bytes()).await?;
-    stream.write_all(blob).await?;
-    stream.flush().await?;
-    Ok(())
-}
-
-/// Read a length-prefixed blob written by [`write_blob`].
-async fn read_blob(stream: &mut TcpStream) -> Result<Vec<u8>> {
-    let mut len = [0u8; 4];
-    stream.read_exact(&mut len).await?;
-    let n = u32::from_be_bytes(len) as usize;
-    if n > MAX_RECORD {
-        return Err(Error::Decode("first flight exceeds maximum size".into()));
-    }
-    let mut blob = vec![0u8; n];
-    stream.read_exact(&mut blob).await?;
-    Ok(blob)
+/// Read the client's first **TLS record** whole (the ClientHello), returning its
+/// raw bytes (5-byte record header included) so the decoy path can replay them
+/// verbatim. Bounded by [`tls::MAX_CLIENT_HELLO`] and a read timeout so a slowloris
+/// or an oversized length field can't hang or exhaust the accept task.
+async fn read_tls_record(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    let read = async {
+        let mut header = [0u8; 5];
+        stream.read_exact(&mut header).await?;
+        let len = u16::from_be_bytes([header[3], header[4]]) as usize;
+        if len == 0 || len > tls::MAX_CLIENT_HELLO {
+            return Err(Error::Decode("TLS record length out of range".into()));
+        }
+        let mut body = vec![0u8; len];
+        stream.read_exact(&mut body).await?;
+        let mut record = Vec::with_capacity(5 + len);
+        record.extend_from_slice(&header);
+        record.extend_from_slice(&body);
+        Ok(record)
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), read)
+        .await
+        .map_err(|_| Error::Decode("first flight read timed out".into()))?
 }
 
 /// A message-oriented connection that obfuscates every record.
@@ -362,6 +381,35 @@ pub struct Conn<O: Obfuscation> {
 }
 
 impl<O: Obfuscation> Conn<O> {
+    /// Reverse-proxy this (un-authenticated) connection to a decoy `upstream`
+    /// (M27), replaying the `first_flight` ClientHello already read so the upstream
+    /// sees an unbroken TLS handshake, then splicing raw bytes both ways until
+    /// either side closes. A prober therefore completes a real TLS session — real
+    /// cert, real page — with an operator-pinned site and learns nothing.
+    ///
+    /// `upstream` is operator-configured (not attacker-supplied), but is still run
+    /// through the SSRF guard; `allow_loopback` opens localhost for dev/test decoys.
+    /// Consumes `self`: the connection is spent on the proxy.
+    pub async fn reverse_proxy_decoy(
+        self,
+        first_flight: &[u8],
+        upstream: &str,
+        allow_loopback: bool,
+    ) -> Result<()> {
+        if !neo_core::net::is_safe_dial_target(upstream, allow_loopback) {
+            return Err(Error::Config(format!(
+                "decoy upstream is not a safe target: {upstream}"
+            )));
+        }
+        let mut up = TcpStream::connect(upstream).await?;
+        up.write_all(first_flight).await?;
+        up.flush().await?;
+        let mut client = self.stream;
+        // A reset/close is the normal end of a proxied session, not an error.
+        let _ = tokio::io::copy_bidirectional(&mut client, &mut up).await;
+        Ok(())
+    }
+
     /// Send one payload as an obfuscated, length-prefixed record.
     pub async fn send(&mut self, payload: &[u8]) -> Result<()> {
         let record = self.obfuscation.frame(payload)?;
@@ -390,6 +438,9 @@ impl<O: Obfuscation> Conn<O> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TLS handshake record content type, for the decoy test's upstream assertion.
+    const CONTENT_HANDSHAKE_BYTE: u8 = 0x16;
 
     #[test]
     fn bucketed_quantizes_length_and_roundtrips() {
@@ -488,12 +539,18 @@ mod tests {
         });
 
         // Legitimate client authenticates and sends an obfuscated payload.
-        let (mut conn, seed) = transport.dial_reality(&addr, &key, EPOCH).await.unwrap();
+        let (mut conn, seed) = transport
+            .dial_reality(&addr, &key, EPOCH, "www.example.com")
+            .await
+            .unwrap();
         conn.send(b"authed payload").await.unwrap();
 
         // Prober without the capability: its flight must land on the decoy path.
         let wrong = RealitySecret::generate().unwrap().public();
-        let (_probe, _) = transport.dial_reality(&addr, &wrong, EPOCH).await.unwrap();
+        let (_probe, _) = transport
+            .dial_reality(&addr, &wrong, EPOCH, "www.example.com")
+            .await
+            .unwrap();
 
         let (auth_seed, prober_is_decoy) = server.await.unwrap();
         assert_eq!(
@@ -502,5 +559,67 @@ mod tests {
             "server and client share the session seed"
         );
         assert!(prober_is_decoy, "a prober must be silently decoyed");
+    }
+
+    #[tokio::test]
+    async fn a_prober_is_reverse_proxied_to_the_decoy_upstream() {
+        const EPOCH: u64 = 42;
+
+        // A stub "real website": it must see a genuine TLS handshake record (the
+        // replayed ClientHello) and answers with a page the prober will read.
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap().to_string();
+        let upstream_task = tokio::spawn(async move {
+            let (mut s, _) = upstream.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let n = s.read(&mut buf).await.unwrap();
+            let saw_handshake = n >= 5 && buf[0] == CONTENT_HANDSHAKE_BYTE;
+            s.write_all(b"HTTP/1.1 200 OK\r\n\r\nreal page")
+                .await
+                .unwrap();
+            s.flush().await.unwrap();
+            saw_handshake // upstream drops `s` here, ending the proxied session
+        });
+
+        let secret = RealitySecret::generate().unwrap();
+        let transport = Transport::new(Camouflage::new(Shape::QuicMasque));
+        let listener = transport.listen("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let up = upstream_addr.clone();
+        let server = tokio::spawn(async move {
+            match listener.accept_reality(&secret, EPOCH).await.unwrap() {
+                RealityAccept::Decoy { conn, first_flight } => {
+                    // allow_loopback = true: the stub upstream is on 127.0.0.1.
+                    conn.reverse_proxy_decoy(&first_flight, &up, true)
+                        .await
+                        .unwrap();
+                }
+                RealityAccept::Authenticated { .. } => panic!("a prober must not authenticate"),
+            }
+        });
+
+        // A prober sends a well-formed ClientHello but with the WRONG capability —
+        // it classifies as Decoy and is proxied. It reads raw bytes (a real prober
+        // is a TLS client, not a neo `Conn`), so it must get the upstream's page.
+        let wrong = RealitySecret::generate().unwrap().public();
+        let (prefix, _) = wrong.client_hello_prefix(EPOCH).unwrap();
+        let hello = tls::build_client_hello(&prefix, "www.example.com");
+        let mut probe = TcpStream::connect(&addr).await.unwrap();
+        probe.write_all(&hello).await.unwrap();
+        probe.flush().await.unwrap();
+        probe.shutdown().await.unwrap(); // half-close so the splice can drain
+        let mut resp = Vec::new();
+        probe.read_to_end(&mut resp).await.unwrap();
+
+        assert_eq!(
+            resp, b"HTTP/1.1 200 OK\r\n\r\nreal page",
+            "the prober receives the decoy upstream's real response"
+        );
+        server.await.unwrap();
+        assert!(
+            upstream_task.await.unwrap(),
+            "the decoy upstream saw a genuine TLS handshake"
+        );
     }
 }

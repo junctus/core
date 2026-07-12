@@ -93,7 +93,12 @@ pub async fn run_tunnel_stack(
 
 /// Open a `udp:`-tagged circuit to one UDP flow's destination and shuttle
 /// datagrams both ways (one datagram == one circuit cell).
-async fn handle_udp_flow(identity: Arc<NodeIdentity>, flow: UdpFlow, circuit: Vec<Hop>, mix: MixParams) {
+async fn handle_udp_flow(
+    identity: Arc<NodeIdentity>,
+    flow: UdpFlow,
+    circuit: Vec<Hop>,
+    mix: MixParams,
+) {
     let target = format!("udp:{}", flow.dst);
     let (sink, stream) = match open_circuit(&identity, &circuit, &target).await {
         Ok(pair) => pair,
@@ -140,7 +145,12 @@ async fn handle_udp_flow(identity: Arc<NodeIdentity>, flow: UdpFlow, circuit: Ve
 }
 
 /// Open a circuit to one flow's destination and splice bytes both ways.
-async fn handle_flow(identity: Arc<NodeIdentity>, conn: Connection, circuit: Vec<Hop>, mix: MixParams) {
+async fn handle_flow(
+    identity: Arc<NodeIdentity>,
+    conn: Connection,
+    circuit: Vec<Hop>,
+    mix: MixParams,
+) {
     let target = conn.dst.to_string();
     let (sink, stream) = match open_circuit(&identity, &circuit, &target).await {
         Ok(pair) => pair,
