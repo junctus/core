@@ -58,6 +58,6 @@ pub use garble::{decode, evaluate, GarbledCircuit, Garbler};
 
 mod session;
 pub use session::{
-    combine_ciphertext, local_cipher_share, seal_record_shared, share_keystream, shared_ecdhe,
-    KeystreamShares, PreMasterShares,
+    combine_ciphertext, local_cipher_share, seal_aead_shared, seal_record_shared, share_keystream,
+    shared_ecdhe, KeystreamShares, PreMasterShares,
 };

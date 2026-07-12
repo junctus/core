@@ -181,6 +181,76 @@ pub fn seal_record_shared(
     Ok((ciphertext, tag))
 }
 
+/// The **full RFC 8439 ChaCha20-Poly1305 AEAD** under 2PC — the record-framing step
+/// [`seal_record_shared`] deferred. Encrypts a variable-length plaintext (XOR-shared
+/// between the two parties) under ChaCha20 (the Poly1305 one-time key from counter 0,
+/// encryption from counters 1, 2, …), then authenticates the RFC message
+/// `AAD ‖ pad ‖ CT ‖ pad ‖ len(AAD) ‖ len(CT)` with **multi-block Poly1305** under
+/// 2PC — so neither party ever holds the key, the keystream, or the plaintext.
+/// Returns the public `(ciphertext, tag)`.
+///
+/// Unlike [`seal_record_shared`] (single-block Poly1305 of the bare ciphertext), this
+/// verifies against a **stock ChaCha20-Poly1305 AEAD**. It is **semi-honest**: a
+/// cheating garbler is not yet caught here (that is authenticated garbling, WRK17).
+pub fn seal_aead_shared(
+    key_a: &[u8; 32],
+    key_b: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    pt_a: &[u8],
+    pt_b: &[u8],
+) -> Result<(Vec<u8>, [u8; 16])> {
+    if pt_a.len() != pt_b.len() {
+        return Err(Error::Crypto("plaintext shares differ in length".into()));
+    }
+    let ptlen = pt_a.len();
+
+    // Poly1305 one-time key = keystream block 0, first 32 bytes (kept in shares).
+    let ks0 = share_keystream(key_a, key_b, 0, nonce)?;
+    let poly_a: [u8; 32] = ks0.share_a[..32].try_into().expect("32 bytes");
+    let poly_b: [u8; 32] = ks0.share_b[..32].try_into().expect("32 bytes");
+
+    // Encrypt under keystream blocks 1, 2, … (64 bytes each); only the ciphertext is
+    // ever assembled from the two shares.
+    let mut ct_a = vec![0u8; ptlen];
+    let mut ct_b = vec![0u8; ptlen];
+    for j in 0..ptlen.div_ceil(64) {
+        let ks = share_keystream(key_a, key_b, 1 + j as u32, nonce)?;
+        let off = j * 64;
+        let end = (off + 64).min(ptlen);
+        for i in off..end {
+            ct_a[i] = pt_a[i] ^ ks.share_a[i - off];
+            ct_b[i] = pt_b[i] ^ ks.share_b[i - off];
+        }
+    }
+    let ciphertext: Vec<u8> = ct_a.iter().zip(&ct_b).map(|(a, b)| a ^ b).collect();
+
+    // Public Poly1305 message: AAD ‖ pad16 ‖ CT ‖ pad16 ‖ len(AAD) LE ‖ len(CT) LE.
+    let mut mac_data = Vec::new();
+    mac_data.extend_from_slice(aad);
+    while mac_data.len() % 16 != 0 {
+        mac_data.push(0);
+    }
+    mac_data.extend_from_slice(&ciphertext);
+    while mac_data.len() % 16 != 0 {
+        mac_data.push(0);
+    }
+    mac_data.extend_from_slice(&(aad.len() as u64).to_le_bytes());
+    mac_data.extend_from_slice(&(ciphertext.len() as u64).to_le_bytes());
+    let blocks: Vec<[u8; 16]> = mac_data
+        .chunks(16)
+        .map(|c| {
+            let mut b = [0u8; 16];
+            b[..c.len()].copy_from_slice(c);
+            b
+        })
+        .collect();
+
+    let (tag_a, tag_b) = poly1305::tag_shared_multi(&poly_a, &poly_b, &blocks)?;
+    let tag: [u8; 16] = core::array::from_fn(|i| tag_a[i] ^ tag_b[i]);
+    Ok((ciphertext, tag))
+}
+
 // ---- internals -------------------------------------------------------------
 
 fn write_key_bits(dst: &mut [bool], key: &[u8; 32]) {
@@ -210,6 +280,44 @@ fn random_scalar() -> Result<Scalar> {
 mod tests {
     use super::super::circuit::chacha20_block_ref;
     use super::*;
+
+    #[test]
+    fn full_aead_under_2pc_matches_stock_chacha20poly1305() {
+        use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+        use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+
+        // A real key + nonce + AAD + a multi-block, non-16-aligned plaintext (so the
+        // test exercises >1 ChaCha block AND ciphertext zero-padding in the MAC).
+        let key = [0x42u8; 32];
+        let nonce = [0x07u8; 12];
+        let aad: &[u8] = b"tls-1.3-record-header-ish-aad";
+        let plaintext: Vec<u8> = (0..100u8).collect();
+
+        // Stock reference: ciphertext ‖ 16-byte tag.
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        let sealed = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &plaintext,
+                    aad,
+                },
+            )
+            .unwrap();
+        let (stock_ct, stock_tag) = sealed.split_at(sealed.len() - 16);
+
+        // Split the key and plaintext into two XOR-shares (the 2PC inputs).
+        let mut ka = [0u8; 32];
+        getrandom::getrandom(&mut ka).unwrap();
+        let kb: [u8; 32] = core::array::from_fn(|i| key[i] ^ ka[i]);
+        let mut pa = vec![0u8; plaintext.len()];
+        getrandom::getrandom(&mut pa).unwrap();
+        let pb: Vec<u8> = plaintext.iter().zip(&pa).map(|(p, a)| p ^ a).collect();
+
+        let (ct, tag) = seal_aead_shared(&ka, &kb, &nonce, aad, &pa, &pb).unwrap();
+        assert_eq!(ct.as_slice(), stock_ct, "2PC ciphertext == stock AEAD");
+        assert_eq!(&tag, stock_tag, "2PC tag == full RFC 8439 AEAD tag");
+    }
 
     #[test]
     fn ecdhe_is_additively_shared_and_matches_the_server() {

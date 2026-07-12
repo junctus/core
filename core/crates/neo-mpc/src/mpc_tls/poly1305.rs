@@ -247,6 +247,85 @@ fn tag_circuit() -> Circuit {
     b.build(896, outputs)
 }
 
+/// Compute the shared Poly1305 tag over **`blocks.len()` message blocks** (the full
+/// RFC 8439 case: AAD-pad ‖ ciphertext-pad ‖ length block). The one-time key
+/// `(r, s)` is XOR-shared between the two parties (never assembled); the message
+/// blocks are **public** (AAD + ciphertext + lengths are all public in an AEAD, so
+/// each block goes in one party's share with the other zero). Returns XOR-shares of
+/// the 16-byte tag. Each block is a full 16-byte block (high bit at 128), which is
+/// exactly the RFC AEAD framing — no partial-block padding subtlety.
+pub fn tag_shared_multi(
+    key_a: &[u8; 32],
+    key_b: &[u8; 32],
+    blocks: &[[u8; 16]],
+) -> Result<([u8; 16], [u8; 16])> {
+    let n = blocks.len();
+    if n == 0 {
+        return Err(Error::Crypto("poly1305 needs at least one block".into()));
+    }
+    let circuit = tag_circuit_multi(n);
+    let n_inputs = 512 + n * 256 + 128;
+
+    // Layout: keyA[256] ‖ keyB[256] ‖ n×(blockA[128] ‖ blockB[128]) ‖ maskA[128].
+    let mut inputs = vec![false; n_inputs];
+    write_bits(&mut inputs[0..256], key_a);
+    write_bits(&mut inputs[256..512], key_b);
+    // Evaluator owns keyB and every blockB (the blocks are public, split as
+    // (block, 0) — blockB stays zero and belongs to the evaluator, mirroring the
+    // single-block call).
+    let mut evaluator_wires: HashSet<usize> = (256..512).collect();
+    for (i, blk) in blocks.iter().enumerate() {
+        let base_a = 512 + i * 256;
+        let base_b = base_a + 128;
+        write_bits(&mut inputs[base_a..base_a + 128], blk); // blockA = the public block
+        evaluator_wires.extend(base_b..base_b + 128); // blockB = 0, evaluator's
+    }
+    let mut mask = [0u8; 16];
+    getrandom::getrandom(&mut mask).map_err(|e| Error::Rng(e.to_string()))?;
+    let mask_base = 512 + n * 256;
+    write_bits(&mut inputs[mask_base..mask_base + 128], &mask);
+
+    let out = garble::eval_2pc(&circuit, &evaluator_wires, &inputs)?; // tag ⊕ maskA
+    Ok((mask, bits_to_16(&out)))
+}
+
+/// The multi-block tag circuit: reconstruct `(r, s)` from the two key shares, then
+/// Horner-accumulate `acc = ((acc + blockᵢ') · r) mod p` over the blocks, finally
+/// `(acc + s) mod 2¹²⁸` XOR-masked. `tag_circuit_multi(1)` is structurally the
+/// single-block [`tag_circuit`].
+fn tag_circuit_multi(n_blocks: usize) -> Circuit {
+    let n_inputs = 512 + n_blocks * 256 + 128;
+    let mut b = Builder::new(n_inputs);
+    let zero = b.zero();
+    let one = b.one();
+
+    let r_raw: Vec<usize> = (0..128).map(|i| b.xor(i, 256 + i)).collect(); // key[0..16]
+    let s: Vec<usize> = (0..128).map(|i| b.xor(128 + i, 384 + i)).collect(); // key[16..32]
+    let mut r = r_raw;
+    for &bit in &clamp_zero_bits() {
+        r[bit] = zero;
+    }
+    // acc, block', and sum live in 132 bits: acc < 2^130, block' < 2^131, so
+    // acc+block' < 2^132 (no overflow), and (sum·r) < 2^256 stays in reduce's range.
+    let r132 = pad(&r, 132, zero);
+    let mut acc = vec![zero; 132];
+    for blk in 0..n_blocks {
+        let base_a = 512 + blk * 256;
+        let base_b = base_a + 128;
+        let block: Vec<usize> = (0..128).map(|i| b.xor(base_a + i, base_b + i)).collect();
+        let mut block_hi = block;
+        block_hi.push(one); // bit 128 = 1 (the appended high bit)
+        let block_hi = pad(&block_hi, 132, zero);
+        let sum = b.add_mod(&acc, &block_hi); // acc + block'
+        let prod = mul_circuit(&mut b, &sum, &r132); // (acc + block') · r
+        acc = pad(&reduce_circuit(&mut b, &prod, zero, one), 132, zero); // mod p
+    }
+    let summed = b.add_mod(&pad(&acc, 128, zero), &s); // (acc + s) mod 2^128
+    let mask_base = 512 + n_blocks * 256;
+    let outputs: Vec<usize> = (0..128).map(|i| b.xor(summed[i], mask_base + i)).collect();
+    b.build(n_inputs, outputs)
+}
+
 /// Schoolbook multiply of little-endian bit vectors → `x.len()+y.len()` bits.
 fn mul_circuit(b: &mut Builder, x: &[usize], y: &[usize]) -> Vec<usize> {
     let zero = b.zero();
