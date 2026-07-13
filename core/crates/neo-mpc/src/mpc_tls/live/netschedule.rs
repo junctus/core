@@ -92,7 +92,9 @@ pub fn derive_ecdhe_share_net(
 /// the channel stays in lockstep.
 pub struct KeyScheduleNet {
     party: Party,
-    handshake_secret: [u8; 32],
+    /// The prepared Handshake Secret (ipad/opad states precomputed once) — reused for the
+    /// c/s hs traffic secrets AND the app-epoch "derived" step, so it's prepared just once.
+    hs_prepared: PreparedKey,
     client_hs: [u8; 32],
     server_hs: [u8; 32],
     master: Option<[u8; 32]>,
@@ -118,7 +120,7 @@ impl KeyScheduleNet {
         let server_hs = derive_secret(ch, party, &pk_hs, b"s hs traffic", transcript_ch_sh)?;
         Ok(KeyScheduleNet {
             party,
-            handshake_secret,
+            hs_prepared: pk_hs,
             client_hs,
             server_hs,
             master: None,
@@ -176,8 +178,8 @@ impl KeyScheduleNet {
     /// Advance to the application epoch: Master Secret then both application-traffic secrets
     /// over the full `CH..server Finished` transcript, all under 2PC over `ch`.
     pub fn derive_application(&mut self, ch: &mut dyn Channel, transcript_ch_sfin: &[u8]) -> Result<()> {
-        let pk_hs = prepare_key_net(ch, self.party, &self.handshake_secret)?;
-        let derived = derive_secret(ch, self.party, &pk_hs, b"derived", b"")?;
+        // Reuse the Handshake Secret prepared in derive_handshake (no second prepare).
+        let derived = derive_secret(ch, self.party, &self.hs_prepared, b"derived", b"")?;
         // Master Secret = HKDF-Extract(salt=derived(shared), IKM=0) = HMAC(derived, 0^32).
         let pk_derived = prepare_key_net(ch, self.party, &derived)?;
         let master = hmac_prepared_net(ch, self.party, &pk_derived, &[0u8; 32])?;
