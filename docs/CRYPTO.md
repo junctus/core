@@ -111,12 +111,15 @@ A **3-message, key-confirmed** PQ-hybrid AKE (`neo-crypto::handshake`):
   `kos::cot_sender`/`cot_receiver`): the full TinyOT `F_pre` — malicious KOS-COT authenticated bits →
   distributed shares with a MAC-checked open → authenticated AND triples (cross-term OTs) → the sacrifice
   check → bucketing — runs as a genuine two-party protocol over a `Channel`, **tested over real TCP sockets**
-  (honest triples satisfy `c=a∧b`; cheating-receiver, IT-MAC-forgery, and corrupted-triple aborts). What
-  remains is **not crypto-primitive work**: the **external audit** (the hard gate) + the formal proofs; a
-  **networked online** (the interactive `wrk17::eval_authenticated` and constant-round `authgarble` consume
-  bundled shares — splitting those is the next layer) plus the malicious ECtF-triple generation (MASCOT
-  `sacrifice`; the arithmetic already runs over authenticated shares); live-TLS **hardening** (full X.509
-  chain-building, other ciphersuites/curves, KeyUpdate); and the KOS **Roy22** fix (it ships original
+  (honest triples satisfy `c=a∧b`; cheating-receiver, IT-MAC-forgery, and corrupted-triple aborts), and a
+  **complete two-party malicious 2PC runs with no in-process modelling** — `netprep::eval_authenticated`
+  evaluates a boolean circuit under the distributed shares (XOR/NOT local, each AND a networked Beaver open),
+  TCP-tested to reproduce the plaintext circuit and abort on a forged-MAC open. What remains is **not
+  crypto-primitive work**: the **external audit** (the hard gate) + the formal proofs; routing the *live-TLS*
+  gadgets through this networked engine (they use the bundled in-process online today) plus the malicious
+  ECtF-triple generation (MASCOT `sacrifice`; the arithmetic already runs over authenticated shares); live-TLS
+  **hardening** (full X.509 chain-building, other ciphersuites/curves, KeyUpdate); and the KOS **Roy22** fix
+  (it ships original
   KOS15). A **succinct** ZK shuffle is separate research.
 - **REALITY full-session indistinguishability** — the REALITY authenticator is embedded in a real TLS 1.3
   ClientHello (`neo-transport::tls`, `build/parse_client_hello`) and an active prober is silently

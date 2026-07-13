@@ -15,31 +15,34 @@
 //! share. Opening an aBit (prover reveals `(bit, M)`, verifier checks `M == K ⊕ bit·Δ`)
 //! **aborts on a forgery** — the prover cannot open a bit to the wrong value without Δ.
 //!
-//! On top of the aBits, this module composes the **full networked TinyOT `F_pre`** the
-//! WRK17 online consumes: distributed authenticated shares [`Share`] (both-direction
-//! aBits, [`rand_shares`]) with a symmetric MAC-checked [`open`]; authenticated AND
-//! triples [`Triple`] ([`rand_triples`]: the two cross-term bit-OTs `aa·bb`, `ab·ba` over
-//! the networked COT, then `c = a∧b` authenticated both ways); the [`sacrifice`] check
-//! that catches a corrupted triple; and [`combine`]/[`bucketed_triples`] for leakage
-//! removal — all as genuine two-party protocols where neither party sees the other's
-//! share.
+//! On top of the aBits, this module composes the **full networked TinyOT `F_pre`** and the
+//! **networked online** — an end-to-end two-party malicious 2PC with no in-process
+//! modelling: distributed authenticated shares [`Share`] (both-direction aBits,
+//! [`rand_shares`]) with a symmetric MAC-checked [`open`]; authenticated AND triples
+//! [`Triple`] ([`rand_triples`]: the two cross-term bit-OTs `aa·bb`, `ab·ba` over the
+//! networked COT, then `c = a∧b` authenticated both ways); the [`sacrifice`] check that
+//! catches a corrupted triple; [`combine`]/[`bucketed_triples`] for leakage removal; and
+//! [`eval_authenticated`], which evaluates any boolean circuit under the distributed shares
+//! (XOR/NOT local, each AND a networked Beaver open) — all as genuine two-party protocols
+//! where neither party sees the other's share.
 //!
 //! # Honest boundary
 //!
 //! - Run over a **genuine two-party channel** (tested over real TCP sockets): the OT is
 //!   [`kos`](super::kos)'s maliciously-secure extension (so the networked generation
-//!   catches a cheating receiver), honest triples satisfy `c = a∧b`, and the sacrifice
-//!   aborts on a corrupted triple. This is the **distributed form** of
-//!   [`wrk17`](super::wrk17)'s in-process `Share`/`Triple`/bucketing, which remains the
-//!   reference.
-//! - What remains is feeding these distributed triples into a **networked online**: the
-//!   in-process [`wrk17::eval_authenticated`](super::wrk17) (interactive) and
-//!   [`authgarble`](super::authgarble) (constant-round) consume *bundled* shares, so a
-//!   fully networked evaluation would split those too — that is the next layer.
-//! - The KOS **Roy22** caveat ([`kos`](super::kos)) applies, and nothing here is audited.
+//!   catches a cheating receiver), honest triples satisfy `c = a∧b`, the sacrifice aborts
+//!   on a corrupted triple, the networked online reproduces the plaintext circuit, and a
+//!   forged-MAC open aborts. This is the **distributed form** of
+//!   [`wrk17`](super::wrk17)'s in-process `Share`/`Triple`/online, which remains the
+//!   reference; the constant-round [`authgarble`](super::authgarble) online is the
+//!   higher-throughput alternative (still bundled/in-process).
+//! - The KOS **Roy22** caveat ([`kos`](super::kos)) applies, and nothing here is audited —
+//!   correctness + the abort mechanism are tested; the formal malicious-security theorem is
+//!   the WRK17/KOS proofs + the external audit.
 
 use neo_core::{Error, Result};
 
+use super::circuit::{Circuit, Gate};
 use super::kos;
 use super::live::channel::Channel;
 
@@ -481,8 +484,82 @@ pub fn bucketed_triples(
     Ok(out)
 }
 
+// ── Networked authenticated online — evaluate a circuit over the wire ────────────
+//
+// The distributed counterpart of [`wrk17::eval_authenticated`](super::wrk17): the two
+// parties jointly evaluate a boolean circuit under their [`Share`]s, XOR/NOT local, each
+// AND a Beaver step with a [`Triple`] from [`netprep`]'s networked `F_pre`, every open
+// MAC-checked over the [`Channel`]. Composed with [`rand_shares`] (inputs) + [`bucketed_triples`]
+// this is an **end-to-end two-party malicious 2PC with no in-process modelling**.
+
+/// Networked Beaver AND: `⟨x∧y⟩` from `⟨x⟩,⟨y⟩` and a triple `⟨a⟩,⟨b⟩,⟨a∧b⟩`, via the two
+/// MAC-checked opens `d = x⊕a`, `e = y⊕b` (masked by the random triple, so nothing leaks):
+/// `⟨xy⟩ = ⟨c⟩ ⊕ d·⟨b⟩ ⊕ e·⟨a⟩ ⊕ d·e`.
+fn beaver_and(
+    ch: &mut dyn Channel,
+    party: Party,
+    delta: &[u8; 16],
+    x: &Share,
+    y: &Share,
+    t: &Triple,
+) -> Result<Share> {
+    let d = open(ch, delta, &x.xor(&t.0))?;
+    let e = open(ch, delta, &y.xor(&t.1))?;
+    let mut z = t.2.xor(&t.1.scale(d)).xor(&t.0.scale(e));
+    if d & e {
+        z = z.xor_const(true, party, delta);
+    }
+    Ok(z)
+}
+
+/// Evaluate `circuit` under distributed authenticated shares over `ch`. `inputs[i]` is this
+/// party's share of wire `i`; `triples` supplies one AND-triple per AND gate. XOR/NOT are
+/// local, each AND is a networked [`beaver_and`], and every output is MAC-checked-opened —
+/// **aborting on any tamper**. Both parties run this identically; the returned output bits
+/// are the same on both sides.
+pub fn eval_authenticated(
+    ch: &mut dyn Channel,
+    party: Party,
+    delta: &[u8; 16],
+    circuit: &Circuit,
+    inputs: &[Share],
+    triples: &[Triple],
+) -> Result<Vec<bool>> {
+    if inputs.len() != circuit.input_bits {
+        return Err(Error::Crypto("netprep: wrong input width".into()));
+    }
+    if triples.len() < circuit.and_gates() {
+        return Err(Error::Crypto("netprep: not enough AND triples".into()));
+    }
+    let mut w: Vec<Option<Share>> = vec![None; circuit.num_wires];
+    for (i, s) in inputs.iter().enumerate() {
+        w[i] = Some(*s);
+    }
+    let get = |w: &[Option<Share>], i: usize| -> Result<Share> {
+        w[i].ok_or_else(|| Error::Crypto("netprep: wire used before set".into()))
+    };
+    let mut tix = 0;
+    for gate in &circuit.gates {
+        match *gate {
+            Gate::Xor(a, b, o) => w[o] = Some(get(&w, a)?.xor(&get(&w, b)?)),
+            Gate::Inv(a, o) => w[o] = Some(get(&w, a)?.xor_const(true, party, delta)),
+            Gate::And(a, b, o) => {
+                let s = beaver_and(ch, party, delta, &get(&w, a)?, &get(&w, b)?, &triples[tix])?;
+                tix += 1;
+                w[o] = Some(s);
+            }
+        }
+    }
+    circuit
+        .outputs
+        .iter()
+        .map(|&o| open(ch, delta, &get(&w, o)?))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::circuit::Builder;
     use super::super::live::channel::TcpChannel;
     use super::*;
     use std::net::{TcpListener, TcpStream};
@@ -598,6 +675,84 @@ mod tests {
         );
         ra.expect("party A completes");
         rb.expect("party B completes");
+    }
+
+    /// A small circuit exercising AND, XOR and NOT: out0 = (i0∧i1)⊕i2,
+    /// out1 = (i0∧i3)⊕¬i1. 4 inputs, 2 AND gates.
+    fn small_circuit() -> Circuit {
+        let mut b = Builder::new(4);
+        let a01 = b.and(0, 1);
+        let o0 = b.xor(a01, 2);
+        let a03 = b.and(0, 3);
+        let n1 = b.inv(1);
+        let o1 = b.xor(a03, n1);
+        b.build(4, vec![o0, o1])
+    }
+
+    /// Both parties jointly evaluate `circuit` over the wire on random shared inputs, then
+    /// open the inputs and outputs; returns `(input_bits, output_bits)`.
+    fn eval_party(
+        ch: &mut TcpChannel,
+        party: Party,
+        delta: &[u8; 16],
+        circuit: &Circuit,
+    ) -> Result<(Vec<bool>, Vec<bool>)> {
+        let inputs = rand_shares(ch, party, delta, circuit.input_bits)?;
+        let triples = rand_triples(ch, party, delta, circuit.and_gates())?;
+        let out = eval_authenticated(ch, party, delta, circuit, &inputs, &triples)?;
+        let in_vals = inputs
+            .iter()
+            .map(|s| open(ch, delta, s))
+            .collect::<Result<Vec<bool>>>()?;
+        Ok((in_vals, out))
+    }
+
+    #[test]
+    fn networked_online_evaluates_a_circuit() {
+        // End-to-end two-party malicious 2PC with NO in-process modelling: both parties,
+        // each on its own socket with its own Δ, jointly evaluate the circuit over the
+        // wire (inputs + triples from netprep's networked F_pre, each AND a networked
+        // Beaver open). The opened output must equal the plaintext circuit on the opened
+        // inputs, and both parties must agree.
+        let da = [0x11u8; 16];
+        let db = [0x22u8; 16];
+        let circuit = small_circuit();
+        let (ca, cb) = (circuit.clone(), circuit.clone());
+        let (ra, rb) = two_party(
+            move |ch| eval_party(ch, Party::A, &da, &ca),
+            move |ch| eval_party(ch, Party::B, &db, &cb),
+        );
+        let (in_a, out_a) = ra.expect("party A completes");
+        let (in_b, out_b) = rb.expect("party B completes");
+        assert_eq!(in_a, in_b, "both parties open the same inputs");
+        assert_eq!(out_a, out_b, "both parties open the same outputs");
+        assert_eq!(
+            out_a,
+            circuit.eval(&in_a),
+            "networked online == plaintext circuit"
+        );
+    }
+
+    #[test]
+    fn networked_open_aborts_on_forged_mac() {
+        // The online's abort gate: a party that forges its share's MAC (which needs the
+        // peer's Δ) is caught at the very next open. Single open → no deadlock: the honest
+        // party aborts, the forger's own check (of the honest peer) passes.
+        let da = [0x33u8; 16];
+        let db = [0x44u8; 16];
+        let (_ra, rb) = two_party(
+            move |ch| {
+                // Party A forges: flip a MAC byte on its share before opening.
+                let mut s = rand_shares(ch, Party::A, &da, 1).unwrap()[0];
+                s.mac[0] ^= 1;
+                let _ = open(ch, &da, &s); // A's own check (of B) passes; ignore
+            },
+            move |ch| -> bool {
+                let s = rand_shares(ch, Party::B, &db, 1).unwrap()[0];
+                open(ch, &db, &s).is_err() // B must detect A's forged MAC
+            },
+        );
+        assert!(rb, "the honest party aborts on a forged-MAC open");
     }
 
     #[test]

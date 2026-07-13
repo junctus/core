@@ -376,10 +376,12 @@ noted inline.)
   two-party protocol over a `Channel` — malicious KOS-COT authenticated bits → distributed shares with a
   MAC-checked open → authenticated AND triples (cross-term OTs) → the sacrifice check → bucketing — **tested
   over real TCP sockets** (honest triples satisfy `c=a∧b`; a cheating receiver, an IT-MAC forgery, and a
-  corrupted triple all abort). Remaining: a **networked online** (the interactive `wrk17::eval_authenticated`
-  and constant-round `authgarble` consume bundled shares — splitting those is the next layer) and hardening
-  (full X.509 chain-building to trust anchors, other ciphersuites/curves, KeyUpdate/0-RTT). Unblocks the
-  **M33** attestor.
+  corrupted triple all abort). A **complete two-party malicious 2PC now runs with no in-process modelling**:
+  `netprep::eval_authenticated` evaluates any boolean circuit under the distributed shares (XOR/NOT local,
+  each AND a networked Beaver open), TCP-tested to reproduce the plaintext circuit and to abort on a
+  forged-MAC open. Remaining: routing the *live-TLS* gadgets through this networked engine (they use the
+  bundled in-process online today) and hardening (full X.509 chain-building to trust anchors, other
+  ciphersuites/curves, KeyUpdate/0-RTT). Unblocks the **M33** attestor.
 - **M46 — Client store distribution + one-core consolidation** ⬜ (finishes **M8**'s deferred half) ·
   ~2–3 wk. The clients already exist and run on the shared `neo-netstack` + `neo-node` core: **`../neo-mac`**
   (React Native — ships **macOS + Android APK** today, iOS from the same tree) and **`../neo-linux`** (Rust

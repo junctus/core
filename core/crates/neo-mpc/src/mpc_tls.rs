@@ -78,15 +78,17 @@
 //!   **malicious authenticated-garbling online** (`client_handshake_with_engine`) — the
 //!   malicious key schedule is tested to match the stock RFC 8446 schedule and a malicious
 //!   record round-trips; the full malicious handshake is an `#[ignore]`d ~15-min interop
-//!   test. *Party↔party* 2PC is modelled in-process for the online, but the whole
-//!   **preprocessing is now networked**: [`netprep`] runs the TinyOT `F_pre` as a genuine
-//!   two-party protocol over a [`Channel`](live::channel::Channel) — malicious KOS-COT
-//!   authenticated bits → distributed shares with MAC-checked open → authenticated AND
-//!   triples (cross-term OTs) → the sacrifice check → bucketing — TCP-tested (honest
-//!   triples satisfy `c=a∧b`; a cheating receiver and a corrupted triple abort). What
-//!   remains is a **networked online** (the interactive [`wrk17::eval_authenticated`] and
-//!   the constant-round [`authgarble`] consume bundled shares — splitting those is the next
-//!   layer) plus other hardening (full X.509 chain-building, more ciphersuites, KeyUpdate).
+//!   test. For the *record/key-schedule* gadgets the online is modelled in-process, but a
+//!   **complete two-party malicious 2PC now runs with no in-process modelling** in
+//!   [`netprep`]: the TinyOT `F_pre` (malicious KOS-COT authenticated bits → distributed
+//!   shares with MAC-checked open → AND triples via cross-term OTs → sacrifice → bucketing)
+//!   *and* the authenticated online ([`netprep::eval_authenticated`]: XOR/NOT local, each
+//!   AND a networked Beaver open) run as genuine two-party protocols over a
+//!   [`Channel`](live::channel::Channel), TCP-tested end to end (the online reproduces the
+//!   plaintext circuit; a cheating receiver, a corrupted triple, and a forged-MAC open all
+//!   abort). What remains is routing the *live-TLS* gadgets through that networked engine
+//!   (they use the bundled in-process online today) plus hardening (full X.509
+//!   chain-building, more ciphersuites, KeyUpdate).
 //! - The **external audit** gate, as everywhere in neo.
 
 pub mod auth;
