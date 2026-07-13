@@ -107,15 +107,16 @@ A **3-message, key-confirmed** PQ-hybrid AKE (`neo-crypto::handshake`):
   (`EngineKind`): the whole thing — key schedule + every record — also runs under the **malicious
   authenticated-garbling online** (`client_handshake_with_engine`); the malicious key schedule is tested to
   match the stock RFC 8446 schedule and a malicious record round-trips (the full malicious handshake is an
-  ignored ~15-min interop test). The **networked-preprocessing foundation is built** (`mpc_tls::netprep` +
-  `kos::cot_sender`/`cot_receiver`): authenticated-bit generation runs as a genuine two-party protocol over a
-  `Channel` via the malicious KOS-COT, **tested over real TCP sockets** (cheating-receiver abort + IT-MAC
-  forgery rejection). What remains is **not crypto-primitive work**: the **external audit** (the hard gate) +
-  the formal proofs; composing the networked aBits up into the full `F_pre` (both-direction aBits →
-  `leaky_and` → bucketing → the online's distributed shares — in-process today) plus the malicious
-  ECtF-triple generation (MASCOT `sacrifice`; the arithmetic already runs over authenticated shares); live-TLS
-  **hardening** (full X.509 chain-building, other ciphersuites/curves, KeyUpdate); and the KOS **Roy22** fix
-  (it ships original
+  ignored ~15-min interop test). The **networked preprocessing is built end to end** (`mpc_tls::netprep` +
+  `kos::cot_sender`/`cot_receiver`): the full TinyOT `F_pre` — malicious KOS-COT authenticated bits →
+  distributed shares with a MAC-checked open → authenticated AND triples (cross-term OTs) → the sacrifice
+  check → bucketing — runs as a genuine two-party protocol over a `Channel`, **tested over real TCP sockets**
+  (honest triples satisfy `c=a∧b`; cheating-receiver, IT-MAC-forgery, and corrupted-triple aborts). What
+  remains is **not crypto-primitive work**: the **external audit** (the hard gate) + the formal proofs; a
+  **networked online** (the interactive `wrk17::eval_authenticated` and constant-round `authgarble` consume
+  bundled shares — splitting those is the next layer) plus the malicious ECtF-triple generation (MASCOT
+  `sacrifice`; the arithmetic already runs over authenticated shares); live-TLS **hardening** (full X.509
+  chain-building, other ciphersuites/curves, KeyUpdate); and the KOS **Roy22** fix (it ships original
   KOS15). A **succinct** ZK shuffle is separate research.
 - **REALITY full-session indistinguishability** — the REALITY authenticator is embedded in a real TLS 1.3
   ClientHello (`neo-transport::tls`, `build/parse_client_hello`) and an active prober is silently

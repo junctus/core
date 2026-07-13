@@ -45,8 +45,10 @@
 //!   vetted `p256` and NIST-KAT SHA-256.
 //! - **Malicious-secure 2PC stack** — *built*: malicious OT ([`kos`], KOS correlation
 //!   check — with a **networked two-party form** [`kos::cot_sender`]/[`kos::cot_receiver`]
-//!   driving [`netprep`]'s over-the-wire authenticated bits, TCP-tested incl. the
-//!   cheating-receiver abort) → malicious `F_pre` ([`wrk17`]: aBits over KOS, `aAND`
+//!   driving [`netprep`]'s over-the-wire **TinyOT `F_pre`**: authenticated bits →
+//!   distributed shares (MAC-checked open) → AND triples (cross-term OTs) → sacrifice →
+//!   bucketing, TCP-tested incl. the cheating-receiver + corrupted-triple aborts) →
+//!   in-process malicious `F_pre` ([`wrk17`]: aBits over KOS, `aAND`
 //!   triples via bucketing) → the **constant-round malicious online** ([`authgarble`]: WRK17/KRRW18
 //!   **authenticated garbling** — every wire a doubly-authenticated `{x}`, each AND a
 //!   half-gate pair, a corrupted garbled row ⇒ abort). Correctness + the abort mechanism
@@ -76,12 +78,15 @@
 //!   **malicious authenticated-garbling online** (`client_handshake_with_engine`) — the
 //!   malicious key schedule is tested to match the stock RFC 8446 schedule and a malicious
 //!   record round-trips; the full malicious handshake is an `#[ignore]`d ~15-min interop
-//!   test. *Party↔party* 2PC is modelled in-process for the online, but its **foundation
-//!   is now networked**: [`netprep`] runs authenticated-bit preprocessing as a genuine
-//!   two-party protocol over a [`Channel`](live::channel::Channel) (malicious KOS-COT,
-//!   TCP-tested with the cheating-receiver abort). What remains is composing that up
-//!   (both-direction aBits → `leaky_and` → bucketing → the online's distributed shares)
-//!   and other hardening (full X.509 chain-building, more ciphersuites/curves, KeyUpdate).
+//!   test. *Party↔party* 2PC is modelled in-process for the online, but the whole
+//!   **preprocessing is now networked**: [`netprep`] runs the TinyOT `F_pre` as a genuine
+//!   two-party protocol over a [`Channel`](live::channel::Channel) — malicious KOS-COT
+//!   authenticated bits → distributed shares with MAC-checked open → authenticated AND
+//!   triples (cross-term OTs) → the sacrifice check → bucketing — TCP-tested (honest
+//!   triples satisfy `c=a∧b`; a cheating receiver and a corrupted triple abort). What
+//!   remains is a **networked online** (the interactive [`wrk17::eval_authenticated`] and
+//!   the constant-round [`authgarble`] consume bundled shares — splitting those is the next
+//!   layer) plus other hardening (full X.509 chain-building, more ciphersuites, KeyUpdate).
 //! - The **external audit** gate, as everywhere in neo.
 
 pub mod auth;
