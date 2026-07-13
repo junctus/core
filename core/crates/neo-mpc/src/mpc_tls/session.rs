@@ -32,7 +32,8 @@ use curve25519_dalek::Scalar;
 use neo_core::{Error, Result};
 
 use super::circuit::{chacha20_block_2pc, chacha20_output_bytes};
-use super::{garble, poly1305};
+use super::engine::{eval_circuit, EngineKind};
+use super::poly1305;
 
 /// Additive shares of the ECDHE pre-master point: `Z = share1 + share2`.
 pub struct PreMasterShares {
@@ -101,6 +102,18 @@ pub fn share_keystream(
     counter: u32,
     nonce: &[u8; 12],
 ) -> Result<KeystreamShares> {
+    share_keystream_engine(EngineKind::Semihonest, key_a, key_b, counter, nonce)
+}
+
+/// [`share_keystream`] under a chosen 2PC [`EngineKind`] (semi-honest garbler or the
+/// malicious authenticated-garbling online).
+pub fn share_keystream_engine(
+    engine: EngineKind,
+    key_a: &[u8; 32],
+    key_b: &[u8; 32],
+    counter: u32,
+    nonce: &[u8; 12],
+) -> Result<KeystreamShares> {
     let circuit = chacha20_block_2pc();
 
     // Garbler owns keyA, counter, nonce, and a random output mask; the evaluator
@@ -124,7 +137,7 @@ pub fn share_keystream(
     inputs[640..1152].copy_from_slice(&mask_bits);
 
     let evaluator_wires: HashSet<usize> = (256..512).collect(); // keyB
-    let out_bits = garble::eval_2pc(&circuit, &evaluator_wires, &inputs)?; // = KS ⊕ maskA
+    let out_bits = eval_circuit(engine, &circuit, &evaluator_wires, &inputs)?; // = KS ⊕ maskA
 
     Ok(KeystreamShares {
         share_a: chacha20_output_bytes(&mask_bits), // maskA
@@ -201,13 +214,29 @@ pub fn seal_aead_shared(
     pt_a: &[u8],
     pt_b: &[u8],
 ) -> Result<(Vec<u8>, [u8; 16])> {
+    seal_aead_shared_engine(EngineKind::Semihonest, key_a, key_b, nonce, aad, pt_a, pt_b)
+}
+
+/// [`seal_aead_shared`] under a chosen 2PC [`EngineKind`]. `Malicious` routes every
+/// keystream + Poly1305 circuit through the authenticated-garbling online (aborts on a
+/// cheating party).
+#[allow(clippy::too_many_arguments)]
+pub fn seal_aead_shared_engine(
+    engine: EngineKind,
+    key_a: &[u8; 32],
+    key_b: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    pt_a: &[u8],
+    pt_b: &[u8],
+) -> Result<(Vec<u8>, [u8; 16])> {
     if pt_a.len() != pt_b.len() {
         return Err(Error::Crypto("plaintext shares differ in length".into()));
     }
     let ptlen = pt_a.len();
 
     // Poly1305 one-time key = keystream block 0, first 32 bytes (kept in shares).
-    let ks0 = share_keystream(key_a, key_b, 0, nonce)?;
+    let ks0 = share_keystream_engine(engine, key_a, key_b, 0, nonce)?;
     let poly_a: [u8; 32] = ks0.share_a[..32].try_into().expect("32 bytes");
     let poly_b: [u8; 32] = ks0.share_b[..32].try_into().expect("32 bytes");
 
@@ -216,7 +245,7 @@ pub fn seal_aead_shared(
     let mut ct_a = vec![0u8; ptlen];
     let mut ct_b = vec![0u8; ptlen];
     for j in 0..ptlen.div_ceil(64) {
-        let ks = share_keystream(key_a, key_b, 1 + j as u32, nonce)?;
+        let ks = share_keystream_engine(engine, key_a, key_b, 1 + j as u32, nonce)?;
         let off = j * 64;
         let end = (off + 64).min(ptlen);
         for i in off..end {
@@ -247,7 +276,7 @@ pub fn seal_aead_shared(
         })
         .collect();
 
-    let (tag_a, tag_b) = poly1305::tag_shared_multi(&poly_a, &poly_b, &blocks)?;
+    let (tag_a, tag_b) = poly1305::tag_shared_multi_engine(engine, &poly_a, &poly_b, &blocks)?;
     let tag: [u8; 16] = core::array::from_fn(|i| tag_a[i] ^ tag_b[i]);
     Ok((ciphertext, tag))
 }
@@ -271,6 +300,30 @@ pub fn seal_tls13_record_shared(
     pt_a: &[u8],
     pt_b: &[u8],
 ) -> Result<Vec<u8>> {
+    seal_tls13_record_shared_engine(
+        EngineKind::Semihonest,
+        key_a,
+        key_b,
+        static_iv,
+        seq,
+        content_type,
+        pt_a,
+        pt_b,
+    )
+}
+
+/// [`seal_tls13_record_shared`] under a chosen 2PC [`EngineKind`].
+#[allow(clippy::too_many_arguments)]
+pub fn seal_tls13_record_shared_engine(
+    engine: EngineKind,
+    key_a: &[u8; 32],
+    key_b: &[u8; 32],
+    static_iv: &[u8; 12],
+    seq: u64,
+    content_type: u8,
+    pt_a: &[u8],
+    pt_b: &[u8],
+) -> Result<Vec<u8>> {
     if pt_a.len() != pt_b.len() {
         return Err(Error::Crypto("plaintext shares differ in length".into()));
     }
@@ -286,7 +339,8 @@ pub fn seal_tls13_record_shared(
     let length = (inner_a.len() + 16) as u16;
     let header = [0x17, 0x03, 0x03, (length >> 8) as u8, length as u8];
 
-    let (ciphertext, tag) = seal_aead_shared(key_a, key_b, &nonce, &header, &inner_a, &inner_b)?;
+    let (ciphertext, tag) =
+        seal_aead_shared_engine(engine, key_a, key_b, &nonce, &header, &inner_a, &inner_b)?;
     let mut record = Vec::with_capacity(5 + ciphertext.len() + 16);
     record.extend_from_slice(&header);
     record.extend_from_slice(&ciphertext);

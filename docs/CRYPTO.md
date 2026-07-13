@@ -103,12 +103,16 @@ A **3-message, key-confirmed** PQ-hybrid AKE (`neo-crypto::handshake`):
   schedule under 2PC** → the record layer (2PC seal **and** open) against an actual server, and is
   **interop-tested against a stock `rustls` TLS 1.3 server** (`TLS_CHACHA20_POLY1305_SHA256`) — the two 2PC
   parties complete a handshake and exchange application data, with rustls verifying the client side and the
-  client verifying the server Finished + CertificateVerify. What remains is **not crypto-primitive work**: the
-  **external audit** (the hard gate) + the formal proofs; **malicious-live** (routing the live session through
-  the `authgarble` online — the `EngineKind` seam — which needs the **malicious generation** of the
-  SPDZ/`F_pre` Beaver triples end to end: MASCOT aBits + `sacrifice`; the online phase and ECtF arithmetic
-  already run over authenticated shares, but the triples are dealt honestly); live-TLS **hardening** (full
-  X.509 chain-building, other ciphersuites/curves, KeyUpdate); and the KOS **Roy22** fix (it ships original
+  client verifying the server Finished + CertificateVerify. The live session is **engine-selectable**
+  (`EngineKind`): the whole thing — key schedule + every record — also runs under the **malicious
+  authenticated-garbling online** (`client_handshake_with_engine`); the malicious key schedule is tested to
+  match the stock RFC 8446 schedule and a malicious record round-trips (the full malicious handshake is an
+  ignored ~15-min interop test). What remains is **not crypto-primitive work**: the **external audit** (the
+  hard gate) + the formal proofs; the **networked** aBit `F_pre` preprocessing between the two separate
+  parties (the online + `F_pre` bucketing run in-process today — the crate's standing boundary) plus the
+  malicious ECtF-triple generation (MASCOT `sacrifice`; the arithmetic already runs over authenticated
+  shares); live-TLS **hardening** (full X.509 chain-building, other ciphersuites/curves, KeyUpdate); and the
+  KOS **Roy22** fix (it ships original
   KOS15). A **succinct** ZK shuffle is separate research.
 - **REALITY full-session indistinguishability** — the REALITY authenticator is embedded in a real TLS 1.3
   ClientHello (`neo-transport::tls`, `build/parse_client_hello`) and an active prober is silently

@@ -22,10 +22,13 @@
 //!   verified against the leaf certificate's key. **Full X.509 chain-building to trust
 //!   anchors is out of scope here** (the test uses a self-signed cert) — a deployment
 //!   layers standard path validation on top.
-//! - Semi-honest, in-process party model — see [`super`]'s boundary.
+//! - Engine-selectable ([`client_handshake`] is semi-honest; [`client_handshake_with_engine`]
+//!   runs the whole session under the malicious authenticated-garbling online). In-process
+//!   party model — see [`super`]'s boundary.
 
 use neo_core::{Error, Result};
 
+use super::super::engine::EngineKind;
 use super::super::sha256::sha256;
 use super::channel::{read_tls_record, Channel};
 use super::ecdhe::ClientKeyShare;
@@ -344,9 +347,23 @@ fn read_server_flight(ch: &mut dyn Channel, rx: &mut Direction) -> Result<Vec<Ve
 }
 
 /// Drive the full TLS 1.3 client handshake over `ch` against the server named
-/// `server_name`. On success returns an [`AppSession`] for application data. Every key is
-/// derived under 2PC; the server is authenticated by its Finished + CertificateVerify.
+/// `server_name`, **semi-honest**. On success returns an [`AppSession`] for application
+/// data. Every key is derived under 2PC; the server is authenticated by its Finished +
+/// CertificateVerify. Use [`client_handshake_with_engine`] to run the whole session under
+/// the malicious authenticated-garbling online.
 pub fn client_handshake(ch: &mut dyn Channel, server_name: &str) -> Result<AppSession> {
+    client_handshake_with_engine(ch, server_name, EngineKind::Semihonest)
+}
+
+/// [`client_handshake`] under a chosen 2PC [`EngineKind`]: every key-schedule and record
+/// circuit runs on `engine`. With [`EngineKind::Malicious`] the whole live session is
+/// evaluated under WRK17/KRRW18 authenticated garbling (aborts on a cheating party) — far
+/// slower, so used for the malicious-online interop rather than the default path.
+pub fn client_handshake_with_engine(
+    ch: &mut dyn Channel,
+    server_name: &str,
+    engine: EngineKind,
+) -> Result<AppSession> {
     // 1. Split-scalar key_share + fresh randoms; emit ClientHello (plaintext).
     let cks = ClientKeyShare::generate()?;
     let mut client_random = [0u8; 32];
@@ -401,8 +418,9 @@ pub fn client_handshake(ch: &mut dyn Channel, server_name: &str) -> Result<AppSe
 
     // 3. ECDHE shared secret (2PC) + Handshake Secret + handshake traffic keys.
     let shared = cks.derive_shared(&sh.server_key_share)?;
-    let mut ks = KeySchedule::derive_handshake(&shared.secret_a, &shared.secret_b, &transcript)?;
-    let mut rx_hs = Direction::new(&ks.server_handshake_keys()?);
+    let mut ks =
+        KeySchedule::derive_handshake(engine, &shared.secret_a, &shared.secret_b, &transcript)?;
+    let mut rx_hs = Direction::with_engine(engine, &ks.server_handshake_keys()?);
 
     // 4. Server flight: EncryptedExtensions, Certificate, CertificateVerify, Finished.
     let flight = read_server_flight(ch, &mut rx_hs)?;
@@ -454,7 +472,7 @@ pub fn client_handshake(ch: &mut dyn Channel, server_name: &str) -> Result<AppSe
     let cfin_hash = sha256(&transcript);
     let client_verify_data = ks.client_finished(&cfin_hash)?;
     let client_fin_msg = handshake_message(HS_FINISHED, &client_verify_data);
-    let mut tx_hs = Direction::new(&ks.client_handshake_keys()?);
+    let mut tx_hs = Direction::with_engine(engine, &ks.client_handshake_keys()?);
     let zeros = vec![0u8; client_fin_msg.len()];
     let rec = tx_hs.seal(REC_HANDSHAKE, &client_fin_msg, &zeros)?;
     ch.send(&rec)?;
@@ -464,8 +482,8 @@ pub fn client_handshake(ch: &mut dyn Channel, server_name: &str) -> Result<AppSe
     //    Finished; rekey both directions (fresh seq 0).
     let app_transcript_hash_input = &transcript[..transcript.len() - client_fin_msg.len()];
     ks.derive_application(app_transcript_hash_input)?;
-    let client_write = Direction::new(&ks.client_application_keys()?);
-    let server_read = Direction::new(&ks.server_application_keys()?);
+    let client_write = Direction::with_engine(engine, &ks.client_application_keys()?);
+    let server_read = Direction::with_engine(engine, &ks.server_application_keys()?);
     Ok(AppSession {
         client_write,
         server_read,
@@ -650,5 +668,24 @@ mod tests {
             echo, payload,
             "rustls echoed the 2PC-encrypted application record"
         );
+    }
+
+    #[test]
+    #[ignore] // ~15-20 min: the entire live session under authenticated garbling
+    fn live_handshake_under_malicious_engine() {
+        // Malicious-live end-to-end: the whole TLS 1.3 session — key schedule + every
+        // record — runs under the WRK17/KRRW18 authenticated-garbling online, against the
+        // same stock rustls server. Far slower than the semi-honest path, so ignored by
+        // default; run with `--ignored --release`.
+        let addr = spawn_rustls_echo_server();
+        let mut ch = TcpChannel::connect(addr).unwrap();
+
+        let mut session = client_handshake_with_engine(&mut ch, "localhost", EngineKind::Malicious)
+            .expect("malicious 2PC TLS 1.3 handshake");
+
+        let payload = b"neo-malicious ping";
+        send_application(&mut ch, &mut session, payload).expect("send app data");
+        let echo = recv_application(&mut ch, &mut session).expect("recv echo");
+        assert_eq!(echo, payload, "malicious-engine session echoed the record");
     }
 }

@@ -11,8 +11,9 @@
 
 use neo_core::{Error, Result};
 
-use super::super::poly1305::tag_shared_multi;
-use super::super::session::{seal_tls13_record_shared, share_keystream};
+use super::super::engine::EngineKind;
+use super::super::poly1305::tag_shared_multi_engine;
+use super::super::session::{seal_tls13_record_shared_engine, share_keystream_engine};
 use super::schedule::TrafficKeys;
 
 /// The TLS 1.3 per-record nonce (RFC 8446 §5.3): `static_iv XOR seq` (seq big-endian in
@@ -71,7 +72,26 @@ pub fn open_tls13_record_shared(
     seq: u64,
     record_body: &[u8],
 ) -> Result<(u8, Vec<u8>)> {
-    let (ct_a, ct_b, tag) = open_shares(key_a, key_b, static_iv, seq, record_body)?;
+    open_tls13_record_shared_engine(
+        EngineKind::Semihonest,
+        key_a,
+        key_b,
+        static_iv,
+        seq,
+        record_body,
+    )
+}
+
+/// [`open_tls13_record_shared`] under a chosen 2PC [`EngineKind`].
+pub fn open_tls13_record_shared_engine(
+    engine: EngineKind,
+    key_a: &[u8; 32],
+    key_b: &[u8; 32],
+    static_iv: &[u8; 12],
+    seq: u64,
+    record_body: &[u8],
+) -> Result<(u8, Vec<u8>)> {
+    let (ct_a, ct_b, tag) = open_shares(engine, key_a, key_b, static_iv, seq, record_body)?;
     // Open: plaintext = ct_a ⊕ ct_b (ct_a already folds in the public ciphertext).
     let _ = tag;
     let mut pt: Vec<u8> = ct_a.iter().zip(&ct_b).map(|(a, b)| a ^ b).collect();
@@ -90,6 +110,7 @@ pub fn open_tls13_record_shared(
 /// including the trailing content-type byte) plus the verified tag. `pt_a` folds in the
 /// public ciphertext, so `pt_a ⊕ pt_b` is the plaintext but neither share alone reveals it.
 fn open_shares(
+    engine: EngineKind,
     key_a: &[u8; 32],
     key_b: &[u8; 32],
     static_iv: &[u8; 12],
@@ -108,10 +129,10 @@ fn open_shares(
 
     // 1. Verify the tag: Poly1305 over public (AAD‖CT) with the shared one-time key
     //    (= keystream block 0). Combine the tag shares only to compare — abort on mismatch.
-    let ks0 = share_keystream(key_a, key_b, 0, &nonce)?;
+    let ks0 = share_keystream_engine(engine, key_a, key_b, 0, &nonce)?;
     let poly_a: [u8; 32] = ks0.share_a[..32].try_into().expect("32");
     let poly_b: [u8; 32] = ks0.share_b[..32].try_into().expect("32");
-    let (ta, tb) = tag_shared_multi(&poly_a, &poly_b, &poly_blocks(&header, ct))?;
+    let (ta, tb) = tag_shared_multi_engine(engine, &poly_a, &poly_b, &poly_blocks(&header, ct))?;
     let got: [u8; 16] = core::array::from_fn(|i| ta[i] ^ tb[i]);
     if !ct_eq16(tag, &got) {
         return Err(Error::Crypto(
@@ -123,7 +144,7 @@ fn open_shares(
     let mut pt_a = vec![0u8; ct.len()];
     let mut pt_b = vec![0u8; ct.len()];
     for j in 0..ct.len().div_ceil(64) {
-        let ks = share_keystream(key_a, key_b, 1 + j as u32, &nonce)?;
+        let ks = share_keystream_engine(engine, key_a, key_b, 1 + j as u32, &nonce)?;
         let off = j * 64;
         let end = (off + 64).min(ct.len());
         for i in off..end {
@@ -134,9 +155,11 @@ fn open_shares(
     Ok((pt_a, pt_b, got))
 }
 
-/// One direction of a live record channel: a traffic key/IV (key shared, IV public) plus
-/// an independent record sequence counter (RFC 8446 §5.3 — resets to 0 on each key epoch).
+/// One direction of a live record channel: a traffic key/IV (key shared, IV public), an
+/// independent record sequence counter (RFC 8446 §5.3 — resets to 0 on each key epoch),
+/// and the 2PC [`EngineKind`] its seal/open circuits run under.
 pub struct Direction {
+    engine: EngineKind,
     key_a: [u8; 32],
     key_b: [u8; 32],
     iv: [u8; 12],
@@ -144,8 +167,15 @@ pub struct Direction {
 }
 
 impl Direction {
+    /// A semi-honest direction (the live default).
     pub fn new(keys: &TrafficKeys) -> Self {
+        Self::with_engine(EngineKind::Semihonest, keys)
+    }
+
+    /// A direction whose seal/open circuits run under `engine`.
+    pub fn with_engine(engine: EngineKind, keys: &TrafficKeys) -> Self {
         Direction {
+            engine,
             key_a: keys.key_a,
             key_b: keys.key_b,
             iv: keys.iv,
@@ -156,7 +186,8 @@ impl Direction {
     /// Seal one record of shared `content` under this direction's key, advancing the
     /// sequence number. Returns the exact wire bytes (`header ‖ ciphertext ‖ tag`).
     pub fn seal(&mut self, content_type: u8, pt_a: &[u8], pt_b: &[u8]) -> Result<Vec<u8>> {
-        let rec = seal_tls13_record_shared(
+        let rec = seal_tls13_record_shared_engine(
+            self.engine,
             &self.key_a,
             &self.key_b,
             &self.iv,
@@ -172,8 +203,14 @@ impl Direction {
     /// Open one record body (post-header), advancing the sequence number; returns the
     /// opened `(inner_content_type, plaintext)`.
     pub fn open(&mut self, record_body: &[u8]) -> Result<(u8, Vec<u8>)> {
-        let out =
-            open_tls13_record_shared(&self.key_a, &self.key_b, &self.iv, self.seq, record_body)?;
+        let out = open_tls13_record_shared_engine(
+            self.engine,
+            &self.key_a,
+            &self.key_b,
+            &self.iv,
+            self.seq,
+            record_body,
+        )?;
         self.seq += 1;
         Ok(out)
     }
@@ -190,8 +227,14 @@ impl Direction {
     /// shared. (In a real garbler/evaluator split this is a per-byte equality-open on the
     /// tail, not a full-record reveal.)
     pub fn open_shared(&mut self, record_body: &[u8]) -> Result<(u8, Vec<u8>, Vec<u8>)> {
-        let (mut pt_a, mut pt_b, _tag) =
-            open_shares(&self.key_a, &self.key_b, &self.iv, self.seq, record_body)?;
+        let (mut pt_a, mut pt_b, _tag) = open_shares(
+            self.engine,
+            &self.key_a,
+            &self.key_b,
+            &self.iv,
+            self.seq,
+            record_body,
+        )?;
         self.seq += 1;
         // Tail-only scan: combine one byte at a time from the end, never the interior body.
         let mut end = pt_a.len();
@@ -220,6 +263,27 @@ mod tests {
             .collect();
         let b: Vec<u8> = pt.iter().zip(&a).map(|(p, x)| p ^ x).collect();
         (a, b)
+    }
+
+    #[test]
+    #[ignore] // ~40s in release (authenticated garbling); run with `--ignored --release`
+    fn malicious_engine_record_round_trips() {
+        // Malicious-live record layer: a record sealed + opened under the authenticated-
+        // garbling online recovers the same plaintext (the ChaCha20 keystream + Poly1305
+        // tag circuits run under `EngineKind::Malicious`). Small payload to bound time.
+        let keys = TrafficKeys {
+            key_a: [0x11; 32],
+            key_b: core::array::from_fn(|i| (i as u8) ^ 0x77),
+            iv: [0x24; 12],
+        };
+        let mut tx = Direction::with_engine(EngineKind::Malicious, &keys);
+        let mut rx = Direction::with_engine(EngineKind::Malicious, &keys);
+        let msg = b"hi";
+        let (pa, pb) = split(msg);
+        let record = tx.seal(0x17, &pa, &pb).unwrap();
+        let (ctype, pt) = rx.open(&record[5..]).unwrap();
+        assert_eq!(ctype, 0x17, "malicious open recovers content type");
+        assert_eq!(pt, msg, "malicious seal/open round-trips");
     }
 
     #[test]

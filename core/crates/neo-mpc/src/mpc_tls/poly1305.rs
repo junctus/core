@@ -22,6 +22,7 @@ use std::collections::HashSet;
 use neo_core::{Error, Result};
 
 use super::circuit::{Builder, Circuit};
+use super::engine::{eval_circuit, EngineKind};
 use super::garble;
 
 /// 288-bit little-endian bignum as nine 32-bit limbs (holds products < 2²⁶⁰).
@@ -259,6 +260,17 @@ pub fn tag_shared_multi(
     key_b: &[u8; 32],
     blocks: &[[u8; 16]],
 ) -> Result<([u8; 16], [u8; 16])> {
+    tag_shared_multi_engine(EngineKind::Semihonest, key_a, key_b, blocks)
+}
+
+/// [`tag_shared_multi`] under a chosen 2PC [`EngineKind`] (semi-honest or the malicious
+/// authenticated-garbling online).
+pub fn tag_shared_multi_engine(
+    engine: EngineKind,
+    key_a: &[u8; 32],
+    key_b: &[u8; 32],
+    blocks: &[[u8; 16]],
+) -> Result<([u8; 16], [u8; 16])> {
     let n = blocks.len();
     if n == 0 {
         return Err(Error::Crypto("poly1305 needs at least one block".into()));
@@ -285,7 +297,7 @@ pub fn tag_shared_multi(
     let mask_base = 512 + n * 256;
     write_bits(&mut inputs[mask_base..mask_base + 128], &mask);
 
-    let out = garble::eval_2pc(&circuit, &evaluator_wires, &inputs)?; // tag ⊕ maskA
+    let out = eval_circuit(engine, &circuit, &evaluator_wires, &inputs)?; // tag ⊕ maskA
     Ok((mask, bits_to_16(&out)))
 }
 

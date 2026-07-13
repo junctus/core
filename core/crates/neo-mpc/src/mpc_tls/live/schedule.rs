@@ -25,14 +25,20 @@
 //!   reproduces the stock key schedule byte-for-byte, including the traffic keys/IVs and
 //!   both Finished MACs. The rustls interop test ([`super::handshake`]) then checks the
 //!   *shared* secrets against a live rustls server's `KeyLog`.
-//! - Semi-honest, like the gadgets it drives (`garble::eval_2pc`); the malicious online
-//!   ([`authgarble`](super::super::authgarble)) is the same schedule under a different
-//!   engine — see [`super`]'s boundary + M45/M38.
+//! - Runs under a chosen [`EngineKind`](super::super::engine::EngineKind): the default is
+//!   semi-honest (`garble::eval_2pc`), but the **same schedule runs under the malicious
+//!   authenticated-garbling online** ([`authgarble`](super::super::authgarble)) — every
+//!   HMAC/HKDF circuit dispatched through [`eval_circuit`](super::super::engine::eval_circuit),
+//!   aborting on a cheating party. The malicious key schedule is tested to match the stock
+//!   oracle exactly (see the tests). See [`super`]'s boundary for what "malicious" still
+//!   models in-process (networked aBit preprocessing) + the audit gate.
 
 use neo_core::Result;
 
+use super::super::engine::EngineKind;
 use super::super::hkdf::{
-    hkdf_expand_label_shared, hkdf_extract_shared, hkdf_label, hmac_sha256_shared,
+    hkdf_expand_label_shared_engine, hkdf_extract_shared_engine, hkdf_label,
+    hmac_sha256_shared_engine,
 };
 use super::super::sha256::sha256;
 
@@ -116,18 +122,24 @@ fn derived_early() -> [u8; 32] {
 
 /// `Derive-Secret` on a **shared** secret: `HKDF-Expand-Label(secret, label,
 /// Transcript-Hash(transcript), 32)` under 2PC → shared output.
-fn derive_secret_shared(secret: &Secret2, label: &[u8], transcript: &[u8]) -> Result<Secret2> {
+fn derive_secret_shared(
+    engine: EngineKind,
+    secret: &Secret2,
+    label: &[u8],
+    transcript: &[u8],
+) -> Result<Secret2> {
     let th = sha256(transcript);
-    let (a, b) = hkdf_expand_label_shared(&secret.a, &secret.b, label, &th, 32)?;
+    let (a, b) = hkdf_expand_label_shared_engine(engine, &secret.a, &secret.b, label, &th, 32)?;
     Ok(Secret2 { a, b })
 }
 
 /// Turn a shared traffic secret into a directional [`TrafficKeys`]: `key =
 /// HKDF-Expand-Label(secret, "key", "", 32)` (shared), `iv = HKDF-Expand-Label(secret,
 /// "iv", "", 12)` (opened — a PRF output, safe to reveal with the key still shared).
-fn traffic_keys(secret: &Secret2) -> Result<TrafficKeys> {
-    let (key_a, key_b) = hkdf_expand_label_shared(&secret.a, &secret.b, b"key", b"", 32)?;
-    let (iva, ivb) = hkdf_expand_label_shared(&secret.a, &secret.b, b"iv", b"", 12)?;
+fn traffic_keys(engine: EngineKind, secret: &Secret2) -> Result<TrafficKeys> {
+    let (key_a, key_b) =
+        hkdf_expand_label_shared_engine(engine, &secret.a, &secret.b, b"key", b"", 32)?;
+    let (iva, ivb) = hkdf_expand_label_shared_engine(engine, &secret.a, &secret.b, b"iv", b"", 12)?;
     let iv: [u8; 12] = core::array::from_fn(|i| iva[i] ^ ivb[i]);
     Ok(TrafficKeys { key_a, key_b, iv })
 }
@@ -136,15 +148,21 @@ fn traffic_keys(secret: &Secret2) -> Result<TrafficKeys> {
 /// then `HMAC(finished_key, transcript_hash)` under 2PC → **opened** MAC value (Finished
 /// is public on the wire). `transcript_hash` is over the handshake messages up to (but
 /// not including) the Finished being computed.
-fn finished_mac(secret: &Secret2, transcript_hash: &[u8; 32]) -> Result<[u8; 32]> {
-    let (fka, fkb) = hkdf_expand_label_shared(&secret.a, &secret.b, b"finished", b"", 32)?;
-    let (ma, mb) = hmac_sha256_shared(&fka, &fkb, transcript_hash)?;
+fn finished_mac(
+    engine: EngineKind,
+    secret: &Secret2,
+    transcript_hash: &[u8; 32],
+) -> Result<[u8; 32]> {
+    let (fka, fkb) =
+        hkdf_expand_label_shared_engine(engine, &secret.a, &secret.b, b"finished", b"", 32)?;
+    let (ma, mb) = hmac_sha256_shared_engine(engine, &fka, &fkb, transcript_hash)?;
     Ok(core::array::from_fn(|i| ma[i] ^ mb[i]))
 }
 
 /// The running TLS 1.3 key schedule for `TLS_CHACHA20_POLY1305_SHA256`, holding shares of
-/// the current-epoch secrets. Built in handshake order.
+/// the current-epoch secrets. Built in handshake order, under a chosen 2PC [`EngineKind`].
 pub struct KeySchedule {
+    engine: EngineKind,
     handshake_secret: Secret2,
     client_hs: Secret2,
     server_hs: Secret2,
@@ -156,19 +174,23 @@ pub struct KeySchedule {
 impl KeySchedule {
     /// From the shared ECDHE secret (the ECtF/A2B x-coordinate shares) and the public
     /// `ClientHello ‖ ServerHello` transcript, derive the Handshake Secret and both
-    /// handshake-traffic secrets — all under 2PC.
+    /// handshake-traffic secrets — all under 2PC on the chosen `engine`.
     pub fn derive_handshake(
+        engine: EngineKind,
         ecdhe_a: &[u8; 32],
         ecdhe_b: &[u8; 32],
         transcript_ch_sh: &[u8],
     ) -> Result<Self> {
         // Handshake Secret = HKDF-Extract(salt=Derived(public), IKM=ECDHE(shared)).
         let salt = derived_early();
-        let (hs_a, hs_b) = hkdf_extract_shared(&salt, ecdhe_a, ecdhe_b)?;
+        let (hs_a, hs_b) = hkdf_extract_shared_engine(engine, &salt, ecdhe_a, ecdhe_b)?;
         let handshake_secret = Secret2 { a: hs_a, b: hs_b };
-        let client_hs = derive_secret_shared(&handshake_secret, b"c hs traffic", transcript_ch_sh)?;
-        let server_hs = derive_secret_shared(&handshake_secret, b"s hs traffic", transcript_ch_sh)?;
+        let client_hs =
+            derive_secret_shared(engine, &handshake_secret, b"c hs traffic", transcript_ch_sh)?;
+        let server_hs =
+            derive_secret_shared(engine, &handshake_secret, b"s hs traffic", transcript_ch_sh)?;
         Ok(KeySchedule {
+            engine,
             handshake_secret,
             client_hs,
             server_hs,
@@ -180,24 +202,24 @@ impl KeySchedule {
 
     /// Client handshake-traffic key/IV (protects the client's Finished flight).
     pub fn client_handshake_keys(&self) -> Result<TrafficKeys> {
-        traffic_keys(&self.client_hs)
+        traffic_keys(self.engine, &self.client_hs)
     }
 
     /// Server handshake-traffic key/IV (decrypts the server's flight).
     pub fn server_handshake_keys(&self) -> Result<TrafficKeys> {
-        traffic_keys(&self.server_hs)
+        traffic_keys(self.engine, &self.server_hs)
     }
 
     /// The server's expected Finished MAC over `transcript_hash = Hash(CH..CertVerify)`.
     /// Compare against the server's on-wire Finished to authenticate the handshake.
     pub fn server_finished(&self, transcript_hash: &[u8; 32]) -> Result<[u8; 32]> {
-        finished_mac(&self.server_hs, transcript_hash)
+        finished_mac(self.engine, &self.server_hs, transcript_hash)
     }
 
     /// The client's Finished MAC over `transcript_hash = Hash(CH..server Finished)`,
     /// opened to place on the wire.
     pub fn client_finished(&self, transcript_hash: &[u8; 32]) -> Result<[u8; 32]> {
-        finished_mac(&self.client_hs, transcript_hash)
+        finished_mac(self.engine, &self.client_hs, transcript_hash)
     }
 
     /// Advance to the application epoch: `Master Secret = HKDF-Extract(Derived(Handshake
@@ -205,16 +227,19 @@ impl KeySchedule {
     /// `CH..server Finished` transcript. All under 2PC.
     pub fn derive_application(&mut self, transcript_ch_sfin: &[u8]) -> Result<()> {
         // Derived = Derive-Secret(Handshake Secret, "derived", "") — shared.
-        let derived = derive_secret_shared(&self.handshake_secret, b"derived", b"")?;
+        let derived = derive_secret_shared(self.engine, &self.handshake_secret, b"derived", b"")?;
         // Master Secret = HKDF-Extract(salt=derived(shared), IKM=0) = HMAC(derived, 0^32).
-        let (ms_a, ms_b) = hmac_sha256_shared(&derived.a, &derived.b, &[0u8; 32])?;
+        let (ms_a, ms_b) =
+            hmac_sha256_shared_engine(self.engine, &derived.a, &derived.b, &[0u8; 32])?;
         let master = Secret2 { a: ms_a, b: ms_b };
         self.client_ap = Some(derive_secret_shared(
+            self.engine,
             &master,
             b"c ap traffic",
             transcript_ch_sfin,
         )?);
         self.server_ap = Some(derive_secret_shared(
+            self.engine,
             &master,
             b"s ap traffic",
             transcript_ch_sfin,
@@ -225,12 +250,18 @@ impl KeySchedule {
 
     /// Client application-traffic key/IV (protects application data the client sends).
     pub fn client_application_keys(&self) -> Result<TrafficKeys> {
-        traffic_keys(self.client_ap.as_ref().expect("derive_application first"))
+        traffic_keys(
+            self.engine,
+            self.client_ap.as_ref().expect("derive_application first"),
+        )
     }
 
     /// Server application-traffic key/IV (decrypts application data from the server).
     pub fn server_application_keys(&self) -> Result<TrafficKeys> {
-        traffic_keys(self.server_ap.as_ref().expect("derive_application first"))
+        traffic_keys(
+            self.engine,
+            self.server_ap.as_ref().expect("derive_application first"),
+        )
     }
 
     /// The shared client handshake-traffic secret (exposed for oracle validation against
@@ -313,7 +344,8 @@ mod tests {
         let sap = ref_derive_secret(&master, b"s ap traffic", ch_sfin);
 
         // 2PC schedule.
-        let mut ks = KeySchedule::derive_handshake(&ea, &eb, ch_sh).unwrap();
+        let mut ks =
+            KeySchedule::derive_handshake(EngineKind::Semihonest, &ea, &eb, ch_sh).unwrap();
         assert_eq!(
             ks.client_handshake_secret().open(),
             chs,
@@ -367,5 +399,50 @@ mod tests {
         );
         // Cross-check the untouched `master`/`derived` public constant too.
         assert_eq!(derived_early(), derived0, "public Derived(Early)");
+    }
+
+    #[test]
+    #[ignore] // ~65s in release (authenticated garbling); run with `--ignored --release`
+    fn key_schedule_under_malicious_engine_matches_stock() {
+        // Malicious-live: the WRK17/KRRW18 authenticated-garbling online drives the real
+        // TLS 1.3 key schedule and derives the SAME handshake secrets + traffic keys as
+        // the stock RFC 8446 schedule — the malicious analog of the semi-honest test.
+        // Scoped to the handshake epoch to bound the (much slower) garbling time; the
+        // abort-on-tamper property is covered by `authgarble`'s own tamper tests.
+        let ecdhe: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(2));
+        let (ea, eb) = split(&ecdhe);
+        let ch_sh = b"<ClientHello||ServerHello>";
+
+        // Stock reference.
+        let early = ref_extract(&[0u8; 32], &[0u8; 32]);
+        let derived0 = ref_derive_secret(&early, b"derived", b"");
+        let hs = ref_extract(&derived0, &ecdhe);
+        let chs = ref_derive_secret(&hs, b"c hs traffic", ch_sh);
+        let shs = ref_derive_secret(&hs, b"s hs traffic", ch_sh);
+
+        // Malicious 2PC schedule.
+        let ks = KeySchedule::derive_handshake(EngineKind::Malicious, &ea, &eb, ch_sh).unwrap();
+        assert_eq!(
+            ks.client_handshake_secret().open(),
+            chs,
+            "malicious client_hs"
+        );
+        assert_eq!(
+            ks.server_handshake_secret().open(),
+            shs,
+            "malicious server_hs"
+        );
+
+        let ck = ks.client_handshake_keys().unwrap();
+        assert_eq!(
+            core::array::from_fn::<u8, 32, _>(|i| ck.key_a[i] ^ ck.key_b[i]).to_vec(),
+            ref_hkdf_expand_label(&chs, b"key", b"", 32),
+            "malicious client hs key"
+        );
+        assert_eq!(
+            ck.iv.to_vec(),
+            ref_hkdf_expand_label(&chs, b"iv", b"", 12),
+            "malicious client hs iv"
+        );
     }
 }

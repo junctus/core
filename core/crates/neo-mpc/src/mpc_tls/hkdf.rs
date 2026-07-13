@@ -30,13 +30,25 @@ use std::collections::HashSet;
 use neo_core::{Error, Result};
 
 use super::circuit::{Builder, Circuit};
-use super::garble;
+use super::engine::{eval_circuit, EngineKind};
 use super::sha256::{compress_circuit, H0};
 
 /// `HMAC-SHA256(kA ⊕ kB, msg)` under 2PC: the key is XOR-shared (`kA` party A, `kB`
 /// party B), `msg` is public. Returns XOR-shares `(outA, outB)` of the 32-byte tag,
-/// so neither party learns the key or the tag.
+/// so neither party learns the key or the tag. Semi-honest; see
+/// [`hmac_sha256_shared_engine`] for the malicious online.
 pub fn hmac_sha256_shared(
+    key_a: &[u8; 32],
+    key_b: &[u8; 32],
+    msg: &[u8],
+) -> Result<([u8; 32], [u8; 32])> {
+    hmac_sha256_shared_engine(EngineKind::Semihonest, key_a, key_b, msg)
+}
+
+/// [`hmac_sha256_shared`] under a chosen 2PC [`EngineKind`] — the same masked circuit run
+/// on the semi-honest garbler or the malicious authenticated-garbling online.
+pub fn hmac_sha256_shared_engine(
+    engine: EngineKind,
     key_a: &[u8; 32],
     key_b: &[u8; 32],
     msg: &[u8],
@@ -56,15 +68,35 @@ pub fn hmac_sha256_shared(
     inputs[512..768].copy_from_slice(&mask_bits);
 
     let evaluator_wires: HashSet<usize> = (256..512).collect(); // keyB
-    let out = garble::eval_2pc(&circuit, &evaluator_wires, &inputs)?; // tag ⊕ maskA
+    let out = eval_circuit(engine, &circuit, &evaluator_wires, &inputs)?; // tag ⊕ maskA
     Ok((bytes_from_be_words(&mask_bits), bytes_from_be_words(&out)))
 }
 
 /// `HKDF-Expand-Label(secret, label, context, length)` under 2PC (RFC 8446 §7.1), for
 /// `length ≤ 32`. The secret is XOR-shared; the label/context are public. Returns
 /// XOR-shares of the 32-byte `HMAC-SHA256(secret, HkdfLabel ‖ 0x01)`; the first
-/// `length` bytes are the derived key (each share truncated identically).
+/// `length` bytes are the derived key (each share truncated identically). Semi-honest;
+/// see [`hkdf_expand_label_shared_engine`].
 pub fn hkdf_expand_label_shared(
+    secret_a: &[u8; 32],
+    secret_b: &[u8; 32],
+    label: &[u8],
+    context: &[u8],
+    length: u16,
+) -> Result<([u8; 32], [u8; 32])> {
+    hkdf_expand_label_shared_engine(
+        EngineKind::Semihonest,
+        secret_a,
+        secret_b,
+        label,
+        context,
+        length,
+    )
+}
+
+/// [`hkdf_expand_label_shared`] under a chosen 2PC [`EngineKind`].
+pub fn hkdf_expand_label_shared_engine(
+    engine: EngineKind,
     secret_a: &[u8; 32],
     secret_b: &[u8; 32],
     label: &[u8],
@@ -74,7 +106,7 @@ pub fn hkdf_expand_label_shared(
     let info = hkdf_label(label, context, length);
     let mut msg = info;
     msg.push(0x01); // HKDF-Expand T(1) counter
-    hmac_sha256_shared(secret_a, secret_b, &msg)
+    hmac_sha256_shared_engine(engine, secret_a, secret_b, &msg)
 }
 
 /// `HKDF-Extract(salt, IKM)` under 2PC where the **salt is public** and the 32-byte
@@ -86,6 +118,16 @@ pub fn hkdf_expand_label_shared(
 /// Returns XOR-shares of the 32-byte PRK, so neither party learns the ECDHE secret or
 /// the resulting Handshake Secret.
 pub fn hkdf_extract_shared(
+    salt: &[u8; 32],
+    ikm_a: &[u8; 32],
+    ikm_b: &[u8; 32],
+) -> Result<([u8; 32], [u8; 32])> {
+    hkdf_extract_shared_engine(EngineKind::Semihonest, salt, ikm_a, ikm_b)
+}
+
+/// [`hkdf_extract_shared`] under a chosen 2PC [`EngineKind`].
+pub fn hkdf_extract_shared_engine(
+    engine: EngineKind,
     salt: &[u8; 32],
     ikm_a: &[u8; 32],
     ikm_b: &[u8; 32],
@@ -105,7 +147,7 @@ pub fn hkdf_extract_shared(
     inputs[512..768].copy_from_slice(&mask_bits);
 
     let evaluator_wires: HashSet<usize> = (256..512).collect(); // ikmB
-    let out = garble::eval_2pc(&circuit, &evaluator_wires, &inputs)?; // PRK ⊕ maskA
+    let out = eval_circuit(engine, &circuit, &evaluator_wires, &inputs)?; // PRK ⊕ maskA
     Ok((bytes_from_be_words(&mask_bits), bytes_from_be_words(&out)))
 }
 

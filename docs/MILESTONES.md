@@ -358,19 +358,22 @@ noted inline.)
   `AUDIT_SCOPE.md` (exact crates/commits in/out, each labelled built/proven/deployed), a threat-model→code
   traceability matrix, a reproducible build, and a consolidated KAT/test-vector corpus. No new runtime
   code; high leverage.
-- **M45 — Live 2PC-TLS: drive the complete stack against a real TLS 1.3 server** ✅ (semi-honest live;
-  interop-verified — malicious-live + hardening remain). Built in `neo-mpc::mpc_tls::live`: a real TLS 1.3
-  client state machine (`handshake`) drives split-scalar **P-256 ECDHE** (`ecdhe`, neither party holds the
-  ephemeral secret) → the full **RFC 8446 §7.1 key schedule under 2PC** (`schedule`, validated byte-for-byte
-  vs the vetted `hkdf`/`hmac`/`sha2` crates) → the **record layer** (`record`: `seal_tls13_record_shared` +
-  the matching 2PC **open**) over a `Channel`. **Interop-tested against a stock `rustls` TLS 1.3 server**
-  (`TLS_CHACHA20_POLY1305_SHA256`): the two 2PC client parties complete a real handshake and echo application
-  data — rustls accepts the ClientHello, its flight decrypts under the 2PC-derived server key, its Finished
-  verifies against the 2PC MAC, its CertificateVerify (ECDSA-P256) is checked, and it decrypts the
-  2PC-protected client Finished + app data. Remaining: **malicious-live** (swap `EngineKind::Semihonest` →
-  the `authgarble` online + malicious triple generation — the M38 residual), and hardening (full X.509
-  chain-building to trust anchors, other ciphersuites/curves, KeyUpdate/0-RTT). Party↔party 2PC stays
-  modelled in-process (the crate's standing boundary). Unblocks the **M33** attestor.
+- **M45 — Live 2PC-TLS: drive the complete stack against a real TLS 1.3 server** ✅ (interop-verified,
+  **both engines** — networked preprocessing + hardening remain). Built in `neo-mpc::mpc_tls::live`: a real
+  TLS 1.3 client state machine (`handshake`) drives split-scalar **P-256 ECDHE** (`ecdhe`, neither party holds
+  the ephemeral secret) → the full **RFC 8446 §7.1 key schedule under 2PC** (`schedule`, validated
+  byte-for-byte vs the vetted `hkdf`/`hmac`/`sha2` crates) → the **record layer** (`record`:
+  `seal_tls13_record_shared` + the matching 2PC **open**) over a `Channel`. **Interop-tested against a stock
+  `rustls` TLS 1.3 server** (`TLS_CHACHA20_POLY1305_SHA256`): the two 2PC client parties complete a real
+  handshake and echo application data — rustls accepts the ClientHello, its flight decrypts under the
+  2PC-derived server key, its Finished verifies against the 2PC MAC, its CertificateVerify (ECDSA-P256) is
+  checked, and it decrypts the 2PC-protected client Finished + app data. **Engine-selectable**
+  (`EngineKind`): the whole session — key schedule + every record — also runs under the **malicious
+  WRK17/KRRW18 authenticated-garbling online** (`client_handshake_with_engine`); the malicious key schedule
+  is tested to match the stock RFC 8446 schedule, a malicious record round-trips, and the full malicious
+  handshake is an `#[ignore]`d ~15-min interop test. Remaining: the **networked** aBit `F_pre` preprocessing
+  (party↔party 2PC stays modelled in-process — the crate's standing boundary) and hardening (full X.509
+  chain-building to trust anchors, other ciphersuites/curves, KeyUpdate/0-RTT). Unblocks the **M33** attestor.
 - **M46 — Client store distribution + one-core consolidation** ⬜ (finishes **M8**'s deferred half) ·
   ~2–3 wk. The clients already exist and run on the shared `neo-netstack` + `neo-node` core: **`../neo-mac`**
   (React Native — ships **macOS + Android APK** today, iOS from the same tree) and **`../neo-linux`** (Rust

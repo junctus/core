@@ -31,37 +31,30 @@
 //!   here transports the client↔server TLS bytes; a deployment additionally runs the
 //!   garbler/evaluator/OT sub-protocol over a party↔party wire. This is the crate's
 //!   standing modelling boundary, not new to M45.
-//! - **Semi-honest**, on [`garble::eval_2pc`](super::garble); the malicious online
-//!   ([`authgarble`](super::authgarble)) is the same schedule/records under a different
-//!   engine and additionally needs malicious triple generation (M38/M45 residual). The
-//!   engine seam is [`EngineKind`].
+//! - **Engine-selectable** via [`EngineKind`]: the default is semi-honest
+//!   ([`garble::eval_2pc`](super::garble)), but the **entire session — key schedule and
+//!   every record — runs under the malicious WRK17/KRRW18 authenticated-garbling online**
+//!   ([`authgarble`](super::authgarble)) with [`client_handshake_with_engine`]. The
+//!   malicious key schedule is tested to match the stock RFC 8446 schedule and a malicious
+//!   record round-trips (aborting on a cheating party); the full malicious handshake is an
+//!   `#[ignore]`d interop test (~15-20 min under garbling). What "malicious" still models
+//!   in-process is the *networked* aBit preprocessing (the KOS-OT `F_pre` between the two
+//!   separate parties) — the crate's standing boundary — so this is a malicious-secure
+//!   *construction* whose abort mechanism is tested, not the formal end-to-end theorem.
 //! - **Nothing here is audited.** Live interop proves *correctness*, not the malicious-
 //!   security theorem — that is the external audit gate, as everywhere in neo.
 
 pub mod channel;
 pub mod ecdhe;
-pub mod engine;
 pub mod handshake;
 pub mod record;
 pub mod schedule;
 
-/// Which 2PC engine the live session evaluates its circuits under. The record/schedule
-/// gadgets run on [`Semihonest`](EngineKind::Semihonest) today; [`Malicious`](EngineKind::Malicious)
-/// is reserved for the [`authgarble`](super::authgarble) online once malicious triple
-/// generation is wired end to end (see the module boundary).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EngineKind {
-    /// Free-XOR / half-gate garbling ([`garble::eval_2pc`](super::garble)); ≤1-bit leak
-    /// with dual-execution. What the live path uses today.
-    Semihonest,
-    /// WRK17/KRRW18 authenticated garbling ([`authgarble`](super::authgarble)) — aborts on
-    /// a cheating party. Gated on malicious triple generation; not yet the live default.
-    Malicious,
-}
-
+pub use super::engine::{eval_circuit, EngineKind};
 pub use channel::{Channel, Loopback, TcpChannel};
 pub use ecdhe::{ClientKeyShare, SharedSecret};
-pub use engine::eval_circuit;
-pub use handshake::{client_handshake, recv_application, send_application, AppSession};
+pub use handshake::{
+    client_handshake, client_handshake_with_engine, recv_application, send_application, AppSession,
+};
 pub use record::Direction;
 pub use schedule::{KeySchedule, Secret2, TrafficKeys};

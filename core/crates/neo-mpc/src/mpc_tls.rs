@@ -69,11 +69,14 @@
 //!   driver ([`live::handshake`]), which is **interop-tested against a stock `rustls`
 //!   TLS 1.3 server** (`TLS_CHACHA20_POLY1305_SHA256`): rustls accepts the ClientHello,
 //!   its flight decrypts under the 2PC-derived key, its Finished verifies against the 2PC
-//!   MAC, and it decrypts the 2PC-protected client Finished + application data. Semi-
-//!   honest ([`live::EngineKind`] names the malicious seam); *party↔party* 2PC stays
-//!   modelled in-process (the crate's standing boundary). What remains is malicious-live
-//!   (the triple-generation residual above) + hardening (full X.509 chain-building, other
-//!   ciphersuites/curves, KeyUpdate).
+//!   MAC, and it decrypts the 2PC-protected client Finished + application data.
+//!   **Engine-selectable** ([`engine::EngineKind`]): the same live session runs under the
+//!   **malicious authenticated-garbling online** (`client_handshake_with_engine`) — the
+//!   malicious key schedule is tested to match the stock RFC 8446 schedule and a malicious
+//!   record round-trips; the full malicious handshake is an `#[ignore]`d ~15-min interop
+//!   test. *Party↔party* 2PC stays modelled in-process (the crate's standing boundary), so
+//!   the malicious residual is the **networked** aBit preprocessing; other hardening (full
+//!   X.509 chain-building, more ciphersuites/curves, KeyUpdate) is systems work.
 //! - The **external audit** gate, as everywhere in neo.
 
 pub mod auth;
@@ -82,6 +85,7 @@ pub mod circuit;
 pub mod convert;
 pub mod dualex;
 pub mod ectf;
+pub mod engine;
 pub mod garble;
 pub mod hkdf;
 pub mod kos;
