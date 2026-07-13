@@ -41,12 +41,15 @@ client
 
 No relay ever holds a complete, readable flow (slicing over node-disjoint paths); no hop learns more
 than its next hop (Sphinx); no minority of an exit committee can read the request (threshold VSS), and
-the committee *decrypt* path assembles the key/plaintext at no single party (M28). The full two-party
-**MPC-TLS** send path (a TLS session whose key is never assembled at one party) is a complete,
-adversarially-verified **crypto stack** (M24) that **runs live** against a real TLS 1.3 server (M45 —
+the committee *decrypt* path assembles the key/plaintext at no single party (M28) — and it is the exit
+path the running node actually uses today (that or a plain TCP splice). The full two-party **MPC-TLS**
+send path (a TLS session whose key is never assembled at one party) is a complete, adversarially-verified
+**crypto stack** (M24) that **completes real TLS 1.3 handshakes against a live server** (M45 —
 interop-verified against stock `rustls`, both semi-honest and malicious engines, with real X.509
-chain-building + KeyUpdate). Both the committee-exit box above and the full 2PC-TLS path are live and
-audit-gated.
+chain-building + KeyUpdate). But it is a **tested capability, not yet wired into the runtime data plane**:
+nothing in `neo-node`/the CLI drives `mpc_tls::live` today, so live user traffic still egresses via the
+committee-exit or TCP-splice path. Wiring 2PC-TLS as the actual send path (a client + relay jointly
+playing the TLS client) is a distinct integration step. All audit-gated.
 
 ## Crates
 
