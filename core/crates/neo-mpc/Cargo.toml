@@ -36,5 +36,6 @@ num-bigint.workspace = true
 hmac.workspace = true
 hkdf.workspace = true
 sha2.workspace = true
+aes = "0.8"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 rcgen = "0.13"

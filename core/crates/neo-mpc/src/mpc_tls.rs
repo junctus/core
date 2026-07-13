@@ -91,6 +91,7 @@
 //!   chain-building, more ciphersuites, KeyUpdate).
 //! - The **external audit** gate, as everywhere in neo.
 
+pub mod aes;
 pub mod auth;
 pub mod authgarble;
 pub mod circuit;

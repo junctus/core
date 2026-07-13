@@ -389,8 +389,11 @@ noted inline.)
   feature (`WebpkiVerifier`, interop-tested). Remaining: routing the *live-TLS record/key-schedule* gadgets
   through the networked engine (they use the bundled in-process online today — a performance question: the
   interactive online is one round-trip per AND, so a full handshake wants the **constant-round** networked
-  online); and **AES-GCM / x25519** (each a new 2PC primitive — an AES circuit, a Montgomery-curve ECtF).
-  Unblocks the **M33** attestor.
+  online). For **AES-GCM**: a correct **AES-128 boolean circuit** (`mpc_tls::aes`, GF(2⁸)-inverse S-box) is
+  built + validated against FIPS-197 + the stock `aes` crate, with a **2PC AES-CTR keystream** gadget
+  (`share_aes_keystream`) — the remaining piece is GHASH (a GF(2¹²⁸) MAC, like the existing Poly1305 tag) to
+  assemble the full GCM AEAD. **x25519** (a Montgomery-curve ECtF) remains a separate primitive. Unblocks the
+  **M33** attestor.
 - **M46 — Client store distribution + one-core consolidation** ⬜ (finishes **M8**'s deferred half) ·
   ~2–3 wk. The clients already exist and run on the shared `neo-netstack` + `neo-node` core: **`../neo-mac`**
   (React Native — ships **macOS + Android APK** today, iOS from the same tree) and **`../neo-linux`** (Rust

@@ -123,9 +123,11 @@ A **3-message, key-confirmed** PQ-hybrid AKE (`neo-crypto::handshake`):
   **not crypto-primitive work**: the **external audit** (the hard gate) + the formal proofs; routing the
   *live-TLS record/key-schedule* gadgets through this networked engine (they use the bundled in-process online
   today — a performance question, since the interactive online is one round-trip per AND, so a full handshake
-  wants the **constant-round** networked online); **AES-GCM / x25519** (each a new 2PC primitive — an AES
-  circuit, a Montgomery-curve ECtF); plus the malicious ECtF-triple generation (MASCOT `sacrifice`; the
-  arithmetic already runs over authenticated shares); and the KOS **Roy22** fix (it ships original
+  wants the **constant-round** networked online). For **AES-GCM**, a correct **AES-128 circuit** (`mpc_tls::aes`,
+  GF(2⁸)-inverse S-box, validated vs FIPS-197 + the stock `aes` crate) + a **2PC AES-CTR keystream**
+  (`share_aes_keystream`) are built; GHASH (a GF(2¹²⁸) MAC like the Poly1305 tag) is the remaining assembly.
+  **x25519** (a Montgomery-curve ECtF) is a separate primitive. Plus the malicious ECtF-triple generation
+  (MASCOT `sacrifice`; the arithmetic already runs over authenticated shares); and the KOS **Roy22** fix (it ships original
   KOS15). A **succinct** ZK shuffle is separate research.
 - **REALITY full-session indistinguishability** — the REALITY authenticator is embedded in a real TLS 1.3
   ClientHello (`neo-transport::tls`, `build/parse_client_hello`) and an active prober is silently

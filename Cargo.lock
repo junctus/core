@@ -2705,6 +2705,7 @@ dependencies = [
 name = "neo-mpc"
 version = "0.0.0"
 dependencies = [
+ "aes",
  "blahaj",
  "blake3",
  "chacha20poly1305",
