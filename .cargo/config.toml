@@ -1,0 +1,10 @@
+# Enable the ARMv8 hardware-AES backend of the `aes` crate on Apple Silicon / aarch64.
+# On x86_64 the `aes` crate auto-detects AES-NI at runtime with no flags; on aarch64 it
+# falls back to (slow) software AES unless `aes_armv8` + the `+aes` target feature are set at
+# build time. This keeps local dev/test on Apple Silicon using hardware AES for the garbled-
+# circuit hash (garble::tccr_hash), matching the relays' AES-NI speed.
+[target.aarch64-apple-darwin]
+rustflags = ["--cfg", "aes_armv8", "-C", "target-feature=+aes"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["--cfg", "aes_armv8", "-C", "target-feature=+aes"]
