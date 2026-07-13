@@ -210,6 +210,115 @@ fn half(bytes: &[u8; 32], off: usize) -> [u8; 16] {
     o
 }
 
+// ── Networked ECtF: the two parties run the same protocol over a `Channel`, each
+//    holding only its own point-share. `mta_fp`'s OT maps directly onto the networked
+//    KOS COT ([`kos::cot_sender`]/[`kos::cot_receiver`]); the masked inversion's reveal is
+//    one field-element exchange. This is the ECDHE step of the networked live handshake.
+
+use super::live::channel::Channel;
+
+/// Gilboa MtA — **sender** side (holds `a`): offers `(tᵢ, tᵢ + a·2ⁱ)` for each bit over the
+/// networked OT and returns its share `−Σtᵢ`.
+fn mta_fp_sender(ch: &mut dyn Channel, a: &F, f: &Field) -> Result<F> {
+    let mut pow2a = *a;
+    let mut t_sum = f.zero();
+    let mut lo = Vec::with_capacity(256);
+    let mut hi = Vec::with_capacity(256);
+    for _ in 0..256 {
+        let t = f.rand()?;
+        t_sum += t;
+        let m1 = t + pow2a;
+        let (tb, mb) = (to_be(&t), to_be(&m1));
+        lo.push((half(&tb, 0), half(&mb, 0)));
+        hi.push((half(&tb, 16), half(&mb, 16)));
+        pow2a += pow2a;
+    }
+    kos::cot_sender(ch, &lo)?;
+    kos::cot_sender(ch, &hi)?;
+    Ok(t_sum.neg())
+}
+
+/// Gilboa MtA — **receiver** side (holds `b`): chooses by the bits of `b` and returns its
+/// share `Σ(chosen) = Σtᵢ + a·b`.
+fn mta_fp_receiver(ch: &mut dyn Channel, b: &F, f: &Field) -> Result<F> {
+    let b_be = to_be(b);
+    let bits: Vec<bool> = (0..256).map(|i| (b_be[31 - i / 8] >> (i % 8)) & 1 == 1).collect();
+    let lo_recv = kos::cot_receiver(ch, &bits)?;
+    let hi_recv = kos::cot_receiver(ch, &bits)?;
+    let mut v = f.zero();
+    for i in 0..256 {
+        let mut m = [0u8; 32];
+        m[..16].copy_from_slice(&lo_recv[i]);
+        m[16..].copy_from_slice(&hi_recv[i]);
+        v += f.load_be(&m);
+    }
+    Ok(v)
+}
+
+/// Networked [`mul_shared`] — party A's role (sender for both cross terms).
+fn mul_shared_a(ch: &mut dyn Channel, ua: &F, wa: &F, f: &Field) -> Result<F> {
+    let c1 = mta_fp_sender(ch, ua, f)?; // ↔ B.receiver(wb)
+    let c2 = mta_fp_sender(ch, wa, f)?; // ↔ B.receiver(ub)
+    Ok((*ua * *wa) + c1 + c2)
+}
+
+/// Networked [`mul_shared`] — party B's role (receiver for both cross terms).
+fn mul_shared_b(ch: &mut dyn Channel, ub: &F, wb: &F, f: &Field) -> Result<F> {
+    let d1 = mta_fp_receiver(ch, wb, f)?; // ↔ A.sender(ua)
+    let d2 = mta_fp_receiver(ch, ub, f)?; // ↔ A.sender(wa)
+    Ok((*ub * *wb) + d1 + d2)
+}
+
+/// Open a shared field element (symmetric): send our share, receive the peer's, sum.
+fn open_field(ch: &mut dyn Channel, share: &F, f: &Field) -> Result<F> {
+    ch.send(&to_be(share))?;
+    let peer = ch.recv_exact(32)?;
+    Ok(*share + f.load_be(&peer.try_into().expect("32 bytes")))
+}
+
+/// **Networked ECtF — party A** (holds point-share `P1 = (x1, y1)`). Runs the same
+/// protocol as [`ectf`] over `ch`, returning A's additive share of `x(P1+P2)`.
+pub fn ectf_a(ch: &mut dyn Channel, p1: (&[u8; 32], &[u8; 32]), prime: &[u8; 32]) -> Result<[u8; 32]> {
+    let f = Field::new(prime);
+    let x1 = f.load_be(p1.0);
+    let y1 = f.load_be(p1.1);
+    let (dxa, dya) = (x1.neg(), y1.neg());
+
+    let a_sh_a = mul_shared_a(ch, &dxa, &dxa, &f)?; // Δx² share
+    let b_sh_a = mul_shared_a(ch, &dya, &dya, &f)?; // Δy² share
+    let ra = f.rand()?;
+    let ar_a = mul_shared_a(ch, &a_sh_a, &ra, &f)?;
+    let d = open_field(ch, &ar_a, &f)?;
+    if d.retrieve() == U256::ZERO {
+        return Err(Error::Crypto("ECtF-net: degenerate masked inversion (d = 0)".into()));
+    }
+    let dinv = d.invert().0;
+    let br_a = mul_shared_a(ch, &b_sh_a, &ra, &f)?;
+    let s1 = (br_a * dinv) - x1; // λ² share − x1
+    Ok(to_be(&s1))
+}
+
+/// **Networked ECtF — party B** (holds point-share `P2 = (x2, y2)`).
+pub fn ectf_b(ch: &mut dyn Channel, p2: (&[u8; 32], &[u8; 32]), prime: &[u8; 32]) -> Result<[u8; 32]> {
+    let f = Field::new(prime);
+    let x2 = f.load_be(p2.0);
+    let y2 = f.load_be(p2.1);
+    let (dxb, dyb) = (x2, y2);
+
+    let a_sh_b = mul_shared_b(ch, &dxb, &dxb, &f)?;
+    let b_sh_b = mul_shared_b(ch, &dyb, &dyb, &f)?;
+    let rb = f.rand()?;
+    let ar_b = mul_shared_b(ch, &a_sh_b, &rb, &f)?;
+    let d = open_field(ch, &ar_b, &f)?;
+    if d.retrieve() == U256::ZERO {
+        return Err(Error::Crypto("ECtF-net: degenerate masked inversion (d = 0)".into()));
+    }
+    let dinv = d.invert().0;
+    let br_b = mul_shared_b(ch, &b_sh_b, &rb, &f)?;
+    let s2 = (br_b * dinv) - x2;
+    Ok(to_be(&s2))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,6 +377,40 @@ mod tests {
                 "ECtF x-coordinate share must reconstruct P-256's ({i}G)+({j}G)"
             );
         }
+    }
+
+    #[test]
+    fn networked_ectf_matches_p256_over_tcp() {
+        // The two parties run ECtF over a real TCP socket (each holds only its own point
+        // share); the reconstructed x-coordinate must equal P-256's — the networked ECDHE
+        // conversion for the live 2PC-TLS handshake.
+        use super::super::live::channel::TcpChannel;
+        use std::net::{TcpListener, TcpStream};
+        use std::thread;
+
+        let g = ProjectivePoint::GENERATOR;
+        let p1 = (g + g).to_affine(); // 2G
+        let p2 = (g + g + g + g + g).to_affine(); // 5G
+        let sum = (g + g + g + g + g + g + g).to_affine(); // 7G
+        let (x1, y1) = coords(&p1);
+        let (x2, y2) = coords(&p2);
+        let (sx, _) = coords(&sum);
+        let p = BigUint::from_bytes_be(&P256_PRIME_BE);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (bx, by) = (x2, y2);
+        let b = thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let mut ch = TcpChannel::from_stream(sock);
+            ectf_b(&mut ch, (&bx, &by), &P256_PRIME_BE).unwrap()
+        });
+        let mut ch = TcpChannel::from_stream(TcpStream::connect(addr).unwrap());
+        let s1 = ectf_a(&mut ch, (&x1, &y1), &P256_PRIME_BE).unwrap();
+        let s2 = b.join().unwrap();
+
+        let recon = (BigUint::from_bytes_be(&s1) + BigUint::from_bytes_be(&s2)) % &p;
+        assert_eq!(bu_to_be32(&recon), sx, "networked ECtF reconstructs P-256 x(2G+5G)");
     }
 
     #[test]

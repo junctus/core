@@ -14,6 +14,7 @@ use tokio::net::TcpListener;
 mod defaults;
 mod discovery;
 mod doh;
+mod mpc2pc;
 mod roles;
 
 #[derive(Parser)]
@@ -182,6 +183,19 @@ enum Command {
     Committee {
         #[command(subcommand)]
         action: CommitteeAction,
+    },
+    /// Networked two-party 2PC-TLS crypto (M45/M47), live between two nodes. Runs a
+    /// **constant-round** networked 2PC of real TLS operations with a peer — the ECtF
+    /// **ECDHE** conversion (split-scalar, neither party holds the secret) and the
+    /// **SHA-256 key-schedule circuit** garbled+evaluated over the wire — proving the
+    /// 2PC-TLS crypto runs live over the network. One side `--listen`, the other `--connect`.
+    Mpc2pc {
+        /// Party A / garbler: bind and wait for the peer (e.g. `0.0.0.0:9700`).
+        #[arg(long, conflicts_with = "connect")]
+        listen: Option<String>,
+        /// Party B / evaluator: connect to the peer at this `host:port`.
+        #[arg(long, conflicts_with = "listen")]
+        connect: Option<String>,
     },
 }
 
@@ -391,6 +405,7 @@ async fn main() -> anyhow::Result<()> {
                 roles::run_committee_send(descriptor, &destination, &message, cfg).await?
             }
         },
+        Command::Mpc2pc { listen, connect } => mpc2pc::run(listen, connect)?,
     }
     Ok(())
 }
