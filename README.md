@@ -7,10 +7,11 @@ A dispersed, post-quantum, verifiable, censorship-resistant privacy overlay — 
 > and browses through them. M0–M25, M28, and M36 are shipped and tested: the core, the frontier tier
 > (anonymous credits, VRF paths, committee exit, PIR + ZK shuffle), streaming/NAT/DoH bootstrap, three
 > rounds of internal security review with every finding fixed, and — the flagship — a **complete,
-> adversarially-verified malicious-secure two-party MPC-TLS crypto stack** (M24). The two gates before
-> real-world use are the **external cryptography audit** and **live MPC-TLS integration** (the crypto is
-> built; wiring it to a real TLS session is systems work). **Not audited** — do not rely on neo for
-> real-world safety. See [`docs/MILESTONES.md`](docs/MILESTONES.md) for status.
+> adversarially-verified malicious-secure two-party MPC-TLS crypto stack** (M24) that now **runs live**
+> against a real TLS 1.3 server (M45 ✅ — interop-verified against stock `rustls`, both semi-honest and
+> malicious engines). The one gate before real-world use is the **external cryptography audit**.
+> **Not audited** — do not rely on neo for real-world safety. See
+> [`docs/MILESTONES.md`](docs/MILESTONES.md) for status.
 
 ## What makes it different
 

@@ -10,10 +10,11 @@ production, and a client (`../neo-mac`) connects and browses. M0–M25, M28, and
 tested (the **Shipped** table below), including the frontier research (anonymous credits, VRF paths,
 committee exit, PIR + ZK shuffle), three rounds of internal security review with every finding fixed
 (`SECURITY_REVIEW.md`), and the flagship — a **complete, adversarially-verified malicious-secure
-two-party MPC-TLS crypto stack** (M24). The two hard gates before anyone relies on neo are the
-**external cryptography audit** and **live MPC-TLS integration** (M45 — the crypto is built; wiring it
-to a real session is systems work); the standing product gap is REALITY full-session indistinguishability
-(M27). **Nothing here is audited; do not rely on neo for real-world safety until the audit gate.**
+two-party MPC-TLS crypto stack** (M24) that now **runs live** against a real TLS 1.3 server (M45 ✅,
+interop-verified against stock `rustls`, both semi-honest and malicious engines). The one hard gate before
+anyone relies on neo is the **external cryptography audit**; the standing product gap is REALITY
+full-session indistinguishability (M27). **Nothing here is audited; do not rely on neo for real-world safety
+until the audit gate.**
 
 ---
 
@@ -51,6 +52,7 @@ depth**. "Deferred" items that have since shipped are reflected as done, not ope
 | M21 | Persistent circuit tunnels | `neo-node::circuit`, `neo-node::mux` | One Sphinx packet sets up the circuit, then counter-keyed symmetric-onion **cells** (`[seq][onion body]`, per-cell e2e MAC keyed by the exit) — exit splices a real TCP connection: TCP-over-onion. `mux` runs many logical streams over one circuit with per-stream flow control, SSRF/port-checked per OPEN. Aggregate cross-stream congestion control remains a refinement. |
 | M23 | Probe-resistant transports | `neo-crypto`, `neo-transport` | `reality` — REALITY-style authenticated first flight: client proves a pre-shared out-of-band capability with a uniform-random-to-outsiders authenticator, epoch-bound; server **silently** picks authenticate-vs-decoy (prober can't distinguish a bridge from an ordinary server). `Camouflage` shapes records to imitate QUIC/MASQUE or WebRTC/DTLS; `dial_reality`/`accept_reality` over a real connection. In-ClientHello embedding + full-session mimicry → M27. |
 | M25 | Adversarial hardening round 2 | (M20–M24 + REALITY/credits/seed/circuit surfaces) | Second internal adversarial review; closed all findings with regression tests: **CRITICAL** REALITY low-order-point authenticator forgery → silent Decoy on non-contributory DH; REALITY per-epoch replay cache + randomized pad; circuit-cell replay/reorder/drop via `next_expected_seq`; seed dial-back SSRF + health-loop starvation (default-deny private ranges, capped registry, bounded sweep, rate limits); exit-splice open-proxy SSRF (thread `ExitPolicy`, reject internal ranges — the correctness half of M31/M41); length-distinguishable cover packets → fixed-cell padding; unbounded double-spend sets → per-epoch + key rotation + persisted `spent`; threshold-ciphertext malleability → KEM-DEM + identity-key guard; semi-honest MPC doc scoping; `sharks`→maintained Shamir + `cargo audit` in CI; VRF beacon abort-grinding; a LOW/hygiene bundle (zeroize handshake secrets, accept-loop timeouts/semaphore, oblivious empty-record reject, seeded shuffle in `sample_relays`, softened overclaims). Internal review — **not** a substitute for the audit gate. |
+| M45 | Live 2PC-TLS | `neo-mpc::mpc_tls::live`, `netprep`, `aes` | The M24 crypto stack **driven live against a real TLS 1.3 server** (`TLS_CHACHA20_POLY1305_SHA256` + `secp256r1`): split-scalar P-256 ECDHE → the full RFC 8446 §7.1 key schedule under 2PC → seal/open record layer → the handshake state machine, **interop-tested against stock `rustls`** (completes a handshake + echoes app data) under **both** the semi-honest and the malicious authenticated-garbling engine. Real X.509 **chain-building** (`WebpkiVerifier`, `live-tls-webpki`), **KeyUpdate** (RFC 8446 §7.2), positional DER cert parse. Bonus: a **fully networked two-party malicious 2PC** (`netprep` — malicious KOS-COT → distributed aBits/shares/triples → sacrifice/bucketing → authenticated online, TCP-tested with abort-on-cheat), and the actual SHA-256 key-schedule circuit run through it. All ~130 correctness/interop tests green; audit-gated like all of neo. Interop breadth (AES-GCM, x25519, constant-round networked online) → M47. |
 
 ---
 
@@ -81,12 +83,12 @@ assembled at a single party** — built bottom-up, each layer checked against a 
     vetted `hmac`/`hkdf` crates.
 - **"Done" here means the crypto stack is complete + tested + verified — audit-gated like all of neo, not
   production-proven.** ~62 correctness/abort tests, all green.
-- Genuinely remaining (not crypto-primitive work): **malicious generation** of the SPDZ/`F_pre` triples end
-  to end (MASCOT aBits + sacrifice — the ECtF arithmetic already runs over authenticated Beaver via
-  `ectf_beaver`, **M38**, but its triples are dealt honestly); the KOS Roy22 fix an auditor applies (ships
-  original KOS15); the **live TLS** state machine + record layer against a real server (**M45**). The live
-  session path stays semi-honest with dual-execution's ≤1-bit leak until M45 lands — that *security* cannot be
-  established by correctness tests.
+- The **live TLS** state machine + record layer against a real server is done (**M45** ✅), running under both
+  the semi-honest and the malicious authenticated-garbling engine, and the party↔party 2PC has a genuine
+  networked form (`netprep`, TCP-tested). Genuinely remaining (not crypto-primitive work): the KOS Roy22 fix
+  an auditor applies (ships original KOS15), and — for the arithmetic path — end-to-end **malicious
+  generation** of the SPDZ triples (MASCOT sacrifice; `ectf_beaver`, **M38**, runs over authenticated Beaver
+  but its triples are dealt honestly). Both are audit-gate items, not blockers of the live session.
 
 ### M28 — Verdict: the committee exit no one can subpoena ✅ (decrypt-direction, runnable end-to-end; real clearnet exit + DKG liveness deferred)
 The product wiring of the M12/M20/M22 committee crypto into a **runnable** exit whose operators are
@@ -316,11 +318,11 @@ enumerate and burn the whole fleet — the classic way nation-states kill bridge
 
 ### Post-live-network wave ⬜ (from research stack → real, operable, trustworthy)
 
-The core crypto and the frontier research are shipped; the live network runs. The highest-leverage work
-now is turning that into something people can *use, operate, and trust*, and closing the last named gaps
-to end-to-end malicious security and a live MPC-TLS session. These are **achievable engineering** (not
-open research), sequenced roughly by leverage-per-effort. (Several finish or re-scope an existing ⬜:
-noted inline.)
+The core crypto and the frontier research are shipped; the live network runs; the malicious-secure 2PC-TLS
+stack now runs **live** against a real TLS 1.3 server (M45). The highest-leverage work now is turning that
+into something people can *use, operate, and trust*. These are **achievable engineering** (not open
+research), sequenced roughly by leverage-per-effort. (Several finish or re-scope an existing ⬜: noted
+inline.)
 
 - **M37 — Local SOCKS5/HTTP-CONNECT proxy front-end** ⬜ ("point any app at neo") · ~1–2 wk. The built,
   tested multi-stream mux circuit (`neo-node::mux`) is only reachable via `neo send` / the Mac FFI. Add
@@ -358,8 +360,9 @@ noted inline.)
   `AUDIT_SCOPE.md` (exact crates/commits in/out, each labelled built/proven/deployed), a threat-model→code
   traceability matrix, a reproducible build, and a consolidated KAT/test-vector corpus. No new runtime
   code; high leverage.
-- **M45 — Live 2PC-TLS: drive the complete stack against a real TLS 1.3 server** ✅ (interop-verified,
-  **both engines** — networked preprocessing + hardening remain). Built in `neo-mpc::mpc_tls::live`: a real
+- **M45 — Live 2PC-TLS: drive the complete stack against a real TLS 1.3 server** ✅ **done**
+  (interop-verified against stock `rustls`, both engines; audit-gated like all of neo). Built in
+  `neo-mpc::mpc_tls::live`: a real
   TLS 1.3 client state machine (`handshake`) drives split-scalar **P-256 ECDHE** (`ecdhe`, neither party holds
   the ephemeral secret) → the full **RFC 8446 §7.1 key schedule under 2PC** (`schedule`, validated
   byte-for-byte vs the vetted `hkdf`/`hmac`/`sha2` crates) → the **record layer** (`record`:
@@ -386,14 +389,11 @@ noted inline.)
   parser-differential-hardened). Server-cert verification is pluggable (`ServerCertVerifier`): the default
   authenticates the leaf key + transcript signature, and **full X.509 chain-building** to trust anchors
   (issuer path, validity, subject name) is built via vetted `rustls-webpki` behind the `live-tls-webpki`
-  feature (`WebpkiVerifier`, interop-tested). Remaining: routing the *live-TLS record/key-schedule* gadgets
-  through the networked engine (they use the bundled in-process online today — a performance question: the
-  interactive online is one round-trip per AND, so a full handshake wants the **constant-round** networked
-  online). For **AES-GCM**: a correct **AES-128 boolean circuit** (`mpc_tls::aes`, GF(2⁸)-inverse S-box) is
-  built + validated against FIPS-197 + the stock `aes` crate, with a **2PC AES-CTR keystream** gadget
-  (`share_aes_keystream`) — the remaining piece is GHASH (a GF(2¹²⁸) MAC, like the existing Poly1305 tag) to
-  assemble the full GCM AEAD. **x25519** (a Montgomery-curve ECtF) remains a separate primitive. Unblocks the
-  **M33** attestor.
+  feature (`WebpkiVerifier`, interop-tested). **This is M45 complete**: a real TLS 1.3 session
+  (`TLS_CHACHA20_POLY1305_SHA256` + `secp256r1`) driven end to end against an actual server, both semi-honest
+  and malicious, with real X.509 chain-building + KeyUpdate — plus the full networked two-party 2PC as a
+  bonus. Interop breadth + performance (alternate ciphersuites/curves, the constant-round networked online)
+  are **M47**, not M45. Unblocks the **M33** attestor.
 - **M46 — Client store distribution + one-core consolidation** ⬜ (finishes **M8**'s deferred half) ·
   ~2–3 wk. The clients already exist and run on the shared `neo-netstack` + `neo-node` core: **`../neo-mac`**
   (React Native — ships **macOS + Android APK** today, iOS from the same tree) and **`../neo-linux`** (Rust
@@ -401,11 +401,21 @@ noted inline.)
   notarized macOS release + **iOS TestFlight/App-Store**, a signed **Play-Store AAB**, reproducible signed
   release pipelines for all three, and pinning the three clients to a single audited core version (a
   shared FFI so they don't drift). Mobile is where censorship-circumvention demand is highest.
+- **M47 — Live 2PC-TLS interop breadth + performance** ⬜ (post-M45 extensions; each a bounded add on top of
+  the shipped stack). Four independent pieces, largest first: (a) **constant-round networked online** — the
+  live-TLS record/key-schedule gadgets use the bundled in-process online today; the interactive networked
+  online (`netprep::eval_authenticated`) is one round-trip per AND, so a *networked-party* full handshake at
+  practical speed wants WRK17/KRRW18 **authenticated garbling networked** (constant-round). (b) **AES-GCM** —
+  the AES-128 circuit + 2PC AES-CTR keystream (`mpc_tls::aes`) are built + validated (FIPS-197 + stock `aes`);
+  remaining is **GHASH** (a GF(2¹²⁸) MAC, structurally the existing Poly1305 tag) to assemble the GCM AEAD,
+  then `TLS_AES_128_GCM_SHA256`. (c) **x25519** — a Montgomery-curve ECtF (today's `ectf` is short-Weierstrass
+  P-256) to negotiate the dominant TLS 1.3 group. (d) **KeyUpdate/0-RTT/HRR** breadth + multi-record
+  streaming. None is on the M45 critical path — that milestone is one working ciphersuite/curve end to end.
 
 Also re-scoped by the above: **M27** (REALITY) — the remaining flagship piece is proxying the upstream's
 genuine ServerHello on the authenticated path (byte-identical handshake), ~3–4 wk of systems work reusing
 `reverse_proxy_decoy` + the ClientHello codec; **M30** (fixed-cell constant-rate) and **M33** (attestor)
-become concretely achievable once M45 lands.
+are concretely achievable now that **M45** has landed.
 
 ---
 

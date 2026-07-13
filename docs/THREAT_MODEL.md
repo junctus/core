@@ -10,7 +10,7 @@
 | On-path censor | blocks by IP/SNI/protocol, active probing | decentralized DoH rendezvous; obfuscation ladder; REALITY-style authenticate/decoy split (M23) | full-session TLS indistinguishability still open — the auth path sends no ServerHello (M27) |
 | Colluding relays | run several nodes on your path | k-of-n slicing: fewer than k shares reveal nothing; onion layering | collusion ≥ k on one request's paths degrades it |
 | Global passive observer | watches all links at once | cover traffic + Poisson timing mixing (M5) | costs latency/bandwidth; imperfect at tiny scale |
-| Malicious exit | inspects/tampers with clearnet traffic | fresh per-request exits (M7); committee exit + threshold-decrypt (M12/M28); malicious-secure 2PC-TLS crypto stack (M24) | plaintext to a clearnet site is inherently visible to *some* egress; live MPC-TLS integration pending |
+| Malicious exit | inspects/tampers with clearnet traffic | fresh per-request exits (M7); committee exit + threshold-decrypt (M12/M28); malicious-secure 2PC-TLS crypto stack (M24), live against a real TLS 1.3 server (M45) | plaintext to a clearnet site is inherently visible to *some* egress; all audit-gated |
 | Sybil attacker | floods fake nodes to map/deanonymize | bandwidth credits make identities costly (M10); VRF paths (M11) | open problem; residual risk during bootstrap |
 | Quantum "harvest now" | records today, decrypts later | PQ-hybrid handshake + onion packets from day one | depends on PQ primitive assumptions |
 
@@ -43,5 +43,5 @@ The full adversarial internal review — every finding across all rounds (includ
 CRITICAL Sphinx breaks, now fixed) with its fix — is in [`SECURITY_REVIEW.md`](SECURITY_REVIEW.md).
 
 Still ahead: REALITY **full-session** indistinguishability (the auth path completes only the ClientHello
-— M27); live MPC-TLS integration against a real server (M45; the crypto stack is built + verified, M24);
-and — the hard gate — the **external security + cryptography audit**.
+— M27); and — the hard gate — the **external security + cryptography audit**. (Live MPC-TLS against a real
+server landed in M45 — interop-verified against stock `rustls`, both semi-honest and malicious engines.)

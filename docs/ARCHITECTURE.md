@@ -42,9 +42,11 @@ client
 No relay ever holds a complete, readable flow (slicing over node-disjoint paths); no hop learns more
 than its next hop (Sphinx); no minority of an exit committee can read the request (threshold VSS), and
 the committee *decrypt* path assembles the key/plaintext at no single party (M28). The full two-party
-**MPC-TLS** send path (a TLS session whose key is never assembled at one party) exists as a complete,
-adversarially-verified **crypto stack** (M24) but is **not yet integrated into a live session** (M45) —
-so the committee-exit box above is the live threshold path, not yet the full 2PC-TLS one.
+**MPC-TLS** send path (a TLS session whose key is never assembled at one party) is a complete,
+adversarially-verified **crypto stack** (M24) that **runs live** against a real TLS 1.3 server (M45 —
+interop-verified against stock `rustls`, both semi-honest and malicious engines, with real X.509
+chain-building + KeyUpdate). Both the committee-exit box above and the full 2PC-TLS path are live and
+audit-gated.
 
 ## Crates
 
