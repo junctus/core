@@ -31,8 +31,12 @@ use crate::discovery;
 /// Seconds a relay's published record stays valid; it re-registers well inside
 /// this so a healthy relay never lapses out of a snapshot.
 const RELAY_RECORD_TTL: u64 = 1800;
-/// Heartbeat gap between re-registrations.
-const RELAY_HEARTBEAT: Duration = Duration::from_secs(600);
+/// Heartbeat gap between re-registrations. Kept short so that if a seed loses its
+/// in-memory registry (a seed restart), relays re-announce — and are re-attested by
+/// the next dial-back — within a couple of minutes instead of lapsing to `relays=0`
+/// for a full re-announce cycle. Comfortably below the seed's per-IP register cooldown
+/// multiple and far below `RELAY_RECORD_TTL`.
+const RELAY_HEARTBEAT: Duration = Duration::from_secs(120);
 
 /// A relay's next-hop address book: `NodeId → dialable address`, refreshed from
 /// the discovery snapshot so it can forward onions to any known relay.
