@@ -124,12 +124,15 @@ sudo ANNOUNCE_ADDR=<your-public-ip>:443 EXIT=1 \
 The identity persists at `/var/lib/neo-relay/relay.key`, so the relay keeps a stable node id —
 and its attested listing — across restarts. **Never delete it.**
 
-### Open the port
+### Open the ports
 
-The relay port (the one in `ANNOUNCE_ADDR`) **must be open inbound** in your firewall / cloud
-security group. It is needed both for client connections and for the seed's **dial-back health
-check** — until that succeeds the relay is registered but *not* attested, so it will not appear
-in snapshots.
+Two inbound TCP ports must be open in your firewall / cloud security group:
+
+- **The relay port** (the one in `ANNOUNCE_ADDR`, e.g. `443`) — for client connections and for
+  the seed's **dial-back health check** (until it succeeds the relay is registered but *not*
+  attested, so it won't appear in snapshots).
+- **`9700`** — every relay also runs the networked 2PC-TLS co-processor endpoint (see below).
+  Override the address with `--mpc2pc-listen`.
 
 ### Verify and manage
 
@@ -150,11 +153,12 @@ Drop `--exit` for a forward-only relay. The baked-in seeds find the public netwo
 your own with `NEO_MIRRORS`/`NEO_WITNESSES`. On a low-RAM VPS the default LTO release profile
 can OOM — build with `CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16`.
 
-### Optional: 2PC-TLS co-processor endpoint (experimental)
+### The 2PC-TLS co-processor endpoint (always on)
 
-Add `--mpc2pc-listen 0.0.0.0:9700` to `neo run` (or `MPC2PC=0.0.0.0:9700` to `install.sh`) to
-also serve networked two-party 2PC-TLS sessions on a second port, in-process alongside the
-relay. Open that port inbound too; peers connect with `neo mpc2pc --connect <relay-ip>:9700`.
+Every relay serves a networked two-party 2PC-TLS endpoint in-process on **`0.0.0.0:9700`** —
+running a relay means running this. Peers connect with `neo mpc2pc --connect <relay-ip>:9700`
+(add `--full` for the whole networked handshake key agreement). Override the bind with
+`--mpc2pc-listen <addr>` (or `MPC2PC=<addr>` to `install.sh`). Keep port `9700` open inbound.
 
 ## License
 

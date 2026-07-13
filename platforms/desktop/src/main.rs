@@ -78,10 +78,10 @@ enum Command {
         /// Bridge a TUN device through the tunnel (needs `--features tun` and root).
         #[arg(long)]
         tun: bool,
-        /// Also stand up a networked 2PC-TLS co-processor endpoint on this address
-        /// (party A / garbler), served in-process alongside the node — one session per
-        /// inbound connection. Off by default. On a relay, open this TCP port in the
-        /// firewall; peers reach it with `neo mpc2pc --connect <this-addr>`.
+        /// Override the address for the networked 2PC-TLS co-processor endpoint. Relays
+        /// **always** serve it (default `0.0.0.0:9700`) — open that TCP port in the
+        /// firewall; peers reach it with `neo mpc2pc --connect <this-addr>`. On a
+        /// non-relay node, passing this is what turns the endpoint on.
         #[arg(long = "mpc2pc-listen")]
         mpc2pc_listen: Option<String>,
     },
@@ -316,10 +316,16 @@ async fn main() -> anyhow::Result<()> {
             tun,
             mpc2pc_listen,
         } => {
-            // Opt-in: stand up the networked 2PC-TLS co-processor endpoint in-process,
-            // on its own thread, alongside the node/relay. Default off — no behavior
-            // change unless `--mpc2pc-listen` is passed.
-            if let Some(addr) = mpc2pc_listen {
+            // The networked 2PC-TLS co-processor is a **mandatory part of being a relay**:
+            // every relay stands the endpoint up in-process (default `0.0.0.0:9700`,
+            // overridable with `--mpc2pc-listen`). A non-relay node only serves it if the
+            // flag is given explicitly.
+            let mpc_addr = if relay {
+                Some(mpc2pc_listen.unwrap_or_else(|| "0.0.0.0:9700".to_string()))
+            } else {
+                mpc2pc_listen
+            };
+            if let Some(addr) = mpc_addr {
                 std::thread::spawn(move || {
                     // The standing relay endpoint serves the lighter demo session (low
                     // bandwidth); the full key-agreement driver is an on-demand `--full` run.
