@@ -29,29 +29,17 @@
 
 use std::collections::HashSet;
 
-use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use neo_core::{Error, Result};
 
 use super::circuit::Circuit;
 use super::garble::{decode, evaluate, AndTable, Garbler, Label};
+use super::kos;
 use super::live::channel::Channel;
-use super::ot;
 
 /// AND tables streamed per `ch.send`/`recv` on flight 1 — 32 KiB of scratch, so neither
 /// party ever buffers the whole (message-sized) table set. The wire bytes are identical to
 /// one big send (the channel is an unframed byte stream).
 const TABLES_PER_CHUNK: usize = 1024;
-
-fn point_bytes(p: &RistrettoPoint) -> [u8; 32] {
-    p.compress().to_bytes()
-}
-
-fn read_point(buf: &[u8]) -> Result<RistrettoPoint> {
-    CompressedRistretto::from_slice(buf)
-        .map_err(|_| Error::Crypto("garble-net: bad point length".into()))?
-        .decompress()
-        .ok_or_else(|| Error::Crypto("garble-net: invalid Ristretto point".into()))
-}
 
 fn label16(buf: &[u8]) -> Label {
     buf.try_into().expect("16-byte label")
@@ -111,25 +99,14 @@ pub fn garbler_run(
             tail.extend_from_slice(&g.input_label(w, bit));
         }
     }
-    let mut setups = Vec::with_capacity(evs.len());
-    for _ in &evs {
-        let s = ot::sender_setup()?;
-        tail.extend_from_slice(&point_bytes(&s.s));
-        setups.push(s);
-    }
-    ch.send(&tail)?; // [flight 1]
+    ch.send(&tail)?; // [flight 1: tables ‖ decoding ‖ garbler-labels]
 
-    // Flight 2 (recv): the OT receiver points. Flight 3 (send): the OT ciphertexts.
-    let r_raw = ch.recv_exact(evs.len() * 32)?; // [flight 2]
-    let mut f3 = Vec::with_capacity(evs.len() * 32);
-    for (i, &w) in evs.iter().enumerate() {
-        let r = read_point(&r_raw[i * 32..i * 32 + 32])?;
-        let (m0, m1) = g.ot_pair(w);
-        let (e0, e1) = ot::sender_send(&setups[i], &r, &m0, &m1);
-        f3.extend_from_slice(&e0);
-        f3.extend_from_slice(&e1);
-    }
-    ch.send(&f3)?; // [flight 3]
+    // Transfer the evaluator's input labels via ONE **KOS OT-extension** (a constant ~128
+    // base OTs + cheap symmetric extension for all wires) instead of a Chou–Orlandi base OT
+    // per wire — the dominant cost once garbling is fast. `ot_pair(w) = (W₀, W₀⊕Δ)` are the
+    // wire's two labels; the evaluator learns only the one for its bit.
+    let messages: Vec<(Label, Label)> = evs.iter().map(|&w| g.ot_pair(w)).collect();
+    kos::cot_sender(ch, &messages)?;
     Ok(())
 }
 
@@ -169,7 +146,7 @@ pub fn evaluator_run(
         remaining -= take;
     }
 
-    let tail = ch.recv_exact(dec_bytes + lbl + evs.len() * 32)?;
+    let tail = ch.recv_exact(dec_bytes + lbl)?;
     let mut off = 0;
 
     let decoding: Vec<bool> = (0..n_out)
@@ -185,28 +162,13 @@ pub fn evaluator_run(
             gi += 1;
         }
     }
-    off += lbl;
 
-    let s_points: Vec<RistrettoPoint> = (0..evs.len())
-        .map(|i| read_point(&tail[off + i * 32..off + i * 32 + 32]))
-        .collect::<Result<_>>()?;
-
-    // Flight 2 (send): OT receiver responses; keep the receiver state for finishing.
-    let mut r_out = Vec::with_capacity(evs.len() * 32);
-    let mut choices = Vec::with_capacity(evs.len());
-    for (i, &w) in evs.iter().enumerate() {
-        let rc = ot::receiver_choose(&s_points[i], inputs[w])?;
-        r_out.extend_from_slice(&point_bytes(&rc.r));
-        choices.push((rc, s_points[i]));
-    }
-    ch.send(&r_out)?; // [flight 2]
-
-    // Flight 3 (recv): OT ciphertexts → the evaluator's input labels.
-    let e_raw = ch.recv_exact(evs.len() * 32)?; // [flight 3]
-    for (i, &w) in evs.iter().enumerate() {
-        let e0 = label16(&e_raw[i * 32..i * 32 + 16]);
-        let e1 = label16(&e_raw[i * 32 + 16..i * 32 + 32]);
-        labels[w] = ot::receiver_finish(&choices[i].0, &choices[i].1, &e0, &e1);
+    // Fetch the evaluator's own input labels via KOS OT-extension (constant base OTs +
+    // symmetric extension), replacing a base OT per wire.
+    let evchoices: Vec<bool> = evs.iter().map(|&w| inputs[w]).collect();
+    let ev_labels = kos::cot_receiver(ch, &evchoices)?;
+    for (&w, label) in evs.iter().zip(ev_labels) {
+        labels[w] = label;
     }
 
     // Local, non-interactive evaluation + decode.
