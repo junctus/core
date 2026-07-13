@@ -44,8 +44,10 @@
 //!   `SHA-256(x-coordinate)` under 2PC, x never assembled — validated against the
 //!   vetted `p256` and NIST-KAT SHA-256.
 //! - **Malicious-secure 2PC stack** — *built*: malicious OT ([`kos`], KOS correlation
-//!   check) → malicious `F_pre` ([`wrk17`]: aBits over KOS, `aAND` triples via
-//!   bucketing) → the **constant-round malicious online** ([`authgarble`]: WRK17/KRRW18
+//!   check — with a **networked two-party form** [`kos::cot_sender`]/[`kos::cot_receiver`]
+//!   driving [`netprep`]'s over-the-wire authenticated bits, TCP-tested incl. the
+//!   cheating-receiver abort) → malicious `F_pre` ([`wrk17`]: aBits over KOS, `aAND`
+//!   triples via bucketing) → the **constant-round malicious online** ([`authgarble`]: WRK17/KRRW18
 //!   **authenticated garbling** — every wire a doubly-authenticated `{x}`, each AND a
 //!   half-gate pair, a corrupted garbled row ⇒ abort). Correctness + the abort mechanism
 //!   are tested; [`wrk17`] also has the equivalent interactive online, and the
@@ -74,9 +76,12 @@
 //!   **malicious authenticated-garbling online** (`client_handshake_with_engine`) — the
 //!   malicious key schedule is tested to match the stock RFC 8446 schedule and a malicious
 //!   record round-trips; the full malicious handshake is an `#[ignore]`d ~15-min interop
-//!   test. *Party↔party* 2PC stays modelled in-process (the crate's standing boundary), so
-//!   the malicious residual is the **networked** aBit preprocessing; other hardening (full
-//!   X.509 chain-building, more ciphersuites/curves, KeyUpdate) is systems work.
+//!   test. *Party↔party* 2PC is modelled in-process for the online, but its **foundation
+//!   is now networked**: [`netprep`] runs authenticated-bit preprocessing as a genuine
+//!   two-party protocol over a [`Channel`](live::channel::Channel) (malicious KOS-COT,
+//!   TCP-tested with the cheating-receiver abort). What remains is composing that up
+//!   (both-direction aBits → `leaky_and` → bucketing → the online's distributed shares)
+//!   and other hardening (full X.509 chain-building, more ciphersuites/curves, KeyUpdate).
 //! - The **external audit** gate, as everywhere in neo.
 
 pub mod auth;
@@ -91,6 +96,7 @@ pub mod hkdf;
 pub mod kos;
 pub mod live;
 pub mod mta;
+pub mod netprep;
 pub mod ot;
 pub mod ot_ext;
 pub mod poly1305;

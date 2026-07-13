@@ -371,9 +371,13 @@ noted inline.)
   (`EngineKind`): the whole session — key schedule + every record — also runs under the **malicious
   WRK17/KRRW18 authenticated-garbling online** (`client_handshake_with_engine`); the malicious key schedule
   is tested to match the stock RFC 8446 schedule, a malicious record round-trips, and the full malicious
-  handshake is an `#[ignore]`d ~15-min interop test. Remaining: the **networked** aBit `F_pre` preprocessing
-  (party↔party 2PC stays modelled in-process — the crate's standing boundary) and hardening (full X.509
-  chain-building to trust anchors, other ciphersuites/curves, KeyUpdate/0-RTT). Unblocks the **M33** attestor.
+  handshake is an `#[ignore]`d ~15-min interop test. The **networked preprocessing foundation is built**
+  (`neo-mpc::mpc_tls::netprep` + `kos::cot_sender`/`cot_receiver`): authenticated-bit generation runs as a
+  genuine two-party protocol over a `Channel` via the malicious KOS-COT, **tested over real TCP sockets**
+  including the cheating-receiver abort and IT-MAC forgery rejection. Remaining: composing it up (both-
+  direction aBits → `leaky_and` → bucketing → the online's distributed shares — the in-process
+  `bucketed_and_triples` is the reference) and hardening (full X.509 chain-building to trust anchors, other
+  ciphersuites/curves, KeyUpdate/0-RTT). Unblocks the **M33** attestor.
 - **M46 — Client store distribution + one-core consolidation** ⬜ (finishes **M8**'s deferred half) ·
   ~2–3 wk. The clients already exist and run on the shared `neo-netstack` + `neo-node` core: **`../neo-mac`**
   (React Native — ships **macOS + Android APK** today, iOS from the same tree) and **`../neo-linux`** (Rust

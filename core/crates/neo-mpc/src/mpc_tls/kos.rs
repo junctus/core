@@ -35,8 +35,12 @@
 //! - It rests on the **semi-honest base OT** ([`ot`]) being run honestly; KOS's own
 //!   proof assumes an ideal/committed base OT (`κ` of them, the cheap public-key
 //!   part). The correlation-robust hash is BLAKE3, as elsewhere.
-//! - Both parties are modelled **in-process** (as the rest of this crate); the check
-//!   messages `(x, t)` are one extra flight a deployment sends over the wire.
+//! - [`extend`] models both parties **in-process** (as most of this crate). The
+//!   **networked** two-party form is [`cot_sender`]/[`cot_receiver`]: the identical
+//!   extension (base OTs, the `u` columns, the `(x, t)` check flight, the masked outputs)
+//!   run over a [`Channel`](super::live::channel::Channel) with each party holding only
+//!   its own secrets — the foundation of [`netprep`](super::netprep)'s networked
+//!   authenticated bits, tested over real TCP incl. the cheating-receiver abort.
 //! - **Roy22 caveat (for the audit):** this is the *original* KOS15 correlation check.
 //!   Roy (SoftSpokenOT, CRYPTO 2022) found a **subtle gap** in KOS15's proof that stood
 //!   for ~a decade; the fix is small and uses the same random-linear-combination idea.
@@ -45,8 +49,10 @@
 //! - Correctness and cheating-receiver **detection** are what the tests establish;
 //!   the formal malicious-OT guarantee is KOS's proof (with the Roy22 fix) + the audit.
 
+use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use neo_core::{Error, Result};
 
+use super::live::channel::Channel;
 use super::ot;
 
 /// Base-OT / security parameter (field width `κ = 128`).
@@ -188,6 +194,208 @@ fn extend_core(
     Ok(out)
 }
 
+// ── Networked KOS-COT: the same extension as `extend`, but the two parties are
+//    separate state machines exchanging messages over a `Channel`, each holding only its
+//    own secrets (neither function sees both sides). `extend` above is the in-process
+//    reference; these run the identical computation, split by role. Used to generate
+//    authenticated bits (`super::netprep`) between two networked parties.
+
+fn point_bytes(p: &RistrettoPoint) -> [u8; 32] {
+    p.compress().to_bytes()
+}
+
+fn read_point(buf: &[u8]) -> Result<RistrettoPoint> {
+    let c = CompressedRistretto::from_slice(buf)
+        .map_err(|_| Error::Crypto("KOS-net: bad point length".into()))?;
+    c.decompress()
+        .ok_or_else(|| Error::Crypto("KOS-net: invalid Ristretto point".into()))
+}
+
+/// Networked KOS OT-extension — **receiver** role (holds the choice bits). Runs the
+/// full extension (base OTs, `u` columns, GF(2^128) correlation check, output recovery)
+/// over `ch`, returning the receiver's chosen messages. In a correlated OT (COT) for
+/// authenticated bits, `choices` are the bits and the returned values are the MACs
+/// `Mᵢ = Kᵢ ⊕ choiceᵢ·Δ`. Aborts if the sender signals a failed check.
+pub fn cot_receiver(ch: &mut dyn Channel, choices: &[bool]) -> Result<Vec<[u8; 16]>> {
+    cot_receiver_core(ch, choices, |_| {})
+}
+
+/// [`cot_receiver`] with a `cheat` hook that may tamper the `u` columns before they are
+/// sent — used by tests to model a malicious receiver the sender's check must catch.
+fn cot_receiver_core(
+    ch: &mut dyn Channel,
+    choices: &[bool],
+    cheat: impl Fn(&mut [u8]),
+) -> Result<Vec<[u8; 16]>> {
+    let m = choices.len();
+    let ell = m + K + SIGMA;
+    let col_bytes = ell.div_ceil(8);
+
+    // Choice column r: real for [0,m), random blinders for the check rows.
+    let mut r = choices.to_vec();
+    r.extend(random_bits(K + SIGMA)?);
+
+    // K seed pairs → t0/t1 columns; the receiver is the base-OT *sender*.
+    let mut seed0 = vec![[0u8; 16]; K];
+    let mut seed1 = vec![[0u8; 16]; K];
+    for j in 0..K {
+        getrandom::getrandom(&mut seed0[j]).map_err(|e| Error::Rng(e.to_string()))?;
+        getrandom::getrandom(&mut seed1[j]).map_err(|e| Error::Rng(e.to_string()))?;
+    }
+    let t0: Vec<Vec<u8>> = seed0.iter().map(|s| prg(s, col_bytes)).collect();
+    let t1: Vec<Vec<u8>> = seed1.iter().map(|s| prg(s, col_bytes)).collect();
+
+    // Base OTs: send K setup points, receive K response points, send K ciphertexts.
+    let setups: Vec<ot::SenderSetup> = (0..K).map(|_| ot::sender_setup()).collect::<Result<_>>()?;
+    let mut s_pts = Vec::with_capacity(K * 32);
+    for st in &setups {
+        s_pts.extend_from_slice(&point_bytes(&st.s));
+    }
+    ch.send(&s_pts)?; // [send1]
+
+    let r_pts_raw = ch.recv_exact(K * 32)?; // [recv1]
+    let mut e_bytes = Vec::with_capacity(K * 32);
+    for j in 0..K {
+        let r_pt = read_point(&r_pts_raw[j * 32..j * 32 + 32])?;
+        let (e0, e1) = ot::sender_send(&setups[j], &r_pt, &seed0[j], &seed1[j]);
+        e_bytes.extend_from_slice(&e0);
+        e_bytes.extend_from_slice(&e1);
+    }
+    ch.send(&e_bytes)?; // [send2]
+
+    // uⱼ = t0ⱼ ⊕ t1ⱼ ⊕ r; send all columns.
+    let r_bytes = bits_to_bytes(&r);
+    let u: Vec<Vec<u8>> = (0..K)
+        .map(|j| {
+            (0..col_bytes)
+                .map(|b| t0[j][b] ^ t1[j][b] ^ r_bytes[b])
+                .collect()
+        })
+        .collect();
+    let mut u_flat = Vec::with_capacity(K * col_bytes);
+    for col in &u {
+        u_flat.extend_from_slice(col);
+    }
+    cheat(&mut u_flat); // honest run: no-op; a malicious receiver deviates here.
+    ch.send(&u_flat)?; // [send3]
+
+    // Both parties bind χ to the *sent* `u` (Fiat–Shamir); the receiver still opens its
+    // HONEST (t0, r) below, so a cheater who altered `u` makes the sender's q inconsistent
+    // and the check fails — the KOS malicious guarantee, now over the wire.
+    let u_sent: Vec<Vec<u8>> = (0..K)
+        .map(|j| u_flat[j * col_bytes..(j + 1) * col_bytes].to_vec())
+        .collect();
+    let chi = derive_chi(&u_sent, ell);
+    let mut x = 0u128;
+    let mut t_val = 0u128;
+    for (i, &chi_i) in chi.iter().enumerate() {
+        if r[i] {
+            x ^= chi_i;
+        }
+        t_val ^= gf_mul(chi_i, row_u128(&t0, i));
+    }
+    let mut check = Vec::with_capacity(32);
+    check.extend_from_slice(&x.to_be_bytes());
+    check.extend_from_slice(&t_val.to_be_bytes());
+    ch.send(&check)?; // [send4]
+
+    // Sender's verdict, then the masked outputs.
+    let status = ch.recv_exact(1)?; // [recv2]
+    if status[0] != 1 {
+        return Err(Error::Crypto(
+            "KOS-net: sender reported correlation-check failure (abort)".into(),
+        ));
+    }
+    let y = ch.recv_exact(m * 32)?; // [recv3]
+    let mut out = Vec::with_capacity(m);
+    for i in 0..m {
+        let y0: [u8; 16] = y[i * 32..i * 32 + 16].try_into().expect("16");
+        let y1: [u8; 16] = y[i * 32 + 16..i * 32 + 32].try_into().expect("16");
+        let pad = h(i, &row16(&t0, i));
+        let chosen = if choices[i] { &y1 } else { &y0 };
+        out.push(xor16(chosen, &pad));
+    }
+    Ok(out)
+}
+
+/// Networked KOS OT-extension — **sender** role (holds the `messages` pairs). Runs the
+/// extension over `ch` and, if the receiver's correlation check passes, delivers the
+/// masked outputs; **returns an error (abort) if the check fails**. In a COT the caller
+/// supplies `messages[i] = (Kᵢ, Kᵢ⊕Δ)` and keeps the `Kᵢ` as its per-bit keys — the
+/// sender learns nothing new, so this returns `()` on success.
+pub fn cot_sender(ch: &mut dyn Channel, messages: &[([u8; 16], [u8; 16])]) -> Result<()> {
+    let m = messages.len();
+    let ell = m + K + SIGMA;
+    let col_bytes = ell.div_ceil(8);
+
+    // Base-OT secret s; the sender is the base-OT *receiver* (choice sⱼ learns seed_{sⱼ}ⱼ).
+    let s = random_bits(K)?;
+    let s_pts_raw = ch.recv_exact(K * 32)?; // [recv1]
+    let mut choices_rc = Vec::with_capacity(K);
+    let mut r_pts = Vec::with_capacity(K * 32);
+    let mut setup_s = Vec::with_capacity(K);
+    for j in 0..K {
+        let sp = read_point(&s_pts_raw[j * 32..j * 32 + 32])?;
+        let rc = ot::receiver_choose(&sp, s[j])?;
+        r_pts.extend_from_slice(&point_bytes(&rc.r));
+        choices_rc.push(rc);
+        setup_s.push(sp);
+    }
+    ch.send(&r_pts)?; // [send1]
+
+    let e_raw = ch.recv_exact(K * 32)?; // [recv2]
+    let mut qseed = vec![[0u8; 16]; K];
+    for j in 0..K {
+        let e0: [u8; 16] = e_raw[j * 32..j * 32 + 16].try_into().expect("16");
+        let e1: [u8; 16] = e_raw[j * 32 + 16..j * 32 + 32].try_into().expect("16");
+        qseed[j] = ot::receiver_finish(&choices_rc[j], &setup_s[j], &e0, &e1);
+    }
+
+    // Receive u; qⱼ = PRG(seed_{sⱼ}ⱼ) ⊕ (sⱼ · uⱼ).
+    let u_flat = ch.recv_exact(K * col_bytes)?; // [recv3]
+    let u: Vec<Vec<u8>> = (0..K)
+        .map(|j| u_flat[j * col_bytes..(j + 1) * col_bytes].to_vec())
+        .collect();
+    let q: Vec<Vec<u8>> = (0..K)
+        .map(|j| {
+            let base = prg(&qseed[j], col_bytes);
+            (0..col_bytes)
+                .map(|b| base[b] ^ if s[j] { u[j][b] } else { 0 })
+                .collect()
+        })
+        .collect();
+
+    // Correlation check: q_val == t ⊕ x⊗s.
+    let chi = derive_chi(&u, ell);
+    let check = ch.recv_exact(32)?; // [recv4]
+    let x = u128::from_be_bytes(check[0..16].try_into().expect("16"));
+    let t_val = u128::from_be_bytes(check[16..32].try_into().expect("16"));
+    let mut q_val = 0u128;
+    for (i, &chi_i) in chi.iter().enumerate() {
+        q_val ^= gf_mul(chi_i, row_u128(&q, i));
+    }
+    let s_field = u128::from_be_bytes(bits_to_bytes16(&s));
+    if q_val != t_val ^ gf_mul(x, s_field) {
+        let _ = ch.send(&[0u8]); // signal abort to the receiver (best-effort)
+        return Err(Error::Crypto(
+            "KOS-net: correlation check failed — cheating receiver detected (abort)".into(),
+        ));
+    }
+    ch.send(&[1u8])?; // [send2] check passed
+
+    // Masked outputs y0ᵢ = m0ᵢ ⊕ H(i, qᵢ), y1ᵢ = m1ᵢ ⊕ H(i, qᵢ⊕s).
+    let s_bytes = bits_to_bytes16(&s);
+    let mut y = Vec::with_capacity(m * 32);
+    for (i, msg) in messages.iter().enumerate() {
+        let q_row = row16(&q, i);
+        let q_xor_s: [u8; 16] = core::array::from_fn(|b| q_row[b] ^ s_bytes[b]);
+        y.extend_from_slice(&xor16(&msg.0, &h(i, &q_row)));
+        y.extend_from_slice(&xor16(&msg.1, &h(i, &q_xor_s)));
+    }
+    ch.send(&y)?; // [send3]
+    Ok(())
+}
+
 /// Fiat–Shamir weights `χᵢ ∈ GF(2^128)` bound to the committed `u` columns, so the
 /// receiver cannot choose `u` after seeing the challenge.
 fn derive_chi(u: &[Vec<u8>], ell: usize) -> Vec<u128> {
@@ -273,13 +481,69 @@ fn random_bits(n: usize) -> Result<Vec<bool>> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::live::channel::TcpChannel;
     use super::*;
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
 
     fn msg(seed: u8) -> ([u8; 16], [u8; 16]) {
         (
             core::array::from_fn(|i| seed.wrapping_add(i as u8)),
             core::array::from_fn(|i| seed.wrapping_mul(3).wrapping_add(i as u8)),
         )
+    }
+
+    /// Run a networked COT over a loopback TCP pair: sender (messages) on a thread,
+    /// receiver (choices, possibly cheating) on this thread. Returns both results.
+    fn run_net_cot(
+        choices: Vec<bool>,
+        messages: Vec<([u8; 16], [u8; 16])>,
+        cheat: impl Fn(&mut [u8]),
+    ) -> (Result<()>, Result<Vec<[u8; 16]>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sender = thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let mut ch = TcpChannel::from_stream(sock);
+            cot_sender(&mut ch, &messages)
+        });
+        let mut ch = TcpChannel::from_stream(TcpStream::connect(addr).unwrap());
+        let recv = cot_receiver_core(&mut ch, &choices, cheat);
+        (sender.join().unwrap(), recv)
+    }
+
+    #[test]
+    fn networked_cot_matches_the_correlation_and_aborts_on_cheat() {
+        // Honest run: the receiver's chosen outputs equal the sender's messages for the
+        // chosen bits (this is exactly the COT correlation the aBit layer relies on).
+        let choices = vec![true, false, true, true, false, false, true, false];
+        let messages: Vec<([u8; 16], [u8; 16])> =
+            (0..choices.len()).map(|i| msg(i as u8)).collect();
+
+        let (send_res, recv_res) = run_net_cot(choices.clone(), messages.clone(), |_| {});
+        send_res.expect("honest sender completes");
+        let out = recv_res.expect("honest receiver completes");
+        for (i, &c) in choices.iter().enumerate() {
+            let want = if c { messages[i].1 } else { messages[i].0 };
+            assert_eq!(out[i], want, "COT output {i} = chosen message");
+        }
+
+        // Cheating receiver (selective-failure): flip one row's bit across K/2 columns of
+        // `u` before sending. Passing the check would need guessing K/2 = 64 bits of the
+        // sender's secret s, so it aborts except w.p. ~2^-64 — the KOS malicious guarantee,
+        // now enforced over the wire by the sender's GF(2^128) check.
+        let col_bytes = (choices.len() + K + SIGMA).div_ceil(8);
+        let row = 3usize;
+        let cheat = move |u: &mut [u8]| {
+            for j in 0..K / 2 {
+                u[j * col_bytes + row / 8] ^= 1 << (row % 8);
+            }
+        };
+        let (send_res, _recv_res) = run_net_cot(choices, messages, cheat);
+        assert!(
+            send_res.is_err(),
+            "a tampered u must trip the KOS correlation check on the sender"
+        );
     }
 
     #[test]
