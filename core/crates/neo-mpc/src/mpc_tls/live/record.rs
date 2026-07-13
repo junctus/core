@@ -178,27 +178,33 @@ impl Direction {
         Ok(out)
     }
 
-    /// Open one record body but keep the plaintext in XOR-shares (for application data
-    /// that must not be assembled at either party). Returns `(content_type, pt_a, pt_b)`.
+    /// Open one record body but keep the *body* plaintext in XOR-shares (for application
+    /// data that must not be assembled at either party). Returns `(content_type, pt_a,
+    /// pt_b)` where `pt_a ⊕ pt_b` is the content and neither share alone reveals it.
+    ///
+    /// Only the TLSInnerPlaintext *boundary* is opened: the trailing zero-padding run and
+    /// the single content-type byte (structure/length information TLS already exposes via
+    /// record framing) are located by scanning the tail — each tail byte's
+    /// `pt_a[i] ⊕ pt_b[i]` is combined one at a time, stopping at the first non-zero. The
+    /// interior body bytes `[0..end-1]` are **never** XOR-combined, so the content stays
+    /// shared. (In a real garbler/evaluator split this is a per-byte equality-open on the
+    /// tail, not a full-record reveal.)
     pub fn open_shared(&mut self, record_body: &[u8]) -> Result<(u8, Vec<u8>, Vec<u8>)> {
-        let (mut pt_a, pt_b, _tag) =
+        let (mut pt_a, mut pt_b, _tag) =
             open_shares(&self.key_a, &self.key_b, &self.iv, self.seq, record_body)?;
         self.seq += 1;
-        // Split the trailing content-type byte off the (opened) tail. The inner content
-        // type sits after any zero padding; strip padding using the combined tail only.
-        let combined: Vec<u8> = pt_a.iter().zip(&pt_b).map(|(a, b)| a ^ b).collect();
-        let mut end = combined.len();
-        while end > 0 && combined[end - 1] == 0 {
+        // Tail-only scan: combine one byte at a time from the end, never the interior body.
+        let mut end = pt_a.len();
+        while end > 0 && (pt_a[end - 1] ^ pt_b[end - 1]) == 0 {
             end -= 1;
         }
         if end == 0 {
             return Err(Error::Crypto("record: empty TLSInnerPlaintext".into()));
         }
-        let content_type = combined[end - 1];
+        let content_type = pt_a[end - 1] ^ pt_b[end - 1]; // the one opened content-type byte
         pt_a.truncate(end - 1);
-        let mut pb = pt_b;
-        pb.truncate(end - 1);
-        Ok((content_type, pt_a, pb))
+        pt_b.truncate(end - 1);
+        Ok((content_type, pt_a, pt_b))
     }
 }
 

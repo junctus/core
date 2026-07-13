@@ -44,6 +44,14 @@ const REC_ALERT: u8 = 21;
 const REC_HANDSHAKE: u8 = 22;
 const REC_APPLICATION_DATA: u8 = 23;
 
+// A remote server controls every byte after the ClientHello, so every server-driven read
+// loop is bounded to deny liveness/memory DoS (endless CCS spam, a flight with no
+// Finished, endless ticket records): a benign flight is a handful of records and well
+// under a few hundred KiB.
+const MAX_CCS_RECORDS: usize = 2; // RFC 8446 allows one middlebox-compat CCS; tolerate 2
+const MAX_FLIGHT_BYTES: usize = 256 * 1024;
+const MAX_SERVER_RECORDS: usize = 512; // per server-driven read loop
+
 const GROUP_SECP256R1: u16 = 0x0017;
 const CIPHER_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
 const SIG_ECDSA_SECP256R1_SHA256: u16 = 0x0403;
@@ -283,10 +291,19 @@ fn try_take_handshake(buf: &[u8]) -> Option<(Vec<u8>, usize)> {
 fn read_server_flight(ch: &mut dyn Channel, rx: &mut Direction) -> Result<Vec<Vec<u8>>> {
     let mut buf: Vec<u8> = Vec::new();
     let mut msgs: Vec<Vec<u8>> = Vec::new();
-    loop {
+    let mut ccs = 0usize;
+    for _ in 0..MAX_SERVER_RECORDS {
         let (ctype, rec) = read_tls_record(ch)?;
         match ctype {
-            REC_CHANGE_CIPHER_SPEC => continue, // middlebox CCS: drop, no seq/transcript
+            REC_CHANGE_CIPHER_SPEC => {
+                ccs += 1;
+                if ccs > MAX_CCS_RECORDS {
+                    return Err(Error::Crypto(
+                        "tls: too many change_cipher_spec records".into(),
+                    ));
+                }
+                continue; // middlebox CCS: drop, no seq/transcript
+            }
             REC_ALERT => {
                 return Err(Error::Crypto(format!(
                     "tls: server sent a plaintext alert {rec:?}"
@@ -300,6 +317,11 @@ fn read_server_flight(ch: &mut dyn Channel, rx: &mut Direction) -> Result<Vec<Ve
                     )));
                 }
                 buf.extend_from_slice(&pt);
+                if buf.len() + msgs.iter().map(Vec::len).sum::<usize>() > MAX_FLIGHT_BYTES {
+                    return Err(Error::Crypto(
+                        "tls: server flight exceeds size bound".into(),
+                    ));
+                }
             }
             other => {
                 return Err(Error::Crypto(format!(
@@ -316,6 +338,9 @@ fn read_server_flight(ch: &mut dyn Channel, rx: &mut Direction) -> Result<Vec<Ve
             }
         }
     }
+    Err(Error::Crypto(
+        "tls: server flight did not complete within the record bound (no Finished)".into(),
+    ))
 }
 
 /// Drive the full TLS 1.3 client handshake over `ch` against the server named
@@ -333,11 +358,21 @@ pub fn client_handshake(ch: &mut dyn Channel, server_name: &str) -> Result<AppSe
 
     let mut transcript = ch_msg.clone();
 
-    // 2. Read ServerHello (plaintext; skip any leading CCS).
-    let sh_body = loop {
+    // 2. Read ServerHello (plaintext; skip a bounded number of leading CCS records).
+    let mut sh_body = None;
+    let mut ccs = 0usize;
+    for _ in 0..MAX_CCS_RECORDS + 1 {
         let (ctype, rec) = read_tls_record(ch)?;
         match ctype {
-            REC_CHANGE_CIPHER_SPEC => continue,
+            REC_CHANGE_CIPHER_SPEC => {
+                ccs += 1;
+                if ccs > MAX_CCS_RECORDS {
+                    return Err(Error::Crypto(
+                        "tls: too many change_cipher_spec records".into(),
+                    ));
+                }
+                continue;
+            }
             REC_HANDSHAKE => {
                 if rec.first() != Some(&HS_SERVER_HELLO) {
                     return Err(Error::Crypto("tls: expected ServerHello".into()));
@@ -345,12 +380,15 @@ pub fn client_handshake(ch: &mut dyn Channel, server_name: &str) -> Result<AppSe
                 let (msg, _) = try_take_handshake(&rec)
                     .ok_or_else(|| Error::Crypto("tls: truncated ServerHello".into()))?;
                 transcript.extend_from_slice(&msg);
-                break msg[4..].to_vec();
+                sh_body = Some(msg[4..].to_vec());
+                break;
             }
             REC_ALERT => return Err(Error::Crypto("tls: server alert before ServerHello".into())),
             other => return Err(Error::Crypto(format!("tls: unexpected record {other}"))),
         }
-    };
+    }
+    let sh_body = sh_body
+        .ok_or_else(|| Error::Crypto("tls: no ServerHello after change_cipher_spec".into()))?;
     let sh = parse_server_hello(&sh_body)?;
     if sh.selected_version != 0x0304 {
         return Err(Error::Crypto("tls: server did not select TLS 1.3".into()));
@@ -484,9 +522,10 @@ pub fn send_application(ch: &mut dyn Channel, sess: &mut AppSession, data: &[u8]
 }
 
 /// Read the next application-data record from the server (skipping post-handshake
-/// NewSessionTicket handshake records), returning the opened plaintext.
+/// NewSessionTicket handshake records), returning the opened plaintext. Bounded so a
+/// server cannot keep the client reading forever without delivering application data.
 pub fn recv_application(ch: &mut dyn Channel, sess: &mut AppSession) -> Result<Vec<u8>> {
-    loop {
+    for _ in 0..MAX_SERVER_RECORDS {
         let (ctype, rec) = read_tls_record(ch)?;
         match ctype {
             REC_CHANGE_CIPHER_SPEC => continue,
@@ -508,16 +547,40 @@ pub fn recv_application(ch: &mut dyn Channel, sess: &mut AppSession) -> Result<V
             }
         }
     }
+    Err(Error::Crypto(
+        "tls: server sent too many non-application records without delivering app data".into(),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::channel::TcpChannel;
+    use super::super::channel::{Loopback, TcpChannel};
+    use super::super::schedule::TrafficKeys;
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Arc;
     use std::thread;
+
+    #[test]
+    fn read_server_flight_aborts_on_ccs_spam() {
+        // A malicious server streaming endless change_cipher_spec records must abort the
+        // bounded flight reader, not spin forever.
+        let (mut client, mut server) = Loopback::pair();
+        for _ in 0..MAX_CCS_RECORDS + 5 {
+            server.send(&[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]).unwrap(); // a CCS record
+        }
+        let keys = TrafficKeys {
+            key_a: [0u8; 32],
+            key_b: [0u8; 32],
+            iv: [0u8; 12],
+        };
+        let mut rx = Direction::new(&keys);
+        assert!(
+            read_server_flight(&mut client, &mut rx).is_err(),
+            "CCS spam must be rejected by the record/CCS bound"
+        );
+    }
 
     /// A loopback rustls TLS 1.3 server restricted to `TLS_CHACHA20_POLY1305_SHA256` +
     /// `secp256r1`, with a self-signed ECDSA-P256 cert. It echoes the first app record.
