@@ -49,12 +49,15 @@ pub mod ecdhe;
 pub mod handshake;
 pub mod record;
 pub mod schedule;
+pub mod verify;
 
 pub use super::engine::{eval_circuit, EngineKind};
 pub use channel::{Channel, Loopback, TcpChannel};
 pub use ecdhe::{ClientKeyShare, SharedSecret};
 pub use handshake::{
-    client_handshake, client_handshake_with_engine, recv_application, send_application, AppSession,
+    client_handshake, client_handshake_verified, client_handshake_with_engine, recv_application,
+    send_application, AppSession,
 };
 pub use record::Direction;
 pub use schedule::{KeySchedule, Secret2, TrafficKeys};
+pub use verify::{LeafKeyVerifier, ServerCertVerifier};

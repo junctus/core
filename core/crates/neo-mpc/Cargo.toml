@@ -16,6 +16,17 @@ getrandom.workspace = true
 crypto-bigint.workspace = true
 # Live 2PC-TLS (M45): real P-256 curve ops for the split-scalar ECDHE key share.
 p256.workspace = true
+# Optional: full X.509 chain-building verifier for the live 2PC-TLS handshake.
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = [
+    "ring",
+    "std",
+], optional = true }
+rustls-pki-types = { version = "1", features = ["std"], optional = true }
+
+[features]
+# A webpki-backed ServerCertVerifier (chain-building to trust anchors) for live 2PC-TLS;
+# off by default so the crate stays dep-light for its committee-exit use.
+live-tls-webpki = ["dep:webpki", "dep:rustls-pki-types"]
 
 [dev-dependencies]
 # Test-only oracles: num-bigint (a second bignum library for the field reconstruction),

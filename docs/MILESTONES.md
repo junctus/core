@@ -382,12 +382,15 @@ noted inline.)
   networked input-sharing → F_pre → online), TCP-tested to reproduce the plaintext and to abort on a
   forged-MAC open. **KeyUpdate** (RFC 8446 §7.2) is implemented + interop-tested against rustls (the 2PC
   client rekeys its write path under 2PC and rustls decrypts the post-update record); the leaf key for
-  CertificateVerify is now extracted by a **proper DER `SubjectPublicKeyInfo` parse** (algorithm/curve OIDs
-  validated). Remaining: routing the *live-TLS record/key-schedule* gadgets through the networked engine (they
-  use the bundled in-process online today — a performance question: the interactive online is one round-trip
-  per AND, so a full handshake wants the constant-round networked online); full **X.509 chain-building** to
-  trust anchors (a caller-supplied `webpki`/platform verifier); and **AES-GCM / x25519** (each a new 2PC
-  primitive — an AES circuit, a Montgomery-curve ECtF — not hardening). Unblocks the **M33** attestor.
+  CertificateVerify is extracted by a **positional DER `SubjectPublicKeyInfo` parse** (OID-validated,
+  parser-differential-hardened). Server-cert verification is pluggable (`ServerCertVerifier`): the default
+  authenticates the leaf key + transcript signature, and **full X.509 chain-building** to trust anchors
+  (issuer path, validity, subject name) is built via vetted `rustls-webpki` behind the `live-tls-webpki`
+  feature (`WebpkiVerifier`, interop-tested). Remaining: routing the *live-TLS record/key-schedule* gadgets
+  through the networked engine (they use the bundled in-process online today — a performance question: the
+  interactive online is one round-trip per AND, so a full handshake wants the **constant-round** networked
+  online); and **AES-GCM / x25519** (each a new 2PC primitive — an AES circuit, a Montgomery-curve ECtF).
+  Unblocks the **M33** attestor.
 - **M46 — Client store distribution + one-core consolidation** ⬜ (finishes **M8**'s deferred half) ·
   ~2–3 wk. The clients already exist and run on the shared `neo-netstack` + `neo-node` core: **`../neo-mac`**
   (React Native — ships **macOS + Android APK** today, iOS from the same tree) and **`../neo-linux`** (Rust

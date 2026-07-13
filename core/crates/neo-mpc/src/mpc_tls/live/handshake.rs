@@ -21,12 +21,14 @@
 //!   verified, and the `CertificateVerify` ECDSA-P256 signature over the transcript is
 //!   verified against the leaf certificate's key — extracted by a **proper DER
 //!   `SubjectPublicKeyInfo` parse** ([`leaf_p256_point`]) that validates the
-//!   `{id-ecPublicKey, prime256v1}` algorithm OIDs, not a byte search. **Full X.509
-//!   chain-building** (issuer-signature path validation to a trust anchor, validity
-//!   periods, hostname) is a **caller-supplied verifier** — a deployment plugs in a
-//!   `webpki`/platform trust store; the built-in path authenticates the leaf key + the
-//!   transcript signature, which (with the ECDHE-bound Finished) already stops a passive
-//!   or key-substituting MITM, but not an untrusted-but-valid certificate.
+//!   `{id-ecPublicKey, prime256v1}` algorithm OIDs, not a byte search. Verification is a
+//!   pluggable [`ServerCertVerifier`](super::verify::ServerCertVerifier): the default
+//!   [`LeafKeyVerifier`](super::verify::LeafKeyVerifier) authenticates the leaf key + the
+//!   transcript signature (which, with the ECDHE-bound Finished, stops a passive or
+//!   key-substituting MITM), while [`client_handshake_verified`] +
+//!   [`WebpkiVerifier`](super::verify) (feature `live-tls-webpki`) do **full X.509
+//!   chain-building** to trust anchors (issuer-signature path validation, validity,
+//!   subject name) via vetted `rustls-webpki`.
 //! - **KeyUpdate** (RFC 8446 §7.2) is supported ([`AppSession::send_key_update`] +
 //!   inbound handling in [`recv_application`]): the traffic secret is advanced under 2PC.
 //! - **Ciphersuite/curve**: `TLS_CHACHA20_POLY1305_SHA256` + `secp256r1` only.
@@ -349,13 +351,25 @@ fn leaf_p256_point(cert_der: &[u8]) -> Option<[u8; 65]> {
     }
 }
 
-/// Verify the server's `CertificateVerify` (ECDSA-P256 over the transcript). `signed`
-/// is the RFC 8446 §4.4.3 signed content; `sig_der` the DER signature; `leaf` the leaf
-/// certificate DER.
-fn verify_certificate_verify(leaf: &[u8], signed: &[u8], sig_der: &[u8]) -> Result<()> {
+/// The built-in leaf verification: verify the server's `CertificateVerify`
+/// (`ecdsa_secp256r1_sha256` only) over the transcript against the leaf certificate's
+/// P-256 key. `signed` is the RFC 8446 §4.4.3 signed content, `sig_der` the DER signature.
+/// Used by [`verify::LeafKeyVerifier`](super::verify::LeafKeyVerifier); does **not** build
+/// a chain to a trust anchor (that is [`verify::WebpkiVerifier`](super::verify)).
+pub(super) fn verify_leaf_signature_p256(
+    leaf: &[u8],
+    scheme: u16,
+    signed: &[u8],
+    sig_der: &[u8],
+) -> Result<()> {
     use p256::ecdsa::signature::Verifier;
     use p256::ecdsa::{Signature, VerifyingKey};
 
+    if scheme != SIG_ECDSA_SECP256R1_SHA256 {
+        return Err(Error::Crypto(format!(
+            "certverify: built-in verifier supports only ecdsa_secp256r1_sha256, got 0x{scheme:04x}"
+        )));
+    }
     let point = leaf_p256_point(leaf)
         .ok_or_else(|| Error::Crypto("certverify: no P-256 key in leaf cert".into()))?;
     let vk = VerifyingKey::from_sec1_bytes(&point)
@@ -455,22 +469,33 @@ fn read_server_flight(ch: &mut dyn Channel, rx: &mut Direction) -> Result<Vec<Ve
 }
 
 /// Drive the full TLS 1.3 client handshake over `ch` against the server named
-/// `server_name`, **semi-honest**. On success returns an [`AppSession`] for application
-/// data. Every key is derived under 2PC; the server is authenticated by its Finished +
-/// CertificateVerify. Use [`client_handshake_with_engine`] to run the whole session under
-/// the malicious authenticated-garbling online.
+/// `server_name`, **semi-honest**, with the built-in leaf verifier. On success returns an
+/// [`AppSession`] for application data. Every key is derived under 2PC; the server is
+/// authenticated by its Finished + CertificateVerify. Use [`client_handshake_with_engine`]
+/// for the malicious online, or [`client_handshake_verified`] to plug in a full X.509
+/// chain-building verifier.
 pub fn client_handshake(ch: &mut dyn Channel, server_name: &str) -> Result<AppSession> {
     client_handshake_with_engine(ch, server_name, EngineKind::Semihonest)
 }
 
-/// [`client_handshake`] under a chosen 2PC [`EngineKind`]: every key-schedule and record
-/// circuit runs on `engine`. With [`EngineKind::Malicious`] the whole live session is
-/// evaluated under WRK17/KRRW18 authenticated garbling (aborts on a cheating party) — far
-/// slower, so used for the malicious-online interop rather than the default path.
+/// [`client_handshake`] under a chosen 2PC [`EngineKind`] (built-in leaf verifier).
 pub fn client_handshake_with_engine(
     ch: &mut dyn Channel,
     server_name: &str,
     engine: EngineKind,
+) -> Result<AppSession> {
+    client_handshake_verified(ch, server_name, engine, &super::verify::LeafKeyVerifier)
+}
+
+/// [`client_handshake_with_engine`] with a caller-supplied
+/// [`ServerCertVerifier`](super::verify::ServerCertVerifier) — e.g.
+/// [`verify::WebpkiVerifier`](super::verify) (feature `live-tls-webpki`) for full X.509
+/// chain-building to trust anchors.
+pub fn client_handshake_verified(
+    ch: &mut dyn Channel,
+    server_name: &str,
+    engine: EngineKind,
+    verifier: &dyn super::verify::ServerCertVerifier,
 ) -> Result<AppSession> {
     // 1. Split-scalar key_share + fresh randoms; emit ClientHello (plaintext).
     let cks = ClientKeyShare::generate()?;
@@ -532,14 +557,14 @@ pub fn client_handshake_with_engine(
 
     // 4. Server flight: EncryptedExtensions, Certificate, CertificateVerify, Finished.
     let flight = read_server_flight(ch, &mut rx_hs)?;
-    let mut leaf_cert: Option<Vec<u8>> = None;
+    let mut chain: Option<Vec<Vec<u8>>> = None;
     let mut transcript_before_certverify: Option<[u8; 32]> = None;
     let mut transcript_before_serverfin: Option<[u8; 32]> = None;
     for msg in &flight {
         match msg[0] {
             HS_ENCRYPTED_EXTENSIONS => transcript.extend_from_slice(msg),
             HS_CERTIFICATE => {
-                leaf_cert = Some(parse_leaf_cert(&msg[4..])?);
+                chain = Some(parse_cert_chain(&msg[4..])?);
                 transcript.extend_from_slice(msg);
             }
             HS_CERTIFICATE_VERIFY => {
@@ -561,7 +586,13 @@ pub fn client_handshake_with_engine(
     }
 
     // 5. Verify CertificateVerify (server authentication) + server Finished (binds ECDHE).
-    verify_server_certificate_verify(&flight, leaf_cert.as_deref(), transcript_before_certverify)?;
+    verify_server_certificate_verify(
+        &flight,
+        chain.as_deref(),
+        transcript_before_certverify,
+        server_name,
+        verifier,
+    )?;
     let sfin_hash = transcript_before_serverfin
         .ok_or_else(|| Error::Crypto("tls: no server Finished in flight".into()))?;
     let server_fin = flight
@@ -600,24 +631,40 @@ pub fn client_handshake_with_engine(
     })
 }
 
-/// Parse the Certificate message body → the leaf (first) certificate DER.
-fn parse_leaf_cert(body: &[u8]) -> Result<Vec<u8>> {
+/// Parse the Certificate message body → the certificate chain (DER, **leaf first**).
+fn parse_cert_chain(body: &[u8]) -> Result<Vec<Vec<u8>>> {
     let mut r = Reader::new(body);
     let ctx_len = r.u8()? as usize;
     r.take(ctx_len)?; // certificate_request_context
     let list_len = ((r.u8()? as usize) << 16) | ((r.u8()? as usize) << 8) | (r.u8()? as usize);
     let list = r.take(list_len)?;
     let mut lr = Reader::new(list);
-    let clen = ((lr.u8()? as usize) << 16) | ((lr.u8()? as usize) << 8) | (lr.u8()? as usize);
-    Ok(lr.take(clen)?.to_vec())
+    let mut chain = Vec::new();
+    while lr.p < list.len() {
+        let clen = ((lr.u8()? as usize) << 16) | ((lr.u8()? as usize) << 8) | (lr.u8()? as usize);
+        chain.push(lr.take(clen)?.to_vec());
+        let ext_len = r_u16(&mut lr)?; // per-entry extensions
+        lr.take(ext_len)?;
+    }
+    if chain.is_empty() {
+        return Err(Error::Crypto("tls: empty certificate chain".into()));
+    }
+    Ok(chain)
 }
 
-/// Verify the CertificateVerify message from the flight against the leaf cert + the
-/// pre-CertVerify transcript hash.
+fn r_u16(r: &mut Reader) -> Result<usize> {
+    Ok(((r.u8()? as usize) << 8) | r.u8()? as usize)
+}
+
+/// Verify the CertificateVerify message from the flight: recover `(scheme, signature)`,
+/// build the RFC 8446 §4.4.3 signed content, and delegate the chain + signature check to
+/// the caller's [`ServerCertVerifier`](super::verify::ServerCertVerifier).
 fn verify_server_certificate_verify(
     flight: &[Vec<u8>],
-    leaf: Option<&[u8]>,
+    chain: Option<&[Vec<u8>]>,
     transcript_before_cv: Option<[u8; 32]>,
+    server_name: &str,
+    verifier: &dyn super::verify::ServerCertVerifier,
 ) -> Result<()> {
     // This client always performs a full (non-PSK) ECDHE handshake, so the server MUST
     // authenticate via CertificateVerify — a flight without it is unauthenticated and aborts.
@@ -627,22 +674,17 @@ fn verify_server_certificate_verify(
         .ok_or_else(|| {
             Error::Crypto("tls: server flight missing CertificateVerify — abort".into())
         })?;
-    let leaf =
-        leaf.ok_or_else(|| Error::Crypto("tls: CertificateVerify without Certificate".into()))?;
+    let chain =
+        chain.ok_or_else(|| Error::Crypto("tls: CertificateVerify without Certificate".into()))?;
     let th = transcript_before_cv
         .ok_or_else(|| Error::Crypto("tls: missing pre-CertificateVerify transcript".into()))?;
 
     let mut r = Reader::new(&cv[4..]);
     let scheme = r.u16()?;
-    if scheme != SIG_ECDSA_SECP256R1_SHA256 {
-        return Err(Error::Crypto(format!(
-            "tls: unsupported CertificateVerify scheme 0x{scheme:04x} (only ecdsa_secp256r1_sha256)"
-        )));
-    }
     let sig_len = r.u16()? as usize;
     let sig = r.take(sig_len)?;
     let signed = certificate_verify_signed(&th);
-    verify_certificate_verify(leaf, &signed, sig)
+    verifier.verify(chain, server_name, scheme, &signed, sig)
 }
 
 /// Send one application-data record (shared plaintext `data`) to the server.
@@ -801,6 +843,12 @@ mod tests {
     /// `secp256r1`, with a self-signed ECDSA-P256 cert. It echoes the first app record.
     /// Returns the bound address; the server runs on a detached thread.
     fn spawn_rustls_echo_server() -> std::net::SocketAddr {
+        spawn_rustls_echo_server_cert().0
+    }
+
+    /// As [`spawn_rustls_echo_server`], also returning the server's self-signed cert DER
+    /// (usable as a trust anchor for the webpki verifier test).
+    fn spawn_rustls_echo_server_cert() -> (std::net::SocketAddr, Vec<u8>) {
         use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
         let mut provider = rustls::crypto::ring::default_provider();
@@ -811,6 +859,7 @@ mod tests {
         // rcgen 0.13 defaults to a P-256 ECDSA key — exactly what the client verifies.
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_der = cert.cert.der().clone();
+        let anchor_der = cert_der.to_vec();
         let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
 
         let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
@@ -843,7 +892,27 @@ mod tests {
                 Some(rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256)
             );
         });
-        addr
+        (addr, anchor_der)
+    }
+
+    #[test]
+    #[cfg(feature = "live-tls-webpki")]
+    #[ignore] // ~15s release: full handshake + webpki chain-building
+    fn live_handshake_with_webpki_chain_verification() {
+        // The 2PC handshake with FULL X.509 chain-building: the webpki verifier validates
+        // the server chain to a trust anchor (here the self-signed cert itself), checks the
+        // "localhost" subject name, and verifies the CertificateVerify signature — all via
+        // vetted rustls-webpki, replacing the built-in leaf-only check.
+        use super::super::verify::WebpkiVerifier;
+        let (addr, root) = spawn_rustls_echo_server_cert();
+        let verifier = WebpkiVerifier::with_roots(&[root]).expect("build webpki verifier");
+        let mut ch = TcpChannel::connect(addr).unwrap();
+        let mut session =
+            client_handshake_verified(&mut ch, "localhost", EngineKind::Semihonest, &verifier)
+                .expect("2PC TLS 1.3 handshake with webpki chain validation");
+        let payload = b"webpki-verified ping";
+        send_application(&mut ch, &mut session, payload).unwrap();
+        assert_eq!(recv_application(&mut ch, &mut session).unwrap(), payload);
     }
 
     #[test]

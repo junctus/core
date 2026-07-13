@@ -117,14 +117,15 @@ A **3-message, key-confirmed** PQ-hybrid AKE (`neo-crypto::handshake`):
   including the **actual SHA-256 key-schedule circuit** (67k ANDs, via networked input-sharing → F_pre →
   online), TCP-tested to reproduce the plaintext and abort on a forged-MAC open. **KeyUpdate** (RFC 8446 §7.2)
   is implemented + interop-tested against rustls, and the CertificateVerify leaf key is extracted by a proper
-  DER `SubjectPublicKeyInfo` parse (OID-validated). What remains is **not crypto-primitive work**: the
-  **external audit** (the hard gate) + the formal proofs; routing the *live-TLS record/key-schedule* gadgets
-  through this networked engine (they use the bundled in-process online today — a performance question, since
-  the interactive online is one round-trip per AND); full **X.509 chain-building** (a caller-supplied
-  `webpki`/platform verifier); **AES-GCM / x25519** (each a new 2PC primitive, not hardening); plus the malicious
-  ECtF-triple generation (MASCOT `sacrifice`; the arithmetic already runs over authenticated shares); live-TLS
-  **hardening** (full X.509 chain-building, other ciphersuites/curves, KeyUpdate); and the KOS **Roy22** fix
-  (it ships original
+  DER `SubjectPublicKeyInfo` parse (OID-validated, parser-differential-hardened). Server-cert verification is
+  pluggable (`ServerCertVerifier`); **full X.509 chain-building** to trust anchors is built via vetted
+  `rustls-webpki` behind the `live-tls-webpki` feature (`WebpkiVerifier`, interop-tested). What remains is
+  **not crypto-primitive work**: the **external audit** (the hard gate) + the formal proofs; routing the
+  *live-TLS record/key-schedule* gadgets through this networked engine (they use the bundled in-process online
+  today — a performance question, since the interactive online is one round-trip per AND, so a full handshake
+  wants the **constant-round** networked online); **AES-GCM / x25519** (each a new 2PC primitive — an AES
+  circuit, a Montgomery-curve ECtF); plus the malicious ECtF-triple generation (MASCOT `sacrifice`; the
+  arithmetic already runs over authenticated shares); and the KOS **Roy22** fix (it ships original
   KOS15). A **succinct** ZK shuffle is separate research.
 - **REALITY full-session indistinguishability** — the REALITY authenticator is embedded in a real TLS 1.3
   ClientHello (`neo-transport::tls`, `build/parse_client_hello`) and an active prober is silently
