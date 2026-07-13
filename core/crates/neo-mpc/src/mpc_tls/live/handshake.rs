@@ -50,8 +50,10 @@ use super::super::sha256::sha256;
 use super::channel::{read_tls_record, Channel};
 use super::ecdhe::ClientKeyShare;
 use super::record::Direction;
-use super::schedule::KeySchedule;
+use super::schedule::{hkdf_expand_label, hmac_sha256, KeySchedule};
 use super::verify::ServerCertVerifier;
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 
 const HS_CLIENT_HELLO: u8 = 0x01;
 const HS_SERVER_HELLO: u8 = 0x02;
@@ -807,6 +809,83 @@ fn open_iv(party: &mut dyn Channel, iv_share: &[u8; 32]) -> Result<[u8; 12]> {
     Ok(iv.try_into().expect("12-byte iv"))
 }
 
+// ---- cleartext handshake crypto (HS-open fast path) --------------------------------------
+//
+// Once the handshake-traffic secrets are opened (KeyScheduleNet::open_handshake_secrets), the
+// server flight (all PUBLIC/authenticated) is decrypted, the Finished MACs computed, and the
+// client Finished sealed **in the clear** with the vetted stock ChaCha20-Poly1305 + HKDF —
+// removing the certificate-flight 2PC (the dominant cost). Only the application epoch stays
+// 2PC. The application keys are never opened, so no member ever holds application plaintext.
+
+/// The TLS 1.3 per-record nonce: `static_iv XOR seq` (RFC 8446 §5.3).
+fn tls13_nonce(iv: &[u8; 12], seq: u64) -> [u8; 12] {
+    let mut n = *iv;
+    for (b, s) in n[4..].iter_mut().zip(seq.to_be_bytes()) {
+        *b ^= s;
+    }
+    n
+}
+
+/// Cleartext `(key, iv)` from a handshake-traffic secret (RFC 8446 §7.3).
+fn cleartext_traffic_keys(secret: &[u8; 32]) -> ([u8; 32], [u8; 12]) {
+    let key: [u8; 32] = hkdf_expand_label(secret, b"key", b"", 32).try_into().expect("32");
+    let iv: [u8; 12] = hkdf_expand_label(secret, b"iv", b"", 12).try_into().expect("12");
+    (key, iv)
+}
+
+/// Cleartext Finished MAC = `HMAC(HKDF-Expand-Label(secret,"finished","",32), transcript_hash)`.
+fn cleartext_finished(secret: &[u8; 32], transcript_hash: &[u8; 32]) -> [u8; 32] {
+    let fk: [u8; 32] = hkdf_expand_label(secret, b"finished", b"", 32).try_into().expect("32");
+    hmac_sha256(&fk, transcript_hash)
+}
+
+/// Cleartext TLS 1.3 record open (stock AEAD): decrypt `record_body` (ciphertext ‖ tag),
+/// strip padding + the trailing content type. Returns `(content_type, plaintext)`.
+fn cleartext_open_record(
+    key: &[u8; 32],
+    iv: &[u8; 12],
+    seq: u64,
+    record_body: &[u8],
+) -> Result<(u8, Vec<u8>)> {
+    let length = (record_body.len()) as u16;
+    let header = [0x17, 0x03, 0x03, (length >> 8) as u8, length as u8];
+    let nonce = tls13_nonce(iv, seq);
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    let mut inner = cipher
+        .decrypt(Nonce::from_slice(&nonce), Payload { msg: record_body, aad: &header })
+        .map_err(|_| Error::Crypto("tls: server record failed to decrypt/authenticate".into()))?;
+    while inner.last() == Some(&0) {
+        inner.pop();
+    }
+    let ct = inner
+        .pop()
+        .ok_or_else(|| Error::Crypto("tls: empty TLSInnerPlaintext".into()))?;
+    Ok((ct, inner))
+}
+
+/// Cleartext TLS 1.3 record seal (stock AEAD): returns the wire record
+/// `0x17 ‖ 0x0303 ‖ length ‖ ciphertext ‖ tag`.
+fn cleartext_seal_record(
+    key: &[u8; 32],
+    iv: &[u8; 12],
+    seq: u64,
+    content_type: u8,
+    content: &[u8],
+) -> Result<Vec<u8>> {
+    let mut inner = content.to_vec();
+    inner.push(content_type);
+    let length = (inner.len() + 16) as u16;
+    let header = [0x17, 0x03, 0x03, (length >> 8) as u8, length as u8];
+    let nonce = tls13_nonce(iv, seq);
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    let sealed = cipher
+        .encrypt(Nonce::from_slice(&nonce), Payload { msg: &inner, aad: &header })
+        .map_err(|_| Error::Crypto("tls: client record seal failed".into()))?;
+    let mut record = header.to_vec();
+    record.extend_from_slice(&sealed);
+    Ok(record)
+}
+
 /// SEC1 uncompressed encoding of a P-256 point (65 bytes).
 fn point_sec1(p: &ProjectivePoint) -> [u8; 65] {
     <[u8; 65]>::try_from(p.to_affine().to_encoded_point(false).as_bytes()).expect("65-byte SEC1")
@@ -907,11 +986,15 @@ pub fn committee_handshake_net(
         ));
     }
 
-    // 5. ECDHE (2PC) + Handshake Secret + server handshake key (share) + IV (opened).
+    // 5. ECDHE (2PC) + Handshake Secret + the two HS-traffic secrets (2PC), then **OPEN** them
+    //    to cleartext. `handshake_secret` stays SHARED — its application-branch children
+    //    (master → app keys) are derived under 2PC in step 10; only its *public* siblings
+    //    client_hs/server_hs are revealed, so the flight decrypt + Finished can run in the
+    //    clear (removing the certificate-flight 2PC) while no member ever sees application data.
     let ecdhe = derive_ecdhe_share_net(party, role, scalar, &sh.server_key_share)?;
     let mut ks = KeyScheduleNet::derive_handshake(party, role, &ecdhe, &transcript)?;
-    let (shk, shiv_share) = ks.server_handshake_keys_share(party)?;
-    let shiv = open_iv(party, &shiv_share)?;
+    let (client_hs, server_hs) = ks.open_handshake_secrets(party)?;
+    let (shk, shiv) = cleartext_traffic_keys(&server_hs);
 
     // 6. Server flight: A reads encrypted records + relays; both open (2PC) + reassemble.
     let mut flight: Vec<Vec<u8>> = Vec::new();
@@ -939,23 +1022,10 @@ pub fn committee_handshake_net(
                 continue;
             }
             REC_APPLICATION_DATA => {
-                // Reconstruct the wire record (header is the AEAD AAD) and open under 2PC.
-                let mut record = vec![0x17, 0x03, 0x03, (body.len() >> 8) as u8, body.len() as u8];
-                record.extend_from_slice(&body);
-                let (inner_share, ok) =
-                    open_tls13_record_net(party, role, &shk, &shiv, seq, &record)?;
-                if !ok {
-                    return Err(Error::Crypto("tls: server flight tag verify failed".into()));
-                }
+                // The server flight is public/authenticated — decrypt it IN THE CLEAR with the
+                // opened server-HS key (stock ChaCha20-Poly1305). No 2PC.
+                let (inner_ct, inner) = cleartext_open_record(&shk, &shiv, seq, &body)?;
                 seq += 1;
-                // Reveal the (public) inner plaintext; strip padding + content_type.
-                let mut inner = combine_public(party, &inner_share)?;
-                while inner.last() == Some(&0) {
-                    inner.pop();
-                }
-                let inner_ct = inner
-                    .pop()
-                    .ok_or_else(|| Error::Crypto("tls: empty inner plaintext".into()))?;
                 if inner_ct != REC_HANDSHAKE {
                     return Err(Error::Crypto("tls: expected handshake in flight".into()));
                 }
@@ -1003,31 +1073,27 @@ pub fn committee_handshake_net(
         }
     }
 
-    // 8. Authenticate: CertificateVerify + server Finished (2PC MAC, opened to compare).
+    // 8. Authenticate: CertificateVerify + server Finished — both members verify locally
+    //    (cleartext) against the opened server-HS secret. No 2PC.
     verify_server_certificate_verify(&flight, chain.as_deref(), tbcv, server_name, verifier)?;
     let sfin_hash = tbsf.ok_or_else(|| Error::Crypto("committee: no server Finished".into()))?;
     let server_fin = flight
         .iter()
         .find(|m| m[0] == HS_FINISHED)
         .ok_or_else(|| Error::Crypto("committee: missing server Finished".into()))?;
-    let sfin_share = ks.server_finished_share(party, &sfin_hash)?;
-    let expected = combine_public(party, &sfin_share)?;
+    let expected = cleartext_finished(&server_hs, &sfin_hash);
     if server_fin[4..] != expected[..] {
         return Err(Error::Crypto(
             "committee: server Finished MAC mismatch — handshake not authenticated (abort)".into(),
         ));
     }
 
-    // 9. Client Finished (2PC MAC, opened) sealed under the client handshake key (2PC).
+    // 9. Client Finished — computed + sealed in the clear under the opened client-HS secret.
     let cfin_hash = sha256(&transcript);
-    let cfin_share = ks.client_finished_share(party, &cfin_hash)?;
-    let cfin = combine_public(party, &cfin_share)?;
+    let cfin = cleartext_finished(&client_hs, &cfin_hash);
     let cfin_msg = handshake_message(HS_FINISHED, &cfin);
-    let (chk, chiv_share) = ks.client_handshake_keys_share(party)?;
-    let chiv = open_iv(party, &chiv_share)?;
-    // Finished value is public: A carries it as its plaintext share, B carries zeros.
-    let pt_share: Vec<u8> = if lead { cfin_msg.clone() } else { vec![0u8; cfin_msg.len()] };
-    let fin_record = seal_tls13_record_net(party, role, &chk, &chiv, 0, REC_HANDSHAKE, &pt_share)?;
+    let (chk, chiv) = cleartext_traffic_keys(&client_hs);
+    let fin_record = cleartext_seal_record(&chk, &chiv, 0, REC_HANDSHAKE, &cfin_msg)?;
     if let Some(s) = server.as_deref_mut() {
         s.send(&fin_record)?;
     }

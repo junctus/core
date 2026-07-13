@@ -132,6 +132,22 @@ impl KeyScheduleNet {
         self.server_hs
     }
 
+    /// **Open both handshake-traffic secrets to cleartext** on both members (returns
+    /// `(client_hs, server_hs)`). Safe: in TLS 1.3 the server flight (Certificate,
+    /// CertificateVerify, both Finished MACs) is public/authenticated, and these two secrets
+    /// are *siblings* of the still-shared `handshake_secret` — HMAC-SHA256 is one-way, so
+    /// revealing them leaks nothing about `handshake_secret`, hence nothing about the Master
+    /// Secret or any application key (which stay XOR-shared, derived on the untouched app
+    /// branch). This lets the cert flight + Finished + client Finished run **in the clear**,
+    /// removing the certificate-flight 2PC — the dominant handshake cost — while the
+    /// application epoch stays under 2PC. **Never** open `handshake_secret` itself: that would
+    /// expose the application branch.
+    pub fn open_handshake_secrets(&self, ch: &mut dyn Channel) -> Result<([u8; 32], [u8; 32])> {
+        let client_hs = open_secret(ch, &self.client_hs)?;
+        let server_hs = open_secret(ch, &self.server_hs)?;
+        Ok((client_hs, server_hs))
+    }
+
     /// This party's shares of the client handshake `(key, iv)` (the IV is 12 bytes; both are
     /// XOR-shares — the record layer opens the IV and keeps the key shared).
     pub fn client_handshake_keys_share(&self, ch: &mut dyn Channel) -> Result<([u8; 32], [u8; 32])> {
@@ -196,6 +212,13 @@ impl KeyScheduleNet {
         self.client_ap = Some(next);
         Ok(())
     }
+}
+
+/// Exchange + XOR a 32-byte secret share with the peer member → the reconstructed secret.
+fn open_secret(ch: &mut dyn Channel, share: &[u8; 32]) -> Result<[u8; 32]> {
+    ch.send(share)?;
+    let peer = ch.recv_exact(32)?;
+    Ok(core::array::from_fn(|i| share[i] ^ peer[i]))
 }
 
 /// `Derive-Secret(secret, label, messages)` under 2PC over `ch`: HKDF-Expand-Label with the
