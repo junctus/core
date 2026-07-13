@@ -207,6 +207,13 @@ enum Command {
         /// in-process reference, instead of the lighter ECtF + single-circuit demo.
         #[arg(long)]
         full: bool,
+        /// **Committee 2PC-TLS**: the two nodes act as exit-committee members and jointly
+        /// complete a real TLS 1.3 handshake to this `host:port` destination (the `--listen`
+        /// side is the lead that dials the destination; the `--connect` side is the
+        /// follower). Both must pass the same value. Fetches `GET /` and reconstructs the
+        /// response from the two members' shares.
+        #[arg(long)]
+        handshake: Option<String>,
     },
 }
 
@@ -439,7 +446,8 @@ async fn main() -> anyhow::Result<()> {
             listen,
             connect,
             full,
-        } => mpc2pc::run(listen, connect, full)?,
+            handshake,
+        } => mpc2pc::run(listen, connect, full, handshake)?,
     }
     Ok(())
 }

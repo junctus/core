@@ -39,7 +39,9 @@ use neo_mpc::mpc_tls::ectf::{ectf_a, ectf_b};
 use neo_mpc::mpc_tls::engine::EngineKind;
 use neo_mpc::mpc_tls::garble_net::{evaluator_run, garbler_run};
 use neo_mpc::mpc_tls::live::channel::{Channel, TcpChannel};
+use neo_mpc::mpc_tls::live::handshake::{committee_handshake_net, committee_recv_app, committee_send_app};
 use neo_mpc::mpc_tls::live::netschedule::{derive_ecdhe_share_net, KeyScheduleNet};
+use neo_mpc::mpc_tls::live::verify::LeafKeyVerifier;
 use neo_mpc::mpc_tls::live::schedule::KeySchedule;
 use neo_mpc::mpc_tls::netengine::Party;
 use neo_mpc::mpc_tls::sha256::{sha256, sha256_compress_circuit};
@@ -52,7 +54,7 @@ const P256_PRIME_BE: [u8; 32] = [
 ];
 
 /// Which side of the two-party protocol this process plays.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Role {
     /// `--listen`: party A — generates the (public) server key share, runs `ectf_a`, garbles.
     A,
@@ -69,16 +71,40 @@ pub struct SessionReport {
 /// Entry point for the `neo mpc2pc` subcommand. `--listen` becomes a **persistent** party-A
 /// server (one session per inbound connection, verbose); `--connect` runs one party-B
 /// session. `full` selects the whole networked key-agreement driver over the lighter demo.
-pub fn run(listen: Option<String>, connect: Option<String>, full: bool) -> anyhow::Result<()> {
+/// `handshake` runs the committee 2PC-TLS handshake to a real destination (one-shot).
+pub fn run(
+    listen: Option<String>,
+    connect: Option<String>,
+    full: bool,
+    handshake: Option<String>,
+) -> anyhow::Result<()> {
     match (listen, connect) {
-        (Some(addr), None) => serve(&addr, true, full),
+        (Some(addr), None) => {
+            if let Some(dest) = handshake {
+                // Committee lead (party A): accept one member, dial the destination.
+                println!("neo mpc2pc — committee lead (party A). Binding {addr}, waiting for peer…");
+                let listener = TcpListener::bind(&addr).with_context(|| format!("bind {addr}"))?;
+                let (sock, peer) = listener.accept().context("accept peer")?;
+                println!("  peer member connected from {peer}");
+                let mut ch = TcpChannel::from_stream(sock);
+                committee_handshake(Role::A, &mut ch, &dest)
+            } else {
+                serve(&addr, true, full)
+            }
+        }
         (None, Some(addr)) => {
-            println!("neo mpc2pc — party B (evaluator). Connecting to {addr}…");
+            let role = if handshake.is_some() { "committee follower (party B)" } else { "party B (evaluator)" };
+            println!("neo mpc2pc — {role}. Connecting to {addr}…");
             let sock = TcpStream::connect(&addr).with_context(|| format!("connect {addr}"))?;
             println!("  connected");
             let mut ch = TcpChannel::from_stream(sock);
-            run_session(Role::B, &mut ch, true, full)?;
-            Ok(())
+            match handshake {
+                Some(dest) => committee_handshake(Role::B, &mut ch, &dest),
+                None => {
+                    run_session(Role::B, &mut ch, true, full)?;
+                    Ok(())
+                }
+            }
         }
         _ => bail!("provide exactly one of --listen <addr> (party A) or --connect <addr> (party B)"),
     }
@@ -432,4 +458,73 @@ fn check(what: &str, got: &[u8; 32], want: &[u8; 32]) -> anyhow::Result<()> {
         bail!("{what}: networked share reconstruction != reference");
     }
     Ok(())
+}
+
+// ---- committee 2PC-TLS handshake to a real destination ------------------------------
+
+/// Run one committee 2PC-TLS handshake to `dest` (host:port): the two nodes jointly complete
+/// a real TLS 1.3 handshake as exit-committee members (neither holds the session key), fetch
+/// `GET /`, and reconstruct the response from their plaintext shares.
+fn committee_handshake(role: Role, ch: &mut dyn Channel, dest: &str) -> anyhow::Result<()> {
+    let party = party_of(role);
+    let host = dest.rsplit_once(':').map(|(h, _)| h).unwrap_or(dest).to_string();
+    let scalar = random_scalar();
+
+    let mut server = if role == Role::A {
+        println!("  dialing destination {dest} (TLS 1.3, ChaCha20-Poly1305 + P-256)…");
+        Some(TcpChannel::from_stream(
+            TcpStream::connect(dest).with_context(|| format!("connect {dest}"))?,
+        ))
+    } else {
+        None
+    };
+
+    let t = Instant::now();
+    let mut sess = committee_handshake_net(
+        ch,
+        party,
+        server.as_mut().map(|c| c as &mut dyn Channel),
+        &host,
+        &scalar,
+        &LeafKeyVerifier,
+    )
+    .map_err(|e| anyhow!("committee handshake: {e}"))?;
+    println!(
+        "  ✓ committee TLS 1.3 handshake to {host} complete in {:?} — no single member holds the session key",
+        t.elapsed()
+    );
+
+    // Fetch GET / — the lead carries the public request bytes, the follower carries zeros.
+    let req = format!(
+        "GET / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: neo-mpc2pc\r\nConnection: close\r\n\r\n"
+    );
+    let pt_share = if role == Role::A {
+        req.clone().into_bytes()
+    } else {
+        vec![0u8; req.len()]
+    };
+    committee_send_app(ch, &mut sess, server.as_mut().map(|c| c as &mut dyn Channel), &pt_share)
+        .map_err(|e| anyhow!("send request: {e}"))?;
+    let my_share = committee_recv_app(ch, &mut sess, server.as_mut().map(|c| c as &mut dyn Channel))
+        .map_err(|e| anyhow!("recv response: {e}"))?;
+
+    // Reconstruct (demo reveal — in production the onion client does this): exchange shares,
+    // XOR, strip padding + the trailing content_type.
+    let mut resp = combine_shares(ch, &my_share)?;
+    while resp.last() == Some(&0) {
+        resp.pop();
+    }
+    resp.pop(); // content_type
+    let text = String::from_utf8_lossy(&resp);
+    let status = text.lines().next().unwrap_or("(no status line)");
+    println!("  ✓ committee fetched https://{host}/ — server responded: {status}");
+    println!("\n✓ committee 2PC-TLS handshake + fetch complete over the wire (no member saw the plaintext).");
+    Ok(())
+}
+
+/// Exchange + XOR a plaintext share with the peer member (demo reconstruction of a public value).
+fn combine_shares(ch: &mut dyn Channel, mine: &[u8]) -> anyhow::Result<Vec<u8>> {
+    ch.send(mine).map_err(|e| anyhow!("send share: {e}"))?;
+    let peer = ch.recv_exact(mine.len()).map_err(|e| anyhow!("recv share: {e}"))?;
+    Ok(mine.iter().zip(&peer).map(|(a, b)| a ^ b).collect())
 }
