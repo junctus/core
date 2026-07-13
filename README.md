@@ -131,8 +131,8 @@ Two inbound TCP ports must be open in your firewall / cloud security group:
 - **The relay port** (the one in `ANNOUNCE_ADDR`, e.g. `443`) — for client connections and for
   the seed's **dial-back health check** (until it succeeds the relay is registered but *not*
   attested, so it won't appear in snapshots).
-- **`9700`** — every relay also runs the networked 2PC-TLS co-processor endpoint (see below).
-  Override the address with `--mpc2pc-listen`.
+- **`9700`** — the experimental 2PC-TLS co-processor endpoint (see below). Override with
+  `--mpc2pc-listen`; not needed unless you want to expose that specialized capability.
 
 ### Verify and manage
 
@@ -153,12 +153,24 @@ Drop `--exit` for a forward-only relay. The baked-in seeds find the public netwo
 your own with `NEO_MIRRORS`/`NEO_WITNESSES`. On a low-RAM VPS the default LTO release profile
 can OOM — build with `CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16`.
 
-### The 2PC-TLS co-processor endpoint (always on)
+### The 2PC-TLS co-processor endpoint (experimental / specialized — *not* the browsing path)
 
-Every relay serves a networked two-party 2PC-TLS endpoint in-process on **`0.0.0.0:9700`** —
-running a relay means running this. Peers connect with `neo mpc2pc --connect <relay-ip>:9700`
-(add `--full` for the whole networked handshake key agreement). Override the bind with
-`--mpc2pc-listen <addr>` (or `MPC2PC=<addr>` to `install.sh`). Keep port `9700` open inbound.
+> **Status: specialized capability, parked.** This is **not** how neo browses the web. Normal
+> traffic uses the onion overlay above — the client does its own end-to-end TLS to the
+> destination and the exit only forwards TCP, which is fast. The 2PC-TLS endpoint is a
+> separate, research-grade building block: two exit-committee members *jointly* run a real
+> TLS 1.3 session to a destination so **no single member ever holds the session key or sees
+> the plaintext**. It works end-to-end against real servers, but a handshake takes **tens of
+> seconds** (garbling millions of gates + OT under 2PC) — inherently far too slow for
+> interactive browsing, and left parked pending a faster design.
+
+It's built for the cases where that obliviousness is worth the latency and requests are few:
+a **DECO-style TLS oracle** (prove a fact about a TLS response without being the endpoint), an
+**oblivious exit** for a high-sensitivity long-lived connection, or split-trust exits where no
+member holds the key. Run `neo run --relay --mpc2pc-listen 0.0.0.0:9700` to expose it (open
+`9700`); peers connect with `neo mpc2pc --connect <relay-ip>:9700` (`--full` for the whole
+networked handshake key agreement, `--handshake <host:port>` to jointly reach a real server).
+See [`docs/MILESTONES.md`](docs/MILESTONES.md) and [`docs/CRYPTO.md`](docs/CRYPTO.md).
 
 ## License
 

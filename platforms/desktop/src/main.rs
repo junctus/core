@@ -78,10 +78,10 @@ enum Command {
         /// Bridge a TUN device through the tunnel (needs `--features tun` and root).
         #[arg(long)]
         tun: bool,
-        /// Override the address for the networked 2PC-TLS co-processor endpoint. Relays
-        /// **always** serve it (default `0.0.0.0:9700`) — open that TCP port in the
-        /// firewall; peers reach it with `neo mpc2pc --connect <this-addr>`. On a
-        /// non-relay node, passing this is what turns the endpoint on.
+        /// Expose the **experimental, specialized** 2PC-TLS co-processor endpoint on this
+        /// address (e.g. `0.0.0.0:9700`) — off by default. This is an oblivious-exit / TLS-
+        /// oracle building block, *not* the browsing path, and is far too slow for
+        /// interactive use. Open the port; peers reach it with `neo mpc2pc --connect <addr>`.
         #[arg(long = "mpc2pc-listen")]
         mpc2pc_listen: Option<String>,
     },
@@ -323,16 +323,11 @@ async fn main() -> anyhow::Result<()> {
             tun,
             mpc2pc_listen,
         } => {
-            // The networked 2PC-TLS co-processor is a **mandatory part of being a relay**:
-            // every relay stands the endpoint up in-process (default `0.0.0.0:9700`,
-            // overridable with `--mpc2pc-listen`). A non-relay node only serves it if the
-            // flag is given explicitly.
-            let mpc_addr = if relay {
-                Some(mpc2pc_listen.unwrap_or_else(|| "0.0.0.0:9700".to_string()))
-            } else {
-                mpc2pc_listen
-            };
-            if let Some(addr) = mpc_addr {
+            // The 2PC-TLS co-processor is an **opt-in, specialized** endpoint (oracle /
+            // oblivious-exit use-cases — see the README; it is not the browsing path and is
+            // far too slow for interactive use). Any node (relay or not) exposes it only when
+            // `--mpc2pc-listen <addr>` is given.
+            if let Some(addr) = mpc2pc_listen {
                 std::thread::spawn(move || {
                     // The standing relay endpoint serves the lighter demo session (low
                     // bandwidth); the full key-agreement driver is an on-demand `--full` run.

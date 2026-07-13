@@ -513,6 +513,39 @@ mod tests {
     }
 
     #[test]
+    fn cot_net_stress_never_false_aborts() {
+        // Honest COT over TCP, many runs with large/varying m and fully random messages +
+        // choices. The correlation check is EXACT for honest parties, so an honest run must
+        // never abort — this reproduces intermittent aborts that only surface across the
+        // ~100+ COT calls of a full handshake (not the handful in the small-cert tests).
+        for iter in 0..200usize {
+            let m = 200 + (iter * 41) % 500;
+            let choices: Vec<bool> = (0..m)
+                .map(|i| i.wrapping_mul(2_654_435_761).wrapping_add(iter) % 3 == 0)
+                .collect();
+            let messages: Vec<([u8; 16], [u8; 16])> = (0..m)
+                .map(|_| {
+                    let mut a = [0u8; 16];
+                    let mut b = [0u8; 16];
+                    getrandom::getrandom(&mut a).unwrap();
+                    getrandom::getrandom(&mut b).unwrap();
+                    (a, b)
+                })
+                .collect();
+            let (send, recv) = run_net_cot(choices.clone(), messages.clone(), |_| {});
+            assert!(
+                send.is_ok(),
+                "iter {iter} m={m}: honest sender aborted — false correlation-check failure"
+            );
+            let out = recv.expect("receiver");
+            for i in 0..m {
+                let want = if choices[i] { messages[i].1 } else { messages[i].0 };
+                assert_eq!(out[i], want, "iter {iter} m={m} OT {i}");
+            }
+        }
+    }
+
+    #[test]
     fn networked_cot_matches_the_correlation_and_aborts_on_cheat() {
         // Honest run: the receiver's chosen outputs equal the sender's messages for the
         // chosen bits (this is exactly the COT correlation the aBit layer relies on).
