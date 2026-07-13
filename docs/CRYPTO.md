@@ -69,10 +69,11 @@ A **3-message, key-confirmed** PQ-hybrid AKE (`neo-crypto::handshake`):
   (`ectf`, Gilboa MtA over a **constant-time** `F_p` + masked inversion → `convert::a2b_shared` → the SHA-256
   key schedule, validated against the vetted `p256` + NIST-KAT SHA-256); **KOS maliciously-secure OT** (`kos`);
   the complete **WRK17/KRRW18 malicious 2PC** — malicious `F_pre` (`leaky_and` + bucketing) feeding
-  **constant-round authenticated garbling** (`authgarble`, where a corrupted garbled row aborts); the **TLS 1.3
-  key schedule** (`hkdf`, matched to the vetted `hmac`/`hkdf` crates); and **SPDZ** authenticated arithmetic
-  (`spdz`) for the field path. Every layer's abort mechanism is tested, and the constructions were
-  **adversarially verified against the published specs**. The formal malicious-security proofs and the
+  **constant-round authenticated garbling** (`authgarble`, where a corrupted garbled row aborts — exercised on
+  the **full SHA-256 compression circuit**, >10k ANDs, not just a toy adder); the **TLS 1.3 key schedule**
+  (`hkdf`, matched to the vetted `hmac`/`hkdf` crates); and **SPDZ** authenticated arithmetic (`spdz`) for the
+  field path, with `ectf_beaver` running ECtF's point addition over authenticated Beaver. Every layer's abort
+  mechanism is tested, and the constructions were **adversarially verified against the published specs**. The formal malicious-security proofs and the
   **external audit** are the security gate, as everywhere in neo.
 - **Persistent circuit tunnels** (`neo-node::circuit`) — a long-lived Sphinx circuit carrying a
   bidirectional byte stream as **counter-keyed onion cells** (no keystream reuse) with a **per-cell
@@ -93,11 +94,16 @@ A **3-message, key-confirmed** PQ-hybrid AKE (`neo-crypto::handshake`):
   1.3 key schedule** (`hkdf`, matched to the vetted `hmac`/`hkdf` crates); and the complete **WRK17/KRRW18
   malicious 2PC** — malicious OT (`kos`) → malicious `F_pre` (leaky-AND + bucketing) → constant-round
   authenticated garbling (`authgarble`) — plus **SPDZ** authenticated arithmetic (`spdz`) for the field path.
-  Every layer's abort mechanism is tested and the constructions were **adversarially verified against the
-  published specs**. What remains is **not crypto-primitive work**: the **external audit** (the hard gate) +
-  the formal proofs; **live-TLS systems integration** (a real handshake state machine + record layer against
-  an actual server); and two internal wirings — `ectf::mul_shared` onto the `spdz` Beaver online, and the KOS
-  **Roy22** fix (it ships original KOS15). A **succinct** ZK shuffle is separate research.
+  The authenticated garbling online is exercised on a **real TLS key-schedule circuit** (the full SHA-256
+  compression, >10k ANDs — matches the plaintext oracle, aborts on a tampered wire), and `spdz::ectf_beaver`
+  runs ECtF's point-addition arithmetic over authenticated Beaver shares (MAC-checked, validated against
+  `p256`, aborts on a tampered triple). Every layer's abort mechanism is tested and the constructions were
+  **adversarially verified against the published specs**. What remains is **not crypto-primitive work**: the
+  **external audit** (the hard gate) + the formal proofs; **live-TLS systems integration** (a real handshake
+  state machine + record layer against an actual server); the **malicious generation** of the SPDZ/`F_pre`
+  Beaver triples end to end (MASCOT aBits + `sacrifice`; the online phase and ECtF arithmetic already run over
+  authenticated shares, but the triples are dealt honestly); and the KOS **Roy22** fix (it ships original
+  KOS15). A **succinct** ZK shuffle is separate research.
 - **REALITY full-session indistinguishability** — the REALITY authenticator is embedded in a real TLS 1.3
   ClientHello (`neo-transport::tls`, `build/parse_client_hello`) and an active prober is silently
   reverse-proxied to a genuine pinned upstream (`Conn::reverse_proxy_decoy`) — both built and tested. The

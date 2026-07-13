@@ -48,11 +48,17 @@
 //!   bucketing) → the **constant-round malicious online** ([`authgarble`]: WRK17/KRRW18
 //!   **authenticated garbling** — every wire a doubly-authenticated `{x}`, each AND a
 //!   half-gate pair, a corrupted garbled row ⇒ abort). Correctness + the abort mechanism
-//!   are tested; [`wrk17`] also has the equivalent interactive online. The **formal**
+//!   are tested; [`wrk17`] also has the equivalent interactive online, and the
+//!   authenticated online is exercised on a **real TLS key-schedule circuit** — the full
+//!   SHA-256 compression (>10k AND gates) under [`authgarble`], matching the plaintext
+//!   oracle and aborting on a tampered wire, not just a toy adder. The **formal**
 //!   malicious-security theorem is the papers' proof + the external audit — not
-//!   established by these correctness tests. The *EC-conversion* path's arithmetic
-//!   analog is [`spdz`] (MASCOT/SPDZ authenticated `F_p` shares, Beaver mult, triple
-//!   sacrifice); wiring [`ectf`]'s `mul_shared` onto it is the remaining integration.
+//!   established by these correctness tests. The *EC-conversion* path runs over the
+//!   arithmetic analog [`spdz`] (MASCOT/SPDZ authenticated `F_p` shares, Beaver mult,
+//!   triple sacrifice): [`spdz::ectf_beaver`] performs ECtF's point-addition arithmetic
+//!   (Δx², Δy², masked inversion, `λ²−x1−x2`) over authenticated Beaver, MAC-checked and
+//!   abort-tested against `p256`. What remains is the *malicious generation* of those
+//!   triples (MASCOT/sacrifice) end to end — the triples are dealt honestly here.
 //! - **Key schedule** — *built*: [`hkdf::hkdf_expand_label_shared`] runs TLS 1.3's
 //!   `HKDF-Expand-Label` (HMAC-SHA256, shared secret + public label) under 2PC,
 //!   matched byte-for-byte against the vetted `hmac`/`hkdf` crates.
@@ -79,11 +85,11 @@ pub mod spdz;
 pub mod wrk17;
 
 pub use authgarble::{bucketed_and_triples, eval_garbled, leaky_and, AShare, Deltas};
-pub use spdz::{beaver_mul, sacrifice};
 pub use convert::{a2b_shared, premaster_hash_from_point_shares};
 pub use ectf::ectf;
 pub use garble::{decode, evaluate, GarbledCircuit, Garbler};
 pub use hkdf::{hkdf_expand_label_shared, hmac_sha256_shared};
+pub use spdz::{beaver_mul, ectf_beaver, sacrifice};
 pub use wrk17::{
     bucketed_triples, combine, eval_authenticated, rand_shares, rand_triples, verify_triple, Keys,
     Share, Triple,

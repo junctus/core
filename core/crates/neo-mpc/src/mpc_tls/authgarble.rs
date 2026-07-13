@@ -399,6 +399,7 @@ fn shuffle<T>(items: &mut [T]) -> Result<()> {
 mod tests {
     use super::*;
     use crate::mpc_tls::circuit::Builder;
+    use crate::mpc_tls::sha256::sha256_compress_circuit;
 
     fn deal_triple(a: bool, b: bool, d: &Deltas) -> Triple {
         Triple(
@@ -599,5 +600,47 @@ mod tests {
                 "F_pre (leaky-AND+bucketing) → authenticated garbling: {x}+{y}"
             );
         }
+    }
+
+    #[test]
+    fn real_tls_key_schedule_circuit_under_authenticated_garbling() {
+        // The malicious online on a REAL TLS key-schedule circuit — the full SHA-256
+        // compression function (tens of thousands of AND gates), not a toy adder:
+        // authenticated garbling evaluates it correctly against the plaintext oracle,
+        // and a tampered wire aborts. This is the malicious 2PC online applied to the
+        // actual circuit the key schedule runs, closing the "authgarble only tested on
+        // an adder" gap.
+        let d = Deltas::random().unwrap();
+        let circuit = sha256_compress_circuit();
+        let n = circuit.and_gates();
+        assert!(
+            n > 10_000,
+            "sanity: SHA-256 compression is a large circuit ({n} ANDs)"
+        );
+
+        // A fixed pseudo-random input over all input wires (h_in ‖ block); only that the
+        // garbled result equals the plaintext circuit matters.
+        let bits: Vec<bool> = (0..circuit.input_bits)
+            .map(|i| i.wrapping_mul(2_654_435_761) & 1 == 1)
+            .collect();
+        let inputs: Vec<AShare> = bits.iter().map(|&v| AShare::deal(v, &d).unwrap()).collect();
+        let triples: Vec<Triple> = (0..n)
+            .map(|_| deal_triple(rand_bit().unwrap(), rand_bit().unwrap(), &d))
+            .collect();
+
+        let out = eval_garbled(&circuit, &inputs, &triples, &d).unwrap();
+        assert_eq!(
+            out,
+            circuit.eval(&bits),
+            "authenticated garbling matches the plaintext SHA-256 compression ({n} ANDs)"
+        );
+
+        // A single tampered input-share MAC aborts a MAC-checked open during evaluation.
+        let mut bad = inputs.clone();
+        bad[0].e.dg[0] ^= 1;
+        assert!(
+            eval_garbled(&circuit, &bad, &triples, &d).is_err(),
+            "a tampered wire must abort the real-circuit evaluation"
+        );
     }
 }

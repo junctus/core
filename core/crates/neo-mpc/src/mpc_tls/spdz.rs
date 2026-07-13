@@ -31,8 +31,12 @@
 //!   establish** (Beaver products are correct; a tampered share or a corrupted triple
 //!   aborts). The *formal* malicious guarantee is the SPDZ proof + the **external
 //!   audit** — not established by these correctness tests.
-//! - The (semi-honest) triples come from [`ectf::mta_fp`](super::ectf); wiring ECtF's
-//!   `mul_shared` onto this authenticated Beaver online is the remaining integration.
+//! - [`ectf_beaver`] wires ECtF's point-addition arithmetic (Δx², Δy², a masked
+//!   inversion, `λ² − x1 − x2`) onto this authenticated Beaver online — the malicious
+//!   analog of [`ectf::ectf`](super::ectf)'s semi-honest `mul_shared`, MAC-checked at
+//!   every open and validated against `p256`. What remains is the *malicious generation*
+//!   of the Beaver triples (MASCOT aBits + sacrifice) end to end; here they are dealt
+//!   honestly, as in the SPDZ online-phase tests.
 //! - Both parties are modelled **in-process**; `F_p` is `crypto-bigint`'s constant-time
 //!   Montgomery arithmetic (as in [`ectf`](super::ectf)); the real SPDZ open uses a
 //!   commit-then-open MAC check (here computed directly in-process).
@@ -62,6 +66,10 @@ impl Field {
     #[cfg(test)]
     fn elem(&self, v: u64) -> F {
         DynResidue::new(&U256::from(v), self.params)
+    }
+    #[cfg(test)]
+    fn load_be(&self, b: &[u8; 32]) -> F {
+        DynResidue::new(&U256::from_be_bytes(*b), self.params)
     }
     fn rand(&self) -> Result<F> {
         loop {
@@ -215,6 +223,48 @@ pub fn sacrifice(t: &Triple, aux: &Triple, keys: &Keys) -> Result<()> {
     Ok(())
 }
 
+/// **Malicious-secure ECtF over the SPDZ Beaver online** — the EC point→x-coordinate
+/// conversion ([`ectf`](super::ectf)) done over authenticated `[·]` shares so that a
+/// tampered value **aborts** (MAC-checked opens) instead of silently corrupting the
+/// pre-master, rather than the semi-honest direct-MtA path. Given authenticated
+/// coordinate shares `[x1],[y1]` (party A's point) and `[x2],[y2]` (party B's), and
+/// four Beaver triples (one per multiplication), returns `[x3]` — the authenticated
+/// share of the x-coordinate of `P1 + P2`.
+///
+/// Same chord math as [`ectf`](super::ectf): `Δx=x2−x1`, `Δy=y2−y1`, then `A=Δx²`,
+/// `B=Δy²`, a masked inversion (open `d = A·r`, `A⁻¹ = r·d⁻¹`), `λ² = (B·r)·d⁻¹`, and
+/// `x3 = λ² − x1 − x2` — but **every product is a MAC-checked [`beaver_mul`]** and the
+/// `A·r` reveal is a MAC-checked [`Auth::open`]. The triples come from `F_pre`
+/// (generated over the malicious OT + [`sacrifice`]-checked); here the caller supplies
+/// them. Requires `x1 ≠ x2` (distinct points — the chord case).
+pub fn ectf_beaver(
+    x1: &Auth,
+    y1: &Auth,
+    x2: &Auth,
+    y2: &Auth,
+    triples: &[Triple; 4],
+    keys: &Keys,
+) -> Result<Auth> {
+    let dx = x2.sub(x1); // Δx
+    let dy = y2.sub(y1); // Δy
+    let a = beaver_mul(&dx, &dx, &triples[0], keys)?; // A = Δx²
+    let b = beaver_mul(&dy, &dy, &triples[1], keys)?; // B = Δy²
+
+    // Masked inversion of A: draw a random [r], reveal d = A·r, so A⁻¹ = r·d⁻¹.
+    let r = Auth::deal(keys.field.rand()?, keys)?;
+    let d = beaver_mul(&a, &r, &triples[2], keys)?.open(keys)?; // A·r, MAC-checked
+    if is_zero(&d) {
+        return Err(Error::Crypto(
+            "ECtF/SPDZ: degenerate masked inversion (d = 0)".into(),
+        ));
+    }
+    let dinv = d.invert().0; // d ≠ 0 (guarded) ⇒ inverse exists
+
+    let br = beaver_mul(&b, &r, &triples[3], keys)?; // B·r
+    let lam2 = br.mul_const(dinv); // λ² = (B·r)·d⁻¹
+    Ok(lam2.sub(x1).sub(x2)) // x3 = λ² − x1 − x2
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +388,87 @@ mod tests {
         assert!(
             sacrifice(&bad, &aux, &k).is_err(),
             "a corrupted triple must fail the sacrifice check"
+        );
+    }
+
+    fn to_be(x: &F) -> [u8; 32] {
+        x.retrieve().to_be_bytes()
+    }
+
+    fn deal_rand_triple(k: &Keys) -> Triple {
+        let f = k.field;
+        let a = f.rand().unwrap();
+        let b = f.rand().unwrap();
+        Triple(
+            Auth::deal(a, k).unwrap(),
+            Auth::deal(b, k).unwrap(),
+            Auth::deal(a * b, k).unwrap(),
+        )
+    }
+
+    #[test]
+    fn ectf_beaver_matches_p256_and_aborts_on_tamper() {
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        use p256::ProjectivePoint;
+
+        let k = keys();
+        let f = k.field;
+        let g = ProjectivePoint::GENERATOR;
+        let mut mult = vec![g];
+        for _ in 0..8 {
+            let last = *mult.last().unwrap();
+            mult.push(last + g);
+        }
+        let coords = |pt: &p256::AffinePoint| -> ([u8; 32], [u8; 32]) {
+            let e = pt.to_encoded_point(false);
+            (
+                <[u8; 32]>::try_from(e.x().unwrap().as_slice()).unwrap(),
+                <[u8; 32]>::try_from(e.y().unwrap().as_slice()).unwrap(),
+            )
+        };
+        let deal_coords = |p: &p256::AffinePoint| {
+            let (x, y) = coords(p);
+            (
+                Auth::deal(f.load_be(&x), &k).unwrap(),
+                Auth::deal(f.load_be(&y), &k).unwrap(),
+            )
+        };
+
+        // Correctness: the malicious (authenticated) ECtF reconstructs P-256's real
+        // point-addition x-coordinate — validated against the vetted `p256` crate.
+        for (i, j) in [(0usize, 1usize), (2, 5)] {
+            let (ax1, ay1) = deal_coords(&mult[i].to_affine());
+            let (ax2, ay2) = deal_coords(&mult[j].to_affine());
+            let (sx, _) = coords(&(mult[i] + mult[j]).to_affine());
+            let triples = [
+                deal_rand_triple(&k),
+                deal_rand_triple(&k),
+                deal_rand_triple(&k),
+                deal_rand_triple(&k),
+            ];
+            let x3 = ectf_beaver(&ax1, &ay1, &ax2, &ay2, &triples, &k).unwrap();
+            assert_eq!(
+                to_be(&x3.open(&k).unwrap()),
+                sx,
+                "malicious ECtF (SPDZ Beaver) reconstructs P-256's ({i}G)+({j}G)"
+            );
+        }
+
+        // Malicious detection: tamper a triple share's MAC → a MAC-checked Beaver open
+        // aborts, instead of silently corrupting the pre-master (the whole point of the
+        // SPDZ wiring vs the semi-honest direct-MtA path).
+        let (ax1, ay1) = deal_coords(&mult[0].to_affine());
+        let (ax2, ay2) = deal_coords(&mult[1].to_affine());
+        let mut triples = [
+            deal_rand_triple(&k),
+            deal_rand_triple(&k),
+            deal_rand_triple(&k),
+            deal_rand_triple(&k),
+        ];
+        triples[0].0.ma += f.elem(1); // corrupt the MAC of the first triple's [a]
+        assert!(
+            ectf_beaver(&ax1, &ay1, &ax2, &ay2, &triples, &k).is_err(),
+            "a tampered triple share must abort the malicious ECtF"
         );
     }
 }

@@ -70,18 +70,23 @@ assembled at a single party** — built bottom-up, each layer checked against a 
     record framing** (`seal_tls13_record_shared`, nonce = `static_iv ⊕ seq`, KAT-pinned).
   - Malicious stack: **KOS** malicious OT (GF(2¹²⁸) correlation check, aborts a cheating receiver) → malicious
     **`F_pre`** (leaky-AND triples + WRK17 bucketing) → **constant-round authenticated garbling** (WRK17/KRRW18,
-    every wire doubly-authenticated, a corrupted garbled row ⇒ abort); **SPDZ** authenticated arithmetic
-    (Beaver mul + triple sacrifice) for the field path.
+    every wire doubly-authenticated, a corrupted garbled row ⇒ abort) — exercised on a **real TLS key-schedule
+    circuit** (full SHA-256 compression, >10k ANDs, matches the plaintext oracle + aborts on a tampered wire),
+    not just a toy adder. **SPDZ** authenticated arithmetic (Beaver mul + triple sacrifice) for the field path,
+    with **`ectf_beaver`** running ECtF's point-addition arithmetic over authenticated Beaver (MAC-checked,
+    validated against `p256`, aborts on a tampered triple).
   - Bridge: **ectf → a2b → SHA-256** chains EC point shares → `SHA-256(x-coordinate)` under 2PC (x-coord never
     assembled), validated against the `p256` crate + NIST SHA-256; A2B runs at the full 256-bit P-256 prime
     over constant-time `crypto-bigint` Montgomery residues. **HKDF-Expand-Label** under 2PC matched to the
     vetted `hmac`/`hkdf` crates.
 - **"Done" here means the crypto stack is complete + tested + verified — audit-gated like all of neo, not
   production-proven.** ~62 correctness/abort tests, all green.
-- Genuinely remaining (not crypto-primitive work): wire `ectf::mul_shared` onto the SPDZ Beaver online
-  (**M38**); the KOS Roy22 fix an auditor applies (ships original KOS15); the **live TLS** state machine +
-  record layer against a real server (**M45**). The live session path stays semi-honest with dual-execution's
-  ≤1-bit leak until M45 lands — that *security* cannot be established by correctness tests.
+- Genuinely remaining (not crypto-primitive work): **malicious generation** of the SPDZ/`F_pre` triples end
+  to end (MASCOT aBits + sacrifice — the ECtF arithmetic already runs over authenticated Beaver via
+  `ectf_beaver`, **M38**, but its triples are dealt honestly); the KOS Roy22 fix an auditor applies (ships
+  original KOS15); the **live TLS** state machine + record layer against a real server (**M45**). The live
+  session path stays semi-honest with dual-execution's ≤1-bit leak until M45 lands — that *security* cannot be
+  established by correctness tests.
 
 ### M28 — Verdict: the committee exit no one can subpoena ✅ (decrypt-direction, runnable end-to-end; real clearnet exit + DKG liveness deferred)
 The product wiring of the M12/M20/M22 committee crypto into a **runnable** exit whose operators are
@@ -322,10 +327,12 @@ noted inline.)
   `neo proxy --listen 127.0.0.1:1080` (SOCKS5 + HTTP CONNECT on loopback) that opens a logical stream per
   connection over a discovered mux circuit (reuse `serve_mux`, the exit SSRF/port guard). Instantly makes
   any browser/CLI usable — no new crypto or wire protocol.
-- **M38 — Wire ECtF onto the SPDZ Beaver online** ⬜ · ~1–2 wk. The one named internal wiring between
-  today's stack and **end-to-end malicious** EC conversion: replace `ectf`'s four `mul_shared` calls with
-  `spdz::beaver_mul` over authenticated `[x]` shares so a tampered multiplicand *aborts* via `sacrifice()`.
-  Both endpoints are built + tested; lowest-effort, highest-certainty security upgrade on the list.
+- **M38 — Wire ECtF onto the SPDZ Beaver online** ✅ (arithmetic wired; malicious triple *generation*
+  remaining). `spdz::ectf_beaver` runs ECtF's point-addition arithmetic (Δx², Δy², masked inversion,
+  `λ²−x1−x2`) over authenticated `[x]` Beaver shares — every open MAC-checked, validated against `p256`,
+  and **aborting on a tampered triple**. What's left of "end-to-end malicious EC conversion" is the
+  *generation* of those Beaver triples under MASCOT (aBits + `sacrifice`) rather than the honest dealer used
+  in the online-phase tests — folded into the malicious-triple-generation item under M24's remaining work.
 - **M39 — Operator observability** ⬜ · ~1–1.5 wk. Two relays, a seed and committee nodes run in
   production behind one `/healthz` string. Add a **localhost-only** (127.0.0.1) Prometheus `/metrics` +
   tiny status page: circuits served, bytes relayed, exit-reject rate by reason, dial-back pass/fail,
@@ -375,36 +382,5 @@ become concretely achievable once M45 lands.
 ## Audit gate ⬜
 External security + cryptography audit **before anyone relies on neo for real safety.** This is a hard
 gate, not a milestone to rush past.
-
----
-
-## Priority order (remaining work)
-
-Recommended sequence for everything still 🔨/⬜, ordered by leverage-per-effort and dependencies. The
-product waves (A–B) are mostly *outside* the crypto audit scope, so they run **in parallel** with the
-audit path (C). Two existing items are subsumed: **M31** → M41, **M8**'s deferred half → M46.
-
-**Wave A — make it usable & operable** *(low effort, high daily value; do first)*
-1. **M37** — SOCKS5 / HTTP-CONNECT front-end · point any app at neo (the mux circuit is built, just unexposed).
-2. **M39** — operator observability · stop flying blind on the live seed/relays/committee.
-3. **M41** — exit-policy engine + governor · the exit-supply unlock (already started — DNS un-blocked; finishes M31).
-4. **M42** — `neo doctor` connectivity + leak self-test · user trust ("am I actually protected?").
-5. **M38** — wire ECtF → SPDZ Beaver · small, high-certainty; completes **end-to-end malicious** EC conversion.
-
-**Wave B — resilience & supply** *(remove single points of failure, grow the network)*
-6. **M40** — 2nd independent seed + k-of-n witness quorum · kills the single-seed/single-witness bootstrap SPOF.
-7. **M43** — one-command signed relay onboarding · grow exit supply (signed static binaries + container).
-8. **M46** — client store distribution · notarized macOS + iOS TestFlight + Play AAB (clients already ship).
-
-**Wave C — the audit path & the flagship** *(the gates before real reliance; can overlap A–B)*
-9. **M44** — audit-readiness package · freeze scope + threat-model→code map; compresses the hard gate.
-10. **Audit gate** — engage the external cryptography audit · start once M38 + M44 land; the hard gate.
-11. **M27** — REALITY full-session indistinguishability *(🔨 in progress)* · the flagship censorship property.
-
-**Wave D — flagship capability & research horizon** *(larger / longer; sequence by appetite)*
-12. **M45** — live 2PC-TLS against a real server · the gap between "crypto complete" and "MPC-TLS works".
-13. **M33** — attestor (verifiable facts about a private TLS session) · category-defining; **gated on M45**.
-14. **M30** — fixed-cell constant-rate circuits · close the metadata size/timing tell.
-15. **M32** Relaykit credit economy · **M34** self-healing bootstrap · **M29** bridge-in-a-QR · **M35** enumeration-resistant bridge distribution.
 
 [`RelayReceipt`]: ../core/crates/neo-credits/src/earn.rs
