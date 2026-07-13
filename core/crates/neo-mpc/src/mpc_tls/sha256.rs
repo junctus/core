@@ -152,6 +152,22 @@ pub(crate) fn sha256_from_block_state(state: &[u8; 32], msg: &[u8]) -> [u8; 32] 
     out
 }
 
+/// The HMAC key-block chaining state `compress(H0, (key‖0…) ⊕ pad^64)` for a ≤32-byte key,
+/// computed in the CLEAR — used to precompute the ipad/opad states of an HMAC whose key is
+/// PUBLIC (e.g. HKDF-Extract's salt), so the circuit need not garble those two compressions.
+pub(crate) fn hmac_key_state(key: &[u8; 32], pad: u8) -> [u8; 32] {
+    let mut block = [pad; 64];
+    for (b, k) in block.iter_mut().zip(key) {
+        *b ^= k;
+    }
+    let h = compress_ref(H0, &block);
+    let mut out = [0u8; 32];
+    for i in 0..8 {
+        out[i * 4..i * 4 + 4].copy_from_slice(&h[i].to_be_bytes());
+    }
+    out
+}
+
 /// One SHA-256 compression (`h' = h + block-mixing`), the reference for the circuit.
 fn compress_ref(h: [u32; 8], block: &[u8; 64]) -> [u32; 8] {
     let mut w = [0u32; 64];

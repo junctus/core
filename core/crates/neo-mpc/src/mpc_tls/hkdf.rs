@@ -31,7 +31,7 @@ use neo_core::{Error, Result};
 
 use super::circuit::{Builder, Circuit};
 use super::engine::{eval_circuit, EngineKind};
-use super::sha256::{compress_circuit, sha256_from_block_state, H0};
+use super::sha256::{compress_circuit, hmac_key_state, sha256_from_block_state, H0};
 
 /// `HMAC-SHA256(kA ⊕ kB, msg)` under 2PC: the key is XOR-shared (`kA` party A, `kB`
 /// party B), `msg` is public. Returns XOR-shares `(outA, outB)` of the 32-byte tag,
@@ -407,46 +407,42 @@ fn outer_from_opad_circuit(inner: &[u8; 32]) -> Circuit {
 /// public constants; only the 32-byte message is shared, so both pad blocks
 /// (`K⊕ipad`, `K⊕opad`) are public and the inner/outer message blocks carry the shares.
 fn hmac_pub_key_circuit(key: &[u8; 32]) -> Circuit {
-    let mut b = Builder::new(768);
-    let h0: Vec<Vec<usize>> = H0.iter().map(|&h| b.word_const(h)).collect();
+    // The key is PUBLIC, so both HMAC key-block chaining states are computed in the CLEAR and
+    // baked in as constants — the circuit garbles only the two MESSAGE compressions (inner
+    // over the shared msg, outer over the shared inner digest), not the two key-block ones.
+    let ipad_state = hmac_key_state(key, 0x36);
+    let opad_state = hmac_key_state(key, 0x5c);
+    let state_words = |s: &[u8; 32], b: &mut Builder| -> Vec<Vec<usize>> {
+        (0..8)
+            .map(|w| b.word_const(u32::from_be_bytes(s[w * 4..w * 4 + 4].try_into().expect("4"))))
+            .collect()
+    };
 
+    let mut b = Builder::new(768);
     // msg = msgA ⊕ msgB, 8 big-endian 32-bit words (one SHA-256 block of shared data).
     let msg: Vec<Vec<usize>> = (0..8)
-        .map(|w| {
-            (0..32)
-                .map(|j| b.xor(w * 32 + j, 256 + w * 32 + j))
-                .collect()
-        })
+        .map(|w| (0..32).map(|j| b.xor(w * 32 + j, 256 + w * 32 + j)).collect())
         .collect();
 
-    // K zero-padded to 64 bytes = 16 big-endian words; high 8 words are 0.
-    let mut kw = [0u32; 16];
-    for (w, slot) in kw.iter_mut().enumerate().take(8) {
-        *slot = u32::from_be_bytes(key[w * 4..w * 4 + 4].try_into().expect("4 bytes"));
-    }
-
-    // Inner: H((K⊕ipad) ‖ msg). Block 0 public (K⊕0x36…36); block 1 = msg(shared)+pad.
-    let ipad_block: Vec<Vec<usize>> = kw.iter().map(|&w| b.word_const(w ^ 0x3636_3636)).collect();
-    let mut h = compress_circuit(&mut b, &h0, &ipad_block);
+    // Inner: compress(ipad_state, msg ‖ pad) — ipad_state precomputed (public key).
+    let ipad_cv = state_words(&ipad_state, &mut b);
     let mut inner_block: Vec<Vec<usize>> = msg;
     inner_block.push(b.word_const(0x8000_0000)); // 0x80 after the 32-byte message
     for _ in 9..15 {
         inner_block.push(b.word_const(0));
     }
     inner_block.push(b.word_const((64 + 32) * 8)); // bit length = 768
-    h = compress_circuit(&mut b, &h, &inner_block);
-    let inner_digest = h; // 8 words, shared
+    let inner_digest = compress_circuit(&mut b, &ipad_cv, &inner_block);
 
-    // Outer: H((K⊕opad) ‖ inner_digest). Block 0 public (K⊕0x5c…5c); final = digest+pad.
-    let opad_block: Vec<Vec<usize>> = kw.iter().map(|&w| b.word_const(w ^ 0x5c5c_5c5c)).collect();
-    let mut ho = compress_circuit(&mut b, &h0, &opad_block);
+    // Outer: compress(opad_state, inner_digest ‖ pad).
+    let opad_cv = state_words(&opad_state, &mut b);
     let mut final_block: Vec<Vec<usize>> = inner_digest;
     final_block.push(b.word_const(0x8000_0000));
     for _ in 9..15 {
         final_block.push(b.word_const(0));
     }
     final_block.push(b.word_const((64 + 32) * 8));
-    ho = compress_circuit(&mut b, &ho, &final_block);
+    let ho = compress_circuit(&mut b, &opad_cv, &final_block);
 
     // Output HMAC ⊕ maskA.
     let outputs: Vec<usize> = ho
