@@ -23,6 +23,9 @@ BIN_SRC="${1:?usage: sudo ANNOUNCE_ADDR=host:port ./install.sh <neo-binary>}"
 ANNOUNCE_ADDR="${ANNOUNCE_ADDR:?set ANNOUNCE_ADDR=<public-host:port>}"
 BIND="${BIND:-0.0.0.0:443}"
 if [[ "${EXIT:-1}" == "1" ]]; then EXIT_FLAG="--exit"; else EXIT_FLAG=""; fi
+# Optional: also serve networked two-party 2PC-TLS on a second port (MPC2PC=host:port).
+# Open that port inbound too. Peers connect with `neo mpc2pc --connect <host:port>`.
+if [[ -n "${MPC2PC:-}" ]]; then MPC2PC_FLAG="--mpc2pc-listen ${MPC2PC}"; else MPC2PC_FLAG=""; fi
 
 echo ">> installing neo binary to /usr/local/bin/neo"
 install -m 0755 "$BIN_SRC" /usr/local/bin/neo
@@ -47,6 +50,7 @@ echo ">> installing systemd service"
 sed -e "s|__ANNOUNCE_ADDR__|${ANNOUNCE_ADDR}|g" \
     -e "s|__BIND__|${BIND}|g" \
     -e "s|__EXIT__|${EXIT_FLAG}|g" \
+    -e "s|__MPC2PC__|${MPC2PC_FLAG}|g" \
     "$HERE/neo-relay.service" > /etc/systemd/system/neo-relay.service
 systemctl daemon-reload
 systemctl enable --now neo-relay.service
@@ -59,7 +63,8 @@ cat <<EOF
 
    role        : $([[ -n "$EXIT_FLAG" ]] && echo "relay + clearnet exit" || echo "forward-only relay")
    listen      : ${BIND}
-   advertised  : ${ANNOUNCE_ADDR}
+   advertised  : ${ANNOUNCE_ADDR}$([[ -n "$MPC2PC_FLAG" ]] && echo "
+   2pc-tls     : ${MPC2PC} (open this port inbound too)")
    node id     : ${NODE_ID}
 
  The relay registers with the baked-in discovery seeds automatically.

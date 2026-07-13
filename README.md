@@ -97,6 +97,65 @@ neo send --message "no relay on this path can read me" --hops 2
 Each relay peels one Sphinx layer and forwards to the next; only the exit sees the payload.
 `neo run` with no flags is a zero-config client that discovers and connects to a relay.
 
+## Run a relay or exit node
+
+Relays *are* the network — anyone can run one, and more relays mean more paths and stronger
+anonymity. A **relay** forwards onion traffic (it can never read it); an **exit** additionally
+egresses the last hop to the clearnet under its own IP. Both register with the discovery seed
+automatically and need no coordination with anyone.
+
+### One command (systemd / Linux)
+
+[`deploy/relay/`](deploy/relay/) installs a hardened `neo-relay.service` — dedicated system
+user, `ProtectSystem=strict`, `MemoryDenyWriteExecute`, and binds `:443` via
+`CAP_NET_BIND_SERVICE` without running as root:
+
+```sh
+cargo build --release -p neo-cli                       # build on the target OS
+sudo ANNOUNCE_ADDR=<your-public-ip>:443 EXIT=1 \
+  deploy/relay/install.sh target/release/neo
+```
+
+- **`ANNOUNCE_ADDR`** — the public `host:port` clients and the seed will dial (required).
+- **`BIND`** — what the process listens on (default `0.0.0.0:443`).
+- **`EXIT`** — `1` for a relay **+ clearnet exit** (egress under your IP; expect the occasional
+  abuse complaint), `0` for a **forward-only relay** (near-zero abuse risk).
+
+The identity persists at `/var/lib/neo-relay/relay.key`, so the relay keeps a stable node id —
+and its attested listing — across restarts. **Never delete it.**
+
+### Open the port
+
+The relay port (the one in `ANNOUNCE_ADDR`) **must be open inbound** in your firewall / cloud
+security group. It is needed both for client connections and for the seed's **dial-back health
+check** — until that succeeds the relay is registered but *not* attested, so it will not appear
+in snapshots.
+
+### Verify and manage
+
+```sh
+neo snapshot                     # your relay should be listed once the port is open
+systemctl status neo-relay
+journalctl -u neo-relay -f
+```
+
+### Manual (no systemd)
+
+```sh
+neo run --relay --exit --listen 0.0.0.0:443 --announce-addr <public-ip>:443 \
+  --identity relay.key
+```
+
+Drop `--exit` for a forward-only relay. The baked-in seeds find the public network; point at
+your own with `NEO_MIRRORS`/`NEO_WITNESSES`. On a low-RAM VPS the default LTO release profile
+can OOM — build with `CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16`.
+
+### Optional: 2PC-TLS co-processor endpoint (experimental)
+
+Add `--mpc2pc-listen 0.0.0.0:9700` to `neo run` (or `MPC2PC=0.0.0.0:9700` to `install.sh`) to
+also serve networked two-party 2PC-TLS sessions on a second port, in-process alongside the
+relay. Open that port inbound too; peers connect with `neo mpc2pc --connect <relay-ip>:9700`.
+
 ## License
 
 AGPL-3.0-or-later (placeholder — revisit before any release).

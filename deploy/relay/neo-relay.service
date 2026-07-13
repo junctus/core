@@ -11,7 +11,7 @@ Group=neo-relay
 # with the baked-in discovery seeds and re-registers on a heartbeat. The node
 # identity persists in /var/lib/neo-relay so the relay keeps a stable id (and
 # thus its attested listing) across restarts. install.sh patches the placeholders.
-ExecStart=/usr/local/bin/neo run --relay __EXIT__ --listen __BIND__ --announce-addr __ANNOUNCE_ADDR__ --identity /var/lib/neo-relay/relay.key
+ExecStart=/usr/local/bin/neo run --relay __EXIT__ --listen __BIND__ --announce-addr __ANNOUNCE_ADDR__ __MPC2PC__ --identity /var/lib/neo-relay/relay.key
 Restart=always
 RestartSec=5
 
