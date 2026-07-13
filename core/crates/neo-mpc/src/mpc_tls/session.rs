@@ -600,6 +600,7 @@ fn random_scalar() -> Result<Scalar> {
 
 #[cfg(test)]
 mod tests {
+
     use super::super::circuit::chacha20_block_ref;
     use super::*;
 

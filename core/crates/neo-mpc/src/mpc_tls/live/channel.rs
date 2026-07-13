@@ -65,11 +65,12 @@ pub struct TcpChannel {
 
 impl TcpChannel {
     pub fn connect(addr: std::net::SocketAddr) -> Result<Self> {
-        Ok(TcpChannel {
-            stream: TcpStream::connect(addr)?,
-        })
+        let stream = TcpStream::connect(addr)?;
+        stream.set_nodelay(true).ok(); // low-latency flights (chunked sends must not wait on Nagle)
+        Ok(TcpChannel { stream })
     }
     pub fn from_stream(stream: TcpStream) -> Self {
+        stream.set_nodelay(true).ok();
         TcpChannel { stream }
     }
 }

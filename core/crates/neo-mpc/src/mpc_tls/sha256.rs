@@ -11,6 +11,7 @@
 //! module's boundary.
 
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 use neo_core::{Error, Result};
 
@@ -183,7 +184,12 @@ fn ssig1(x: u32) -> u32 {
 
 /// A SHA-256 compression as a circuit: inputs `h_in[256] ‖ block[512]` (768),
 /// output the 256-bit updated chaining value. Verified against [`compress_ref`].
-pub fn sha256_compress_circuit() -> Circuit {
+pub fn sha256_compress_circuit() -> &'static Circuit {
+    static CIRCUIT: OnceLock<Circuit> = OnceLock::new();
+    CIRCUIT.get_or_init(build_sha256_compress_circuit)
+}
+
+fn build_sha256_compress_circuit() -> Circuit {
     let mut b = Builder::new(768);
     let h_in: Vec<Vec<usize>> = (0..8).map(|i| (i * 32..i * 32 + 32).collect()).collect();
     let block: Vec<Vec<usize>> = (0..16)

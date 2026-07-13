@@ -37,6 +37,11 @@ use super::garble::{decode, evaluate, AndTable, Garbler, Label};
 use super::live::channel::Channel;
 use super::ot;
 
+/// AND tables streamed per `ch.send`/`recv` on flight 1 — 32 KiB of scratch, so neither
+/// party ever buffers the whole (message-sized) table set. The wire bytes are identical to
+/// one big send (the channel is an unframed byte stream).
+const TABLES_PER_CHUNK: usize = 1024;
+
 fn point_bytes(p: &RistrettoPoint) -> [u8; 32] {
     p.compress().to_bytes()
 }
@@ -75,34 +80,44 @@ pub fn garbler_run(
         return Err(Error::Crypto("garble-net: wrong input width".into()));
     }
     let g = Garbler::garble(circuit)?;
-    let gc = g.garbled(circuit);
+    let decoding = g.decoding(circuit);
     let evs = ev_sorted(ev_wires);
 
-    // Flight 1: tables ‖ decoding ‖ garbler-labels ‖ OT setups.
-    let mut f1 = Vec::new();
-    for (tg, te) in &gc.tables {
-        f1.extend_from_slice(tg);
-        f1.extend_from_slice(te);
+    // Flight 1 = tables ‖ decoding ‖ garbler-labels ‖ OT setups. The bytes on the wire are
+    // unchanged (send is `write_all`, no framing), but the tables are **streamed** in fixed
+    // chunks rather than materialised into one buffer — so the garbler never holds a second
+    // full copy of the (message-sized) tables. See [`garbled`](super::garble::Garbler) is
+    // no longer cloned.
+    let mut buf = Vec::with_capacity(TABLES_PER_CHUNK * 32);
+    for chunk in g.tables().chunks(TABLES_PER_CHUNK) {
+        buf.clear();
+        for (tg, te) in chunk {
+            buf.extend_from_slice(tg);
+            buf.extend_from_slice(te);
+        }
+        ch.send(&buf)?;
     }
-    let mut dec = vec![0u8; gc.decoding.len().div_ceil(8)];
-    for (i, &b) in gc.decoding.iter().enumerate() {
+    // Tail (decoding ‖ garbler-labels ‖ OT setups), one send — built in the same order.
+    let mut tail = Vec::new();
+    let mut dec = vec![0u8; decoding.len().div_ceil(8)];
+    for (i, &b) in decoding.iter().enumerate() {
         if b {
             dec[i / 8] |= 1 << (i % 8);
         }
     }
-    f1.extend_from_slice(&dec);
+    tail.extend_from_slice(&dec);
     for (w, &bit) in inputs.iter().enumerate() {
         if !ev_wires.contains(&w) {
-            f1.extend_from_slice(&g.input_label(w, bit));
+            tail.extend_from_slice(&g.input_label(w, bit));
         }
     }
     let mut setups = Vec::with_capacity(evs.len());
     for _ in &evs {
         let s = ot::sender_setup()?;
-        f1.extend_from_slice(&point_bytes(&s.s));
+        tail.extend_from_slice(&point_bytes(&s.s));
         setups.push(s);
     }
-    ch.send(&f1)?; // [flight 1]
+    ch.send(&tail)?; // [flight 1]
 
     // Flight 2 (recv): the OT receiver points. Flight 3 (send): the OT ciphertexts.
     let r_raw = ch.recv_exact(evs.len() * 32)?; // [flight 2]
@@ -136,23 +151,29 @@ pub fn evaluator_run(
     let n_out = circuit.outputs.len();
     let n_g = circuit.input_bits - evs.len();
 
-    // Flight 1 (recv): sizes are all derivable from the (public) circuit + ev_wires.
-    let tbl = n_and * 32;
+    // Flight 1 (recv): sizes are all derivable from the (public) circuit + ev_wires. Tables
+    // arrive streamed in ≤32 KiB chunks straight into the pre-sized `Vec<AndTable>` (no
+    // whole-flight buffer), then a single tail recv for decoding ‖ labels ‖ OT points.
     let dec_bytes = n_out.div_ceil(8);
     let lbl = n_g * 16;
-    let f1 = ch.recv_exact(tbl + dec_bytes + lbl + evs.len() * 32)?; // [flight 1]
+
+    let mut tables: Vec<AndTable> = Vec::with_capacity(n_and);
+    let mut remaining = n_and;
+    while remaining > 0 {
+        let take = remaining.min(TABLES_PER_CHUNK);
+        let chunk = ch.recv_exact(take * 32)?;
+        for i in 0..take {
+            let b = i * 32;
+            tables.push((label16(&chunk[b..b + 16]), label16(&chunk[b + 16..b + 32])));
+        }
+        remaining -= take;
+    }
+
+    let tail = ch.recv_exact(dec_bytes + lbl + evs.len() * 32)?;
     let mut off = 0;
 
-    let tables: Vec<AndTable> = (0..n_and)
-        .map(|i| {
-            let b = off + i * 32;
-            (label16(&f1[b..b + 16]), label16(&f1[b + 16..b + 32]))
-        })
-        .collect();
-    off += tbl;
-
     let decoding: Vec<bool> = (0..n_out)
-        .map(|i| (f1[off + i / 8] >> (i % 8)) & 1 == 1)
+        .map(|i| (tail[off + i / 8] >> (i % 8)) & 1 == 1)
         .collect();
     off += dec_bytes;
 
@@ -160,14 +181,14 @@ pub fn evaluator_run(
     let mut gi = 0;
     for (w, label) in labels.iter_mut().enumerate() {
         if !ev_wires.contains(&w) {
-            *label = label16(&f1[off + gi * 16..off + gi * 16 + 16]);
+            *label = label16(&tail[off + gi * 16..off + gi * 16 + 16]);
             gi += 1;
         }
     }
     off += lbl;
 
     let s_points: Vec<RistrettoPoint> = (0..evs.len())
-        .map(|i| read_point(&f1[off + i * 32..off + i * 32 + 32]))
+        .map(|i| read_point(&tail[off + i * 32..off + i * 32 + 32]))
         .collect::<Result<_>>()?;
 
     // Flight 2 (send): OT receiver responses; keep the receiver state for finishing.

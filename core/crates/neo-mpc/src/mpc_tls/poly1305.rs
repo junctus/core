@@ -17,7 +17,8 @@
 //! block would be mis-padded). Multi-block messages would iterate the same circuit
 //! by Horner — that iteration is **not** implemented here.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use neo_core::{Error, Result};
 
@@ -431,7 +432,23 @@ fn poly_finalize_net(
 /// `rA[128] ‖ rB[128] ‖ accA[132] ‖ accB[132] ‖ n×(blockA[128]‖blockB[128]) ‖ maskA[132]`.
 /// The loop body is identical to [`tag_circuit_multi`]'s, but the accumulator comes from
 /// input shares (so it can be threaded across calls) instead of starting at zero.
-fn poly_chunk_circuit(n: usize) -> Circuit {
+fn poly_chunk_circuit(n: usize) -> Arc<Circuit> {
+    static CACHE: OnceLock<Mutex<HashMap<usize, Arc<Circuit>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(c) = cache.lock().expect("poly cache").get(&n) {
+        return Arc::clone(c);
+    }
+    let built = Arc::new(build_poly_chunk_circuit(n));
+    Arc::clone(
+        cache
+            .lock()
+            .expect("poly cache")
+            .entry(n)
+            .or_insert(built),
+    )
+}
+
+fn build_poly_chunk_circuit(n: usize) -> Circuit {
     let n_inputs = 652 + n * 256;
     let mut b = Builder::new(n_inputs);
     let zero = b.zero();
@@ -460,7 +477,12 @@ fn poly_chunk_circuit(n: usize) -> Circuit {
 
 /// The Poly1305 finalize circuit: `(acc + s) mod 2¹²⁸`, XOR-masked. Layout:
 /// `accA[132] ‖ accB[132] ‖ sA[128] ‖ sB[128] ‖ maskA[128]`.
-fn poly_finalize_circuit() -> Circuit {
+fn poly_finalize_circuit() -> &'static Circuit {
+    static CIRCUIT: OnceLock<Circuit> = OnceLock::new();
+    CIRCUIT.get_or_init(build_poly_finalize_circuit)
+}
+
+fn build_poly_finalize_circuit() -> Circuit {
     let n_inputs = 648;
     let mut b = Builder::new(n_inputs);
     let zero = b.zero();

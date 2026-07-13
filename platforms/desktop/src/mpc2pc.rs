@@ -34,7 +34,6 @@ use p256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
 use p256::{AffinePoint, EncodedPoint, FieldBytes, NonZeroScalar, ProjectivePoint, Scalar};
 use rand_core::OsRng;
 
-use neo_mpc::mpc_tls::circuit::Circuit;
 use neo_mpc::mpc_tls::ectf::{ectf_a, ectf_b};
 use neo_mpc::mpc_tls::engine::EngineKind;
 use neo_mpc::mpc_tls::garble_net::{evaluator_run, garbler_run};
@@ -294,7 +293,7 @@ fn garbled_key_schedule(
     ch: &mut dyn Channel,
     verbose: bool,
 ) -> anyhow::Result<std::time::Duration> {
-    let circuit: Circuit = sha256_compress_circuit();
+    let circuit = sha256_compress_circuit();
     let ands = circuit.and_gates();
     if verbose {
         println!("\n[2/2] Garbled key-schedule circuit — SHA-256 compression ({ands} AND gates)");

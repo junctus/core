@@ -8,6 +8,8 @@
 //! "free" under free-XOR garbling; AND is the only gate that costs ciphertexts,
 //! which is why the adder (its carry chain) is the thing we count.
 
+use std::sync::OnceLock;
+
 /// A boolean gate over wire indices.
 #[derive(Clone, Copy, Debug)]
 pub enum Gate {
@@ -204,7 +206,12 @@ pub fn chacha20_block() -> Circuit {
 /// keystream **XOR-masked** by `maskA` (so the party that decodes learns only
 /// `KS ⊕ maskA`, and the party holding `maskA` learns only `maskA` — neither
 /// learns the keystream). Output wires (`512`): `KS ⊕ maskA`.
-pub fn chacha20_block_2pc() -> Circuit {
+pub fn chacha20_block_2pc() -> &'static Circuit {
+    static CIRCUIT: OnceLock<Circuit> = OnceLock::new();
+    CIRCUIT.get_or_init(build_chacha20_block_2pc)
+}
+
+fn build_chacha20_block_2pc() -> Circuit {
     let mut b = Builder::new(1152);
     // key = keyA ⊕ keyB
     let key: Vec<usize> = (0..256).map(|i| b.xor(i, 256 + i)).collect();

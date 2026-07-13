@@ -10,11 +10,61 @@
 //! per-gate tweak (a correlation-robust hash in the random-oracle model).
 
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 use neo_core::{Error, Result};
+use rayon::prelude::*;
 
 use super::circuit::{Circuit, Gate};
 use super::ot;
+
+/// A topological **leveling** of a circuit for data-parallel garbling/evaluation. Gates at
+/// the same depth read only strictly-earlier wires (inputs have smaller indices than any
+/// gate output, and each wire is written once), so a whole level is independent and can be
+/// processed in parallel. `and_gid[gi]` is the AND-gate ordinal (its garbled-table index and
+/// blake3 tweak seed) precomputed in gate order — so the tweak/table order is identical to
+/// the sequential version regardless of parallel completion order.
+struct Plan {
+    levels: Vec<Vec<usize>>,
+    and_gid: Vec<u64>,
+    n_and: usize,
+}
+
+fn plan(circuit: &Circuit) -> Plan {
+    let mut wire_level = vec![0u32; circuit.num_wires]; // inputs = level 0
+    let mut gate_level = vec![0u32; circuit.gates.len()];
+    let mut and_gid = vec![0u64; circuit.gates.len()];
+    let mut gid = 0u64;
+    let mut maxl = 0u32;
+    for (gi, gate) in circuit.gates.iter().enumerate() {
+        let (o, lvl) = match *gate {
+            Gate::Xor(a, b, o) => (o, 1 + wire_level[a].max(wire_level[b])),
+            Gate::Inv(a, o) => (o, 1 + wire_level[a]),
+            Gate::And(a, b, o) => {
+                and_gid[gi] = gid;
+                gid += 1;
+                (o, 1 + wire_level[a].max(wire_level[b]))
+            }
+        };
+        debug_assert!(o >= circuit.input_bits, "gate must not write an input wire");
+        wire_level[o] = lvl;
+        gate_level[gi] = lvl;
+        maxl = maxl.max(lvl);
+    }
+    let mut levels = vec![Vec::new(); maxl as usize + 1];
+    for (gi, &l) in gate_level.iter().enumerate() {
+        levels[l as usize].push(gi);
+    }
+    Plan {
+        levels,
+        and_gid,
+        n_and: gid as usize,
+    }
+}
+
+/// Minimum gates per rayon task — batches tiny levels so per-task overhead can't dominate
+/// the many shallow levels of deep-but-narrow circuits (carry chains).
+const PAR_MIN_LEN: usize = 256;
 
 /// A wire label (128-bit).
 pub type Label = [u8; 16];
@@ -44,9 +94,17 @@ fn cond_xor(base: &Label, cond: bool, x: &Label) -> Label {
     }
 }
 
+/// The BLAKE3 hasher pre-keyed with the garble context. `new_derive_key` re-runs the
+/// context KDF on every call, so we derive it once and clone the (cheap) keyed state per
+/// hash — byte-identical output, but millions of KDF re-derivations saved per handshake.
+fn keyed_hasher() -> &'static blake3::Hasher {
+    static K: OnceLock<blake3::Hasher> = OnceLock::new();
+    K.get_or_init(|| blake3::Hasher::new_derive_key("neo-mpc-garble-v1"))
+}
+
 /// Correlation-robust hash `H(label, tweak)` → 128 bits.
 fn h(label: &Label, tweak: u64) -> Label {
-    let mut hh = blake3::Hasher::new_derive_key("neo-mpc-garble-v1");
+    let mut hh = keyed_hasher().clone();
     hh.update(&tweak.to_le_bytes());
     hh.update(label);
     let mut o = [0u8; 16];
@@ -90,17 +148,32 @@ impl Garbler {
             *z = rand_label()?;
         }
 
-        let mut tables = Vec::with_capacity(circuit.and_gates());
-        let mut gid = 0u64;
-        for gate in &circuit.gates {
-            match *gate {
-                Gate::Xor(a, b, o) => zero[o] = xor(&zero[a], &zero[b]),
-                Gate::Inv(a, o) => zero[o] = xor(&zero[a], &delta), // fold flip into the zero-label
-                Gate::And(a, b, o) => {
-                    let (wc0, table) = garble_and(&zero[a], &zero[b], &delta, gid);
-                    zero[o] = wc0;
-                    tables.push(table);
-                    gid += 1;
+        // Garble level-by-level: gates within a level read only earlier-level (final) wire
+        // labels, so the (blake3-heavy) per-gate work runs in parallel; a trivial sequential
+        // scatter then writes each unique output wire and `tables[gid]`. Byte-identical to a
+        // sequential garble — the RNG prologue above is untouched, the gate body is pure, and
+        // `and_gid` fixes the table/tweak order.
+        let p = plan(circuit);
+        let mut tables = vec![([0u8; 16], [0u8; 16]); p.n_and];
+        let mut scratch: Vec<(usize, Label, Option<(u64, AndTable)>)> = Vec::new();
+        for level in &p.levels {
+            level
+                .par_iter()
+                .with_min_len(PAR_MIN_LEN)
+                .map(|&gi| match circuit.gates[gi] {
+                    Gate::Xor(a, b, o) => (o, xor(&zero[a], &zero[b]), None),
+                    Gate::Inv(a, o) => (o, xor(&zero[a], &delta), None),
+                    Gate::And(a, b, o) => {
+                        let gid = p.and_gid[gi];
+                        let (wc0, table) = garble_and(&zero[a], &zero[b], &delta, gid);
+                        (o, wc0, Some((gid, table)))
+                    }
+                })
+                .collect_into_vec(&mut scratch); // reuses the allocation across levels
+            for (o, label, and) in scratch.drain(..) {
+                zero[o] = label;
+                if let Some((gid, table)) = and {
+                    tables[gid as usize] = table;
                 }
             }
         }
@@ -136,12 +209,19 @@ impl Garbler {
     pub fn garbled(&self, circuit: &Circuit) -> GarbledCircuit {
         GarbledCircuit {
             tables: self.tables.clone(),
-            decoding: circuit
-                .outputs
-                .iter()
-                .map(|&o| color(&self.zero[o]))
-                .collect(),
+            decoding: self.decoding(circuit),
         }
+    }
+
+    /// Borrow the AND tables in gid order (avoids the [`garbled`](Self::garbled) clone —
+    /// the networked garbler streams these directly).
+    pub fn tables(&self) -> &[AndTable] {
+        &self.tables
+    }
+
+    /// The output decoding (colour of each output wire's zero-label).
+    pub fn decoding(&self, circuit: &Circuit) -> Vec<bool> {
+        circuit.outputs.iter().map(|&o| color(&self.zero[o])).collect()
     }
 }
 
@@ -153,15 +233,18 @@ fn garble_and(wa0: &Label, wb0: &Label, delta: &Label, gid: u64) -> (Label, AndT
     let jg = 2 * gid;
     let je = 2 * gid + 1;
 
+    // Hash each input zero-label once (reused by the table + the output label).
+    let hwa0 = h(wa0, jg);
+    let hwb0 = h(wb0, je);
     // Generator half-gate.
     let tg = xor(
-        &xor(&h(wa0, jg), &h(&wa1, jg)),
+        &xor(&hwa0, &h(&wa1, jg)),
         &if pb { *delta } else { [0u8; 16] },
     );
-    let wg0 = cond_xor(&h(wa0, jg), pa, &tg);
+    let wg0 = cond_xor(&hwa0, pa, &tg);
     // Evaluator half-gate.
-    let te = xor(&xor(&h(wb0, je), &h(&wb1, je)), wa0);
-    let we0 = cond_xor(&h(wb0, je), pb, &xor(&te, wa0));
+    let te = xor(&xor(&hwb0, &h(&wb1, je)), wa0);
+    let we0 = cond_xor(&hwb0, pb, &xor(&te, wa0));
 
     (xor(&wg0, &we0), (tg, te))
 }
@@ -171,16 +254,25 @@ fn garble_and(wa0: &Label, wb0: &Label, delta: &Label, gid: u64) -> (Label, AndT
 pub fn evaluate(circuit: &Circuit, tables: &[AndTable], input_labels: &[Label]) -> Vec<Label> {
     let mut w = vec![[0u8; 16]; circuit.num_wires];
     w[..circuit.input_bits].copy_from_slice(input_labels);
-    let mut gid = 0usize;
-    for gate in &circuit.gates {
-        match *gate {
-            Gate::Xor(a, b, o) => w[o] = xor(&w[a], &w[b]),
-            Gate::Inv(a, o) => w[o] = w[a], // flip is absorbed by the decoding colour
-            Gate::And(a, b, o) => {
-                let (tg, te) = tables[gid];
-                w[o] = eval_and(&w[a], &w[b], &tg, &te, gid as u64);
-                gid += 1;
-            }
+    // Level-parallel, mirroring `garble`: each level's gates read only earlier-level wires.
+    let p = plan(circuit);
+    let mut scratch: Vec<(usize, Label)> = Vec::new();
+    for level in &p.levels {
+        level
+            .par_iter()
+            .with_min_len(PAR_MIN_LEN)
+            .map(|&gi| match circuit.gates[gi] {
+                Gate::Xor(a, b, o) => (o, xor(&w[a], &w[b])),
+                Gate::Inv(a, o) => (o, w[a]), // flip absorbed by the decoding colour
+                Gate::And(a, b, o) => {
+                    let gid = p.and_gid[gi];
+                    let (tg, te) = tables[gid as usize];
+                    (o, eval_and(&w[a], &w[b], &tg, &te, gid))
+                }
+            })
+            .collect_into_vec(&mut scratch);
+        for (o, label) in scratch.drain(..) {
+            w[o] = label;
         }
     }
     circuit.outputs.iter().map(|&o| w[o]).collect()
