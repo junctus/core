@@ -173,6 +173,10 @@ impl KeyScheduleNet {
     pub fn server_application_secret_share(&self) -> [u8; 32] {
         self.server_ap.expect("derive_application first")
     }
+    /// This party's shares of the client application `(key, iv)`.
+    pub fn client_application_keys_share(&self, ch: &mut dyn Channel) -> Result<([u8; 32], [u8; 32])> {
+        traffic_keys(ch, self.party, &self.client_ap.expect("derive_application first"))
+    }
     /// This party's shares of the server application `(key, iv)`.
     pub fn server_application_keys_share(&self, ch: &mut dyn Channel) -> Result<([u8; 32], [u8; 32])> {
         traffic_keys(ch, self.party, &self.server_ap.expect("derive_application first"))
