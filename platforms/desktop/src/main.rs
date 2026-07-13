@@ -202,6 +202,11 @@ enum Command {
         /// Party B / evaluator: connect to the peer at this `host:port`.
         #[arg(long, conflicts_with = "listen")]
         connect: Option<String>,
+        /// Run the **full** networked handshake key-agreement driver (ECDHE conversion +
+        /// the entire TLS 1.3 key schedule over the channel), self-verified against the
+        /// in-process reference, instead of the lighter ECtF + single-circuit demo.
+        #[arg(long)]
+        full: bool,
     },
 }
 
@@ -316,7 +321,9 @@ async fn main() -> anyhow::Result<()> {
             // change unless `--mpc2pc-listen` is passed.
             if let Some(addr) = mpc2pc_listen {
                 std::thread::spawn(move || {
-                    if let Err(e) = mpc2pc::serve(&addr, false) {
+                    // The standing relay endpoint serves the lighter demo session (low
+                    // bandwidth); the full key-agreement driver is an on-demand `--full` run.
+                    if let Err(e) = mpc2pc::serve(&addr, false, false) {
                         tracing::error!("mpc2pc listener exited: {e}");
                     }
                 });
@@ -422,7 +429,11 @@ async fn main() -> anyhow::Result<()> {
                 roles::run_committee_send(descriptor, &destination, &message, cfg).await?
             }
         },
-        Command::Mpc2pc { listen, connect } => mpc2pc::run(listen, connect)?,
+        Command::Mpc2pc {
+            listen,
+            connect,
+            full,
+        } => mpc2pc::run(listen, connect, full)?,
     }
     Ok(())
 }

@@ -36,9 +36,13 @@ use rand_core::OsRng;
 
 use neo_mpc::mpc_tls::circuit::Circuit;
 use neo_mpc::mpc_tls::ectf::{ectf_a, ectf_b};
+use neo_mpc::mpc_tls::engine::EngineKind;
 use neo_mpc::mpc_tls::garble_net::{evaluator_run, garbler_run};
 use neo_mpc::mpc_tls::live::channel::{Channel, TcpChannel};
-use neo_mpc::mpc_tls::sha256::sha256_compress_circuit;
+use neo_mpc::mpc_tls::live::netschedule::{derive_ecdhe_share_net, KeyScheduleNet};
+use neo_mpc::mpc_tls::live::schedule::KeySchedule;
+use neo_mpc::mpc_tls::netengine::Party;
+use neo_mpc::mpc_tls::sha256::{sha256, sha256_compress_circuit};
 
 /// P-256 base field prime, big-endian — for reconstructing the ECtF x-coordinate share
 /// with an independent bignum library (num-bigint), so it is cross-checked, not self-compared.
@@ -63,16 +67,17 @@ pub struct SessionReport {
 }
 
 /// Entry point for the `neo mpc2pc` subcommand. `--listen` becomes a **persistent** party-A
-/// server (one session per inbound connection, verbose); `--connect` runs one party-B session.
-pub fn run(listen: Option<String>, connect: Option<String>) -> anyhow::Result<()> {
+/// server (one session per inbound connection, verbose); `--connect` runs one party-B
+/// session. `full` selects the whole networked key-agreement driver over the lighter demo.
+pub fn run(listen: Option<String>, connect: Option<String>, full: bool) -> anyhow::Result<()> {
     match (listen, connect) {
-        (Some(addr), None) => serve(&addr, true),
+        (Some(addr), None) => serve(&addr, true, full),
         (None, Some(addr)) => {
             println!("neo mpc2pc — party B (evaluator). Connecting to {addr}…");
             let sock = TcpStream::connect(&addr).with_context(|| format!("connect {addr}"))?;
             println!("  connected");
             let mut ch = TcpChannel::from_stream(sock);
-            run_session(Role::B, &mut ch, true)?;
+            run_session(Role::B, &mut ch, true, full)?;
             Ok(())
         }
         _ => bail!("provide exactly one of --listen <addr> (party A) or --connect <addr> (party B)"),
@@ -85,11 +90,12 @@ pub fn run(listen: Option<String>, connect: Option<String>) -> anyhow::Result<()
 /// --mpc2pc-listen <addr>` runs in-process alongside the relay: a standing 2PC-TLS
 /// co-processor endpoint. `verbose` prints the full per-session transcript (CLI); when
 /// false (relay mode) each session logs a single `tracing` summary line to the journal.
-pub fn serve(addr: &str, verbose: bool) -> anyhow::Result<()> {
+pub fn serve(addr: &str, verbose: bool, full: bool) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).with_context(|| format!("bind {addr}"))?;
-    tracing::info!("mpc2pc: serving networked 2PC-TLS (party A) on {addr}");
+    let mode = if full { "full key-agreement" } else { "demo" };
+    tracing::info!("mpc2pc: serving networked 2PC-TLS (party A, {mode}) on {addr}");
     if verbose {
-        println!("neo mpc2pc — party A (garbler). Serving on {addr}, one session per peer…");
+        println!("neo mpc2pc — party A (garbler). Serving on {addr} ({mode}), one session per peer…");
     }
     for stream in listener.incoming() {
         let stream = match stream {
@@ -102,9 +108,9 @@ pub fn serve(addr: &str, verbose: bool) -> anyhow::Result<()> {
         let peer = stream.peer_addr().ok();
         std::thread::spawn(move || {
             let mut ch = TcpChannel::from_stream(stream);
-            match run_session(Role::A, &mut ch, verbose) {
+            match run_session(Role::A, &mut ch, verbose, full) {
                 Ok(rep) => tracing::info!(
-                    "mpc2pc: served {peer:?} — ECtF {:?}, garbled SHA-256 {:?}",
+                    "mpc2pc: served {peer:?} — ECDHE {:?}, key schedule {:?}",
                     rep.ectf,
                     rep.garble
                 ),
@@ -115,9 +121,18 @@ pub fn serve(addr: &str, verbose: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Run the full two-party session on an established channel: ECtF ECDHE conversion, then
-/// the garbled SHA-256 key-schedule circuit, self-verifying each.
-fn run_session(role: Role, ch: &mut dyn Channel, verbose: bool) -> anyhow::Result<SessionReport> {
+/// Run one two-party session on an established channel, self-verifying. The `full` driver
+/// runs the entire networked handshake key agreement; otherwise the lighter ECtF +
+/// single-circuit demo.
+fn run_session(
+    role: Role,
+    ch: &mut dyn Channel,
+    verbose: bool,
+    full: bool,
+) -> anyhow::Result<SessionReport> {
+    if full {
+        return full_key_agreement(role, ch, verbose);
+    }
     let ectf = ectf_ecdhe(role, ch, verbose)?;
     let garble = garbled_key_schedule(role, ch, verbose)?;
     if verbose {
@@ -289,4 +304,132 @@ fn garbled_key_schedule(
             Ok(elapsed)
         }
     }
+}
+
+// ---- full networked handshake key-agreement driver ----------------------------------
+
+/// Fixed public transcript stand-ins for the demo (their content is opaque to the schedule —
+/// only their hashes enter the HKDF contexts, exactly as real handshake bytes would).
+const CH_SH: &[u8] = b"neo-2pc-tls: ClientHello||ServerHello";
+const CH_SFIN: &[u8] = b"neo-2pc-tls: ClientHello..server Finished";
+const CV: &[u8] = b"neo-2pc-tls: ClientHello..CertVerify";
+
+fn party_of(role: Role) -> Party {
+    match role {
+        Role::A => Party::A,
+        Role::B => Party::B,
+    }
+}
+
+/// Run the **entire networked handshake key agreement** over the channel — ECDHE conversion
+/// (ECtF + A2B) then the full TLS 1.3 key schedule — then self-verify the combined shares
+/// against the vetted in-process [`KeySchedule`] reference. Both parties run the identical
+/// gadget sequence so the channel stays in lockstep.
+fn full_key_agreement(role: Role, ch: &mut dyn Channel, verbose: bool) -> anyhow::Result<SessionReport> {
+    let party = party_of(role);
+
+    // Public server key share Y: A mints an ephemeral one and discards the scalar; B receives.
+    let y_point: ProjectivePoint = match role {
+        Role::A => {
+            let y = ProjectivePoint::GENERATOR * random_scalar(); // discard the server scalar
+            ch.send(y.to_affine().to_encoded_point(false).as_bytes())
+                .map_err(|e| anyhow!("send Y: {e}"))?;
+            y
+        }
+        Role::B => {
+            let buf = ch.recv_exact(65).map_err(|e| anyhow!("recv Y: {e}"))?;
+            let enc = EncodedPoint::from_bytes(&buf).map_err(|e| anyhow!("decode Y: {e}"))?;
+            let aff: AffinePoint = Option::<AffinePoint>::from(AffinePoint::from_encoded_point(&enc))
+                .ok_or_else(|| anyhow!("Y is not a valid P-256 point"))?;
+            ProjectivePoint::from(aff)
+        }
+    };
+    let y_sec1 = y_point.to_affine().to_encoded_point(false).as_bytes().to_vec();
+
+    // This party's ephemeral scalar share.
+    let x = random_scalar();
+
+    if verbose {
+        println!("\n[1/3] Networked ECDHE conversion (ECtF + A2B) — over the channel");
+    }
+    let t = Instant::now();
+    let ecdhe = derive_ecdhe_share_net(ch, party, &x, &y_sec1).map_err(|e| anyhow!("ecdhe: {e}"))?;
+    let ectf_elapsed = t.elapsed();
+    if verbose {
+        println!("  done in {ectf_elapsed:?} — this party holds an XOR-share of x(Z)");
+        println!("\n[2/3] Networked TLS 1.3 key schedule — handshake + application epoch");
+    }
+
+    // The full schedule, identical order on both parties.
+    let t = Instant::now();
+    let mut ks = KeyScheduleNet::derive_handshake(ch, party, &ecdhe, CH_SH)
+        .map_err(|e| anyhow!("derive_handshake: {e}"))?;
+    let client_hs = ks.client_handshake_secret_share();
+    let server_hs = ks.server_handshake_secret_share();
+    let (client_hs_key, _iv) = ks
+        .client_handshake_keys_share(ch)
+        .map_err(|e| anyhow!("client hs keys: {e}"))?;
+    let server_finished = ks
+        .server_finished_share(ch, &sha256(CV))
+        .map_err(|e| anyhow!("server finished: {e}"))?;
+    ks.derive_application(ch, CH_SFIN)
+        .map_err(|e| anyhow!("derive_application: {e}"))?;
+    let client_ap = ks.client_application_secret_share();
+    let server_ap = ks.server_application_secret_share();
+    let sched_elapsed = t.elapsed();
+    if verbose {
+        println!("  done in {sched_elapsed:?} — shares of every traffic secret, key & Finished MAC");
+        println!("\n[3/3] Self-verification against the in-process reference schedule");
+    }
+
+    // Demo-only reveal: exchange this party's scalar + secret shares, reconstruct, and check
+    // against the vetted in-process KeySchedule oracle. (The protocol above leaks none of these.)
+    let mut msg = Vec::with_capacity(256);
+    msg.extend_from_slice(&scalar_bytes(&x));
+    for s in [&ecdhe, &client_hs, &server_hs, &client_hs_key, &server_finished, &client_ap, &server_ap] {
+        msg.extend_from_slice(s);
+    }
+    ch.send(&msg).map_err(|e| anyhow!("send verify: {e}"))?;
+    let peer = ch.recv_exact(256).map_err(|e| anyhow!("recv verify: {e}"))?;
+    let peer_x = scalar_from_bytes(&peer[0..32].try_into().unwrap())?;
+    let peer_share = |i: usize| -> [u8; 32] { peer[32 + i * 32..64 + i * 32].try_into().unwrap() };
+
+    // Ground-truth ECDHE secret from the combined scalars.
+    let z = (y_point * (x + peer_x)).to_affine();
+    let expected_ecdhe = point_x(&z);
+    let combined_ecdhe = xor32(&ecdhe, &peer_share(0));
+    if combined_ecdhe != expected_ecdhe {
+        bail!("networked ECDHE share != p256 x(Z)");
+    }
+
+    // In-process reference schedule from the reconstructed secret (split trivially).
+    let mut refks = KeySchedule::derive_handshake(EngineKind::Semihonest, &expected_ecdhe, &[0u8; 32], CH_SH)
+        .map_err(|e| anyhow!("reference schedule: {e}"))?;
+    check("client_hs secret", &xor32(&client_hs, &peer_share(1)), &refks.client_handshake_secret().open())?;
+    check("server_hs secret", &xor32(&server_hs, &peer_share(2)), &refks.server_handshake_secret().open())?;
+    let rk = refks.client_handshake_keys().map_err(|e| anyhow!("ref client keys: {e}"))?;
+    check("client hs key", &xor32(&client_hs_key, &peer_share(3)), &xor32(&rk.key_a, &rk.key_b))?;
+    let rsf = refks.server_finished(&sha256(CV)).map_err(|e| anyhow!("ref server finished: {e}"))?;
+    check("server Finished MAC", &xor32(&server_finished, &peer_share(4)), &rsf)?;
+    refks.derive_application(CH_SFIN).map_err(|e| anyhow!("ref derive_application: {e}"))?;
+    check("client_ap secret", &xor32(&client_ap, &peer_share(5)), &refks.client_application_secret().open())?;
+    check("server_ap secret", &xor32(&server_ap, &peer_share(6)), &refks.server_application_secret().open())?;
+
+    if verbose {
+        println!("  ✓ ECDHE x(Z) + every key-schedule node matches the reference — handshake key agreement correct");
+        println!("\n✓ full networked 2PC-TLS handshake key agreement complete and self-verified over the wire.");
+    }
+    Ok(SessionReport { ectf: ectf_elapsed, garble: sched_elapsed })
+}
+
+fn xor32(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+    core::array::from_fn(|i| a[i] ^ b[i])
+}
+
+/// Assert a reconstructed value equals the reference, else abort the session.
+fn check(what: &str, got: &[u8; 32], want: &[u8; 32]) -> anyhow::Result<()> {
+    if got != want {
+        bail!("{what}: networked share reconstruction != reference");
+    }
+    Ok(())
 }
