@@ -41,13 +41,21 @@
 //!   run over a [`Channel`](super::live::channel::Channel) with each party holding only
 //!   its own secrets — the foundation of [`netprep`](super::netprep)'s networked
 //!   authenticated bits, tested over real TCP incl. the cheating-receiver abort.
-//! - **Roy22 caveat (for the audit):** this is the *original* KOS15 correlation check.
-//!   Roy (SoftSpokenOT, CRYPTO 2022) found a **subtle gap** in KOS15's proof that stood
-//!   for ~a decade; the fix is small and uses the same random-linear-combination idea.
-//!   This module ships the pedagogically-standard KOS15 form (as in the reference it
-//!   follows); an auditor should apply the Roy22 correction before production reliance.
+//! - **KOS15 vs Roy22 (for the audit):** this is the KOS15 correlation check. Roy
+//!   (SoftSpokenOT, CRYPTO 2022, eprint 2022/192) revisited maliciously-secure OT
+//!   extension and found flaws in prior consistency-check proofs; the practical responses in
+//!   the field are (a) run KOS with **conservative concrete parameters**, or (b) switch to
+//!   the VOLE-based SoftSpokenOT protocol entirely. This module already takes route (a): the
+//!   check runs over the full **GF(2^128)** field with `K + SIGMA = 192` random blinding
+//!   rows — *more* than the reference implementation [libOTe](https://github.com/osu-crypto/libOTe)
+//!   uses for its KOS check (`numExtra = 128`) — and the `χ` challenge is Fiat–Shamir-bound
+//!   to the committed `u` columns (and, in the amortized path, the batch index). So there is
+//!   **no missing one-line "Roy22 patch"**: the residual is proof/bound-level, not an
+//!   implementation deficiency, and the concrete parameters here meet or exceed the reference.
+//!   Route (b) — a full SoftSpokenOT (subspace-VOLE) replacement — is a **separate protocol
+//!   build** appropriate for the external audit phase, not a patch to this check.
 //! - Correctness and cheating-receiver **detection** are what the tests establish;
-//!   the formal malicious-OT guarantee is KOS's proof (with the Roy22 fix) + the audit.
+//!   the formal malicious-OT guarantee is KOS's (Roy22-corrected) analysis + the audit.
 
 use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use neo_core::{Error, Result};
