@@ -506,6 +506,62 @@ pub fn seal_tls13_record_shared_engine(
     Ok(record)
 }
 
+/// **Networked [`seal_tls13_record_shared`]** — seal one TLS 1.3 record (RFC 8446 §5.2) as
+/// two parties over `ch`. `pt_share` is this party's share of the record content;
+/// `content_type`, `static_iv`, `seq` are public. Returns the exact wire record
+/// `opaque_type(0x17) ‖ 0x0303 ‖ length ‖ ciphertext ‖ tag` (identical on both parties),
+/// which a stock TLS 1.3 stack decrypts.
+#[allow(clippy::too_many_arguments)]
+pub fn seal_tls13_record_net(
+    ch: &mut dyn Channel,
+    party: Party,
+    key_share: &[u8; 32],
+    static_iv: &[u8; 12],
+    seq: u64,
+    content_type: u8,
+    pt_share: &[u8],
+) -> Result<Vec<u8>> {
+    // TLSInnerPlaintext = content ‖ content_type. The public content_type byte goes in
+    // party A's share, zero in B's (mirroring the in-process split).
+    let mut inner = pt_share.to_vec();
+    inner.push(if party == Party::A { content_type } else { 0 });
+
+    let nonce = tls13_nonce(static_iv, seq);
+    let length = (inner.len() + 16) as u16;
+    let header = [0x17, 0x03, 0x03, (length >> 8) as u8, length as u8];
+
+    let (ciphertext, tag) = seal_aead_net(ch, party, key_share, &nonce, &header, &inner)?;
+    let mut record = Vec::with_capacity(5 + ciphertext.len() + 16);
+    record.extend_from_slice(&header);
+    record.extend_from_slice(&ciphertext);
+    record.extend_from_slice(&tag);
+    Ok(record)
+}
+
+/// **Networked TLS 1.3 record open** — decrypt + verify one wire record as two parties over
+/// `ch`. Returns this party's XOR-share of the `TLSInnerPlaintext` (`content ‖ content_type`)
+/// and whether the tag verified. Combine both shares to reveal a (public) handshake message,
+/// or keep the share for application data that must stay split between the parties.
+pub fn open_tls13_record_net(
+    ch: &mut dyn Channel,
+    party: Party,
+    key_share: &[u8; 32],
+    static_iv: &[u8; 12],
+    seq: u64,
+    record: &[u8],
+) -> Result<(Vec<u8>, bool)> {
+    if record.len() < 5 + 16 {
+        return Err(Error::Crypto("tls: record too short".into()));
+    }
+    let header: [u8; 5] = record[0..5].try_into().expect("5-byte header");
+    let body = &record[5..];
+    let ciphertext = &body[..body.len() - 16];
+    let tag: [u8; 16] = body[body.len() - 16..].try_into().expect("16-byte tag");
+
+    let nonce = tls13_nonce(static_iv, seq);
+    open_aead_net(ch, party, key_share, &nonce, &header, ciphertext, &tag)
+}
+
 /// The TLS 1.3 per-record nonce (RFC 8446 §5.3): the 64-bit record sequence number,
 /// big-endian, left-padded to the 12-byte IV length and XORed with the static IV.
 fn tls13_nonce(static_iv: &[u8; 12], seq: u64) -> [u8; 12] {
@@ -624,6 +680,69 @@ mod tests {
         let (_pt, ok) = open_aead_net(&mut ch, Party::B, &key_b, &nonce, aad, &ct, &bad).unwrap();
         let (_pta, ok_a2) = a.join().unwrap();
         assert!(!ok && !ok_a2, "tampered tag is rejected");
+    }
+
+    #[test]
+    fn networked_tls13_record_matches_stock_over_tcp() {
+        // Seal a real TLS 1.3 record as two parties over TCP; a stock ChaCha20-Poly1305
+        // decrypt of the wire record must recover `content ‖ content_type`. Then the
+        // networked open of that record recovers the same inner plaintext from shares —
+        // the record framing a real TLS 1.3 stack interoperates with.
+        use super::super::live::channel::TcpChannel;
+        use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+        use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+        use std::net::{TcpListener, TcpStream};
+        use std::thread;
+
+        let key_a = [0x22u8; 32];
+        let key_b: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(11) ^ 0x3c);
+        let key: [u8; 32] = core::array::from_fn(|i| key_a[i] ^ key_b[i]);
+        let iv = [0x31u8; 12];
+        let seq = 7u64;
+        let content = b"neo committee 2pc-tls record".to_vec();
+        let ctype = 0x17u8; // application_data
+        let pt_a: Vec<u8> = content.iter().map(|&b| b ^ 0x5a).collect();
+        let pt_b: Vec<u8> = content.iter().zip(&pt_a).map(|(p, a)| p ^ a).collect();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (ka, ivx, pta) = (key_a, iv, pt_a.clone());
+        let a = thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let mut ch = TcpChannel::from_stream(sock);
+            seal_tls13_record_net(&mut ch, Party::A, &ka, &ivx, seq, ctype, &pta).unwrap()
+        });
+        let mut ch = TcpChannel::from_stream(TcpStream::connect(addr).unwrap());
+        let record = seal_tls13_record_net(&mut ch, Party::B, &key_b, &iv, seq, ctype, &pt_b).unwrap();
+        let record_a = a.join().unwrap();
+        assert_eq!(record, record_a, "both parties emit the same wire record");
+
+        // Stock decrypt of the wire record: nonce = iv ⊕ seq, AAD = 5-byte header.
+        let nonce = tls13_nonce(&iv, seq);
+        let header = &record[..5];
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        let inner = cipher
+            .decrypt(Nonce::from_slice(&nonce), Payload { msg: &record[5..], aad: header })
+            .expect("stock decrypts the networked record");
+        assert_eq!(&inner[..content.len()], &content[..], "content");
+        assert_eq!(inner[content.len()], ctype, "content_type");
+
+        // Networked open recovers the inner plaintext (content ‖ content_type) from shares.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (ka, ivx, recx) = (key_a, iv, record.clone());
+        let a = thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let mut ch = TcpChannel::from_stream(sock);
+            open_tls13_record_net(&mut ch, Party::A, &ka, &ivx, seq, &recx).unwrap()
+        });
+        let mut ch = TcpChannel::from_stream(TcpStream::connect(addr).unwrap());
+        let (inner_b, ok_b) = open_tls13_record_net(&mut ch, Party::B, &key_b, &iv, seq, &record).unwrap();
+        let (inner_a, ok_a) = a.join().unwrap();
+        assert!(ok_a && ok_b, "tag verified");
+        let recovered: Vec<u8> = inner_a.iter().zip(&inner_b).map(|(a, b)| a ^ b).collect();
+        assert_eq!(&recovered[..content.len()], &content[..], "networked open recovers content");
+        assert_eq!(recovered[content.len()], ctype, "networked open recovers content_type");
     }
 
     #[test]
