@@ -105,6 +105,7 @@ pub mod hkdf;
 pub mod kos;
 pub mod live;
 pub mod mta;
+pub mod netengine;
 pub mod netprep;
 pub mod ot;
 pub mod ot_ext;

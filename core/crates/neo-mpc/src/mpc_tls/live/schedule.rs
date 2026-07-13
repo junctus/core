@@ -113,7 +113,7 @@ fn derive_secret_public(secret: &[u8; 32], label: &[u8], transcript: &[u8]) -> [
 /// The 32-byte constant `Derived` off the Early Secret with an empty transcript — the
 /// public salt for the Handshake-Secret extract. `Early Secret = HKDF-Extract(0, 0)`;
 /// `Derived = Derive-Secret(Early Secret, "derived", "")`.
-fn derived_early() -> [u8; 32] {
+pub(crate) fn derived_early() -> [u8; 32] {
     let early = hmac_sha256(&[0u8; 32], &[0u8; 32]); // Extract(salt=0^Hash.len, IKM=0^Hash.len)
     derive_secret_public(&early, b"derived", b"")
 }

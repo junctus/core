@@ -151,6 +151,60 @@ pub fn hkdf_extract_shared_engine(
     Ok((bytes_from_be_words(&mask_bits), bytes_from_be_words(&out)))
 }
 
+// ---- networked (two-party, over-the-wire) gadgets -----------------------------
+//
+// The over-the-wire counterparts of the `*_engine` gadgets above: instead of assembling
+// both parties' shares in-process and calling `eval_circuit`, each party runs its side of
+// the same masked circuit over a `Channel` via `netengine::masked_eval` (constant-round
+// garbled online). Each returns **only this party's XOR-share** of the result. Validated
+// against the stock key schedule over TCP in `live::netschedule`.
+
+use super::live::channel::Channel;
+use super::netengine::{masked_eval, Party};
+
+/// Networked [`hmac_sha256_shared`]: `HMAC-SHA256(kA ⊕ kB, msg)` run as two parties over
+/// `ch`. `key_share` is this party's share of the key; returns this party's share of the tag.
+pub fn hmac_sha256_shared_net(
+    ch: &mut dyn Channel,
+    party: Party,
+    key_share: &[u8; 32],
+    msg: &[u8],
+) -> Result<[u8; 32]> {
+    let circuit = hmac_circuit(msg);
+    let mut share = vec![false; 256];
+    write_be_words(&mut share, key_share);
+    Ok(bytes_from_be_words(&masked_eval(ch, party, &circuit, &share)?))
+}
+
+/// Networked [`hkdf_extract_shared`]: `HKDF-Extract(public salt, shared IKM)` over `ch`.
+/// `ikm_share` is this party's share of the IKM; returns this party's share of the PRK.
+pub fn hkdf_extract_shared_net(
+    ch: &mut dyn Channel,
+    party: Party,
+    salt: &[u8; 32],
+    ikm_share: &[u8; 32],
+) -> Result<[u8; 32]> {
+    let circuit = hmac_pub_key_circuit(salt);
+    let mut share = vec![false; 256];
+    write_be_words(&mut share, ikm_share);
+    Ok(bytes_from_be_words(&masked_eval(ch, party, &circuit, &share)?))
+}
+
+/// Networked [`hkdf_expand_label_shared`]: `HKDF-Expand-Label(shared secret, public label,
+/// public context, length)` over `ch`. Returns this party's share of the 32-byte output.
+pub fn hkdf_expand_label_shared_net(
+    ch: &mut dyn Channel,
+    party: Party,
+    secret_share: &[u8; 32],
+    label: &[u8],
+    context: &[u8],
+    length: u16,
+) -> Result<[u8; 32]> {
+    let mut msg = hkdf_label(label, context, length);
+    msg.push(0x01); // HKDF-Expand T(1) counter
+    hmac_sha256_shared_net(ch, party, secret_share, &msg)
+}
+
 /// The public `HkdfLabel` struct: `uint16 length ‖ (len‖"tls13 "+label) ‖ (len‖context)`.
 pub(crate) fn hkdf_label(label: &[u8], context: &[u8], length: u16) -> Vec<u8> {
     let full_label = [b"tls13 ".as_slice(), label].concat();

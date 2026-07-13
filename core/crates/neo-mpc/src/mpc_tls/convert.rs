@@ -85,6 +85,24 @@ pub fn premaster_hash_from_point_shares(
     digest_shared(&reverse32(&a_le), &reverse32(&b_le))
 }
 
+/// Networked [`a2b_shared`]: the arithmetic→boolean share conversion run as two parties
+/// over a [`Channel`](super::live::channel::Channel) via [`masked_eval`](super::netengine::masked_eval).
+/// `share_le` is this party's additive share (little-endian, `∈ [0, prime)`); returns this
+/// party's XOR bit-share of `x = (shareA + shareB) mod prime` (little-endian).
+pub fn a2b_shared_net(
+    ch: &mut dyn super::live::channel::Channel,
+    party: super::netengine::Party,
+    share_le: &[u8; 32],
+    prime: &[u8; 32],
+) -> Result<[u8; 32]> {
+    let circuit = a2b_circuit(prime);
+    let mut sh = vec![false; 256];
+    write_bits(&mut sh, share_le);
+    Ok(bits_to_32(&super::netengine::masked_eval(
+        ch, party, &circuit, &sh,
+    )?))
+}
+
 fn reverse32(x: &[u8; 32]) -> [u8; 32] {
     let mut o = *x;
     o.reverse();
