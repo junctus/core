@@ -24,6 +24,9 @@ use neo_core::{Error, Result};
 use super::circuit::{Builder, Circuit};
 use super::engine::{eval_circuit, EngineKind};
 use super::garble;
+use super::garble_net::{evaluator_run, garbler_run};
+use super::live::channel::Channel;
+use super::netengine::Party;
 
 /// 288-bit little-endian bignum as nine 32-bit limbs (holds products < 2²⁶⁰).
 type Big = [u64; 9];
@@ -299,6 +302,55 @@ pub fn tag_shared_multi_engine(
 
     let out = eval_circuit(engine, &circuit, &evaluator_wires, &inputs)?; // tag ⊕ maskA
     Ok((mask, bits_to_16(&out)))
+}
+
+/// Networked [`tag_shared_multi`]: the multi-block Poly1305 tag run as two parties over a
+/// [`Channel`], on the constant-round garbled online. `key_share` is this party's XOR-share
+/// of the one-time key `(r, s)`; `blocks` is the **public** authenticated message (same on
+/// both parties). Returns this party's XOR-share of the 16-byte tag.
+pub fn tag_shared_multi_net(
+    ch: &mut dyn Channel,
+    party: Party,
+    key_share: &[u8; 32],
+    blocks: &[[u8; 16]],
+) -> Result<[u8; 16]> {
+    let n = blocks.len();
+    if n == 0 {
+        return Err(Error::Crypto("poly1305 needs at least one block".into()));
+    }
+    let circuit = tag_circuit_multi(n);
+    let n_inputs = 512 + n * 256 + 128;
+
+    // Same layout as `tag_shared_multi_engine`: keyA[256] ‖ keyB[256] ‖
+    // n×(blockA[128] ‖ blockB[128]) ‖ maskA[128]. Evaluator owns keyB + every blockB.
+    let mut ev: HashSet<usize> = (256..512).collect();
+    for i in 0..n {
+        let base_b = 512 + i * 256 + 128;
+        ev.extend(base_b..base_b + 128);
+    }
+
+    match party {
+        Party::A => {
+            let mut g = vec![false; n_inputs];
+            write_bits(&mut g[0..256], key_share); // keyA (poly share)
+            for (i, blk) in blocks.iter().enumerate() {
+                let base_a = 512 + i * 256;
+                write_bits(&mut g[base_a..base_a + 128], blk); // blockA = public block
+            }
+            let mut mask = [0u8; 16];
+            getrandom::getrandom(&mut mask).map_err(|e| Error::Rng(e.to_string()))?;
+            let mask_base = 512 + n * 256;
+            write_bits(&mut g[mask_base..mask_base + 128], &mask);
+            garbler_run(ch, &circuit, &ev, &g)?;
+            Ok(mask) // A's share = maskA
+        }
+        Party::B => {
+            let mut e = vec![false; n_inputs];
+            write_bits(&mut e[256..512], key_share); // keyB (poly share); blockB stays 0
+            let out = evaluator_run(ch, &circuit, &ev, &e)?; // tag ⊕ maskA
+            Ok(bits_to_16(&out))
+        }
+    }
 }
 
 /// The multi-block tag circuit: reconstruct `(r, s)` from the two key shares, then
