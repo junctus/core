@@ -106,7 +106,19 @@ pub fn garbler_run(
     // per wire — the dominant cost once garbling is fast. `ot_pair(w) = (W₀, W₀⊕Δ)` are the
     // wire's two labels; the evaluator learns only the one for its bit.
     let messages: Vec<(Label, Label)> = evs.iter().map(|&w| g.ot_pair(w)).collect();
-    kos::cot_sender(ch, &messages)?;
+    if ch.kos_amortized() {
+        // Reuse the session's persistent base-OT setup: pay 128 base OTs once, then just
+        // extend (cheap symmetric work) for this gadget's evaluator wires. Take the setup
+        // out (moved) so it does not borrow `ch` while extending, then return it.
+        let mut setup = match ch.take_kos_sender() {
+            Some(s) => s,
+            None => kos::KosSenderSetup::new(ch)?,
+        };
+        setup.extend_sender(ch, &messages)?;
+        ch.put_kos_sender(setup);
+    } else {
+        kos::cot_sender(ch, &messages)?;
+    }
     Ok(())
 }
 
@@ -166,7 +178,17 @@ pub fn evaluator_run(
     // Fetch the evaluator's own input labels via KOS OT-extension (constant base OTs +
     // symmetric extension), replacing a base OT per wire.
     let evchoices: Vec<bool> = evs.iter().map(|&w| inputs[w]).collect();
-    let ev_labels = kos::cot_receiver(ch, &evchoices)?;
+    let ev_labels = if ch.kos_amortized() {
+        let mut setup = match ch.take_kos_receiver() {
+            Some(s) => s,
+            None => kos::KosReceiverSetup::new(ch)?,
+        };
+        let out = setup.extend_receiver(ch, &evchoices)?;
+        ch.put_kos_receiver(setup);
+        out
+    } else {
+        kos::cot_receiver(ch, &evchoices)?
+    };
     for (&w, label) in evs.iter().zip(ev_labels) {
         labels[w] = label;
     }

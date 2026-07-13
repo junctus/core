@@ -37,7 +37,7 @@ use rand_core::OsRng;
 use neo_mpc::mpc_tls::ectf::{ectf_a, ectf_b};
 use neo_mpc::mpc_tls::engine::EngineKind;
 use neo_mpc::mpc_tls::garble_net::{evaluator_run, garbler_run};
-use neo_mpc::mpc_tls::live::channel::{Channel, TcpChannel};
+use neo_mpc::mpc_tls::live::channel::{AmortizingChannel, Channel, TcpChannel};
 use neo_mpc::mpc_tls::live::handshake::{committee_handshake_net, committee_recv_app, committee_send_app};
 use neo_mpc::mpc_tls::live::netschedule::{derive_ecdhe_share_net, KeyScheduleNet};
 use neo_mpc::mpc_tls::live::verify::LeafKeyVerifier;
@@ -478,9 +478,14 @@ fn committee_handshake(role: Role, ch: &mut dyn Channel, dest: &str) -> anyhow::
         None
     };
 
+    // Amortize the KOS base OTs across the whole session: ONE base-OT setup per role serves
+    // the handshake's key-schedule gadgets AND every app record, instead of 128 base OTs per
+    // gadget. `AmortizingChannel` just caches the per-role setup on the member↔member leg; the
+    // 2PC protocol is unchanged (see the `committee_handshake_amortized_base_ots` interop test).
+    let mut party_ch = AmortizingChannel::new(ch);
     let t = Instant::now();
     let mut sess = committee_handshake_net(
-        ch,
+        &mut party_ch,
         party,
         server.as_mut().map(|c| c as &mut dyn Channel),
         &host,
@@ -502,14 +507,14 @@ fn committee_handshake(role: Role, ch: &mut dyn Channel, dest: &str) -> anyhow::
     } else {
         vec![0u8; req.len()]
     };
-    committee_send_app(ch, &mut sess, server.as_mut().map(|c| c as &mut dyn Channel), &pt_share)
+    committee_send_app(&mut party_ch, &mut sess, server.as_mut().map(|c| c as &mut dyn Channel), &pt_share)
         .map_err(|e| anyhow!("send request: {e}"))?;
-    let my_share = committee_recv_app(ch, &mut sess, server.as_mut().map(|c| c as &mut dyn Channel))
+    let my_share = committee_recv_app(&mut party_ch, &mut sess, server.as_mut().map(|c| c as &mut dyn Channel))
         .map_err(|e| anyhow!("recv response: {e}"))?;
 
     // Reconstruct (demo reveal — in production the onion client does this): exchange shares,
     // XOR, strip padding + the trailing content_type.
-    let mut resp = combine_shares(ch, &my_share)?;
+    let mut resp = combine_shares(&mut party_ch, &my_share)?;
     while resp.last() == Some(&0) {
         resp.pop();
     }

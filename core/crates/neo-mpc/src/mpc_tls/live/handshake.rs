@@ -1417,6 +1417,64 @@ mod tests {
     }
 
     #[test]
+    fn committee_handshake_amortized_base_ots_still_interops() {
+        // Identical to `committee_handshake_against_rustls_and_echo`, but each member wraps its
+        // member↔member socket in `AmortizingChannel`, so the whole session's garbled gadgets
+        // (key schedule + the app record) share ONE KOS base-OT setup per role — 128 base OTs
+        // once, not per gadget. rustls accepting the result is the oracle that the amortized
+        // COT path yields byte-identical correct 2PC output: amortization changes cost, not the
+        // protocol. Also exercises the per-batch PRG separation + global H tweak over a real
+        // multi-gadget session (not just the isolated `kos` batch tests).
+        use super::super::channel::AmortizingChannel;
+        use super::super::verify::LeafKeyVerifier;
+        use p256::Scalar;
+        use std::net::TcpStream;
+
+        let server_addr = spawn_rustls_echo_server();
+        let plistener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let paddr = plistener.local_addr().unwrap();
+        let payload = b"amortized committee 2pc-tls ping".to_vec();
+        let pl = payload.len();
+
+        let b = thread::spawn(move || {
+            let mut raw = TcpChannel::from_stream(TcpStream::connect(paddr).unwrap());
+            let mut party = AmortizingChannel::new(&mut raw);
+            let x2 = Scalar::from(0x0f0f_a5a5_1234_5678u64);
+            let mut sess =
+                committee_handshake_net(&mut party, Party::B, None, "localhost", &x2, &LeafKeyVerifier)
+                    .expect("party B handshake");
+            committee_send_app(&mut party, &mut sess, None, &vec![0u8; pl]).unwrap();
+            committee_recv_app(&mut party, &mut sess, None).unwrap()
+        });
+
+        let (psock, _) = plistener.accept().unwrap();
+        let mut raw = TcpChannel::from_stream(psock);
+        let mut party = AmortizingChannel::new(&mut raw);
+        let mut server = TcpChannel::from_stream(TcpStream::connect(server_addr).unwrap());
+        let x1 = Scalar::from(0x1234_5678_9abc_def0u64);
+        let mut sess = committee_handshake_net(
+            &mut party,
+            Party::A,
+            Some(&mut server),
+            "localhost",
+            &x1,
+            &LeafKeyVerifier,
+        )
+        .expect("party A handshake");
+        committee_send_app(&mut party, &mut sess, Some(&mut server), &payload).unwrap();
+        let share_a = committee_recv_app(&mut party, &mut sess, Some(&mut server)).unwrap();
+        let share_b = b.join().unwrap();
+
+        let mut inner: Vec<u8> = share_a.iter().zip(&share_b).map(|(a, b)| a ^ b).collect();
+        while inner.last() == Some(&0) {
+            inner.pop();
+        }
+        let ct = inner.pop();
+        assert_eq!(ct, Some(REC_APPLICATION_DATA), "inner content_type");
+        assert_eq!(inner, payload, "amortized committee 2PC-TLS echo matches");
+    }
+
+    #[test]
     fn live_handshake_against_rustls_server_and_echo() {
         // The end-to-end M45 proof: two 2PC client parties jointly complete a real
         // TLS 1.3 handshake against a stock rustls server and exchange application data.

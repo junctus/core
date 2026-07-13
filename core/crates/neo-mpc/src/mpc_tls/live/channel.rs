@@ -19,6 +19,8 @@ use std::sync::{Arc, Mutex};
 
 use neo_core::{Error, Result};
 
+use super::super::kos::{KosReceiverSetup, KosSenderSetup};
+
 /// A bidirectional byte transport (the client↔server leg of a live TLS session).
 pub trait Channel {
     /// Write all of `buf`, or error.
@@ -40,6 +42,77 @@ pub trait Channel {
             got += k;
         }
         Ok(out)
+    }
+
+    // ── KOS base-OT amortization (opt-in) ──
+    //
+    // By default a channel does NOT amortize: every networked garbled gadget runs its own
+    // 128 public-key base OTs ([`kos::cot_sender`]/[`kos::cot_receiver`]). A session that
+    // wraps its transport in [`AmortizingChannel`] returns `true` from `kos_amortized`, so
+    // [`garble_net`](super::super::garble_net) instead holds ONE persistent
+    // [`KosSenderSetup`]/[`KosReceiverSetup`] per role and reuses it for every gadget — the
+    // base OTs are paid once per session. The setups are taken out (moved) for the duration
+    // of one extend then returned, so a setup never borrows the channel it runs over.
+
+    /// Whether this channel amortizes KOS base OTs across gadgets (default: no).
+    fn kos_amortized(&self) -> bool {
+        false
+    }
+    /// Take the persistent KOS **sender** setup, or `None` if base OTs are not yet done for
+    /// this session (the caller then runs [`KosSenderSetup::new`] once). Returned via
+    /// [`put_kos_sender`](Channel::put_kos_sender).
+    fn take_kos_sender(&mut self) -> Option<KosSenderSetup> {
+        None
+    }
+    /// Return a KOS sender setup after one extend batch, so the next gadget reuses it.
+    fn put_kos_sender(&mut self, _setup: KosSenderSetup) {}
+    /// Take the persistent KOS **receiver** setup, or `None` if not yet established.
+    fn take_kos_receiver(&mut self) -> Option<KosReceiverSetup> {
+        None
+    }
+    /// Return a KOS receiver setup after one extend batch, so the next gadget reuses it.
+    fn put_kos_receiver(&mut self, _setup: KosReceiverSetup) {}
+}
+
+/// Wraps a live session's member↔member channel so all of the session's networked garbled
+/// gadgets share ONE KOS base-OT setup per role — the 128 public-key base OTs are paid once
+/// for the whole handshake instead of once per gadget (the dominant per-gadget cost after
+/// [HS-open] removed the certificate-flight 2PC). All byte I/O delegates to `inner`; the two
+/// `Option`s hold the per-role persistent setup, lazily established on the first gadget's COT
+/// (party A garbles → sender slot; party B evaluates → receiver slot).
+pub struct AmortizingChannel<'a> {
+    inner: &'a mut dyn Channel,
+    sender: Option<KosSenderSetup>,
+    receiver: Option<KosReceiverSetup>,
+}
+
+impl<'a> AmortizingChannel<'a> {
+    pub fn new(inner: &'a mut dyn Channel) -> Self {
+        Self { inner, sender: None, receiver: None }
+    }
+}
+
+impl Channel for AmortizingChannel<'_> {
+    fn send(&mut self, buf: &[u8]) -> Result<()> {
+        self.inner.send(buf)
+    }
+    fn recv(&mut self, buf: &mut [u8]) -> Result<usize> {
+        self.inner.recv(buf)
+    }
+    fn kos_amortized(&self) -> bool {
+        true
+    }
+    fn take_kos_sender(&mut self) -> Option<KosSenderSetup> {
+        self.sender.take()
+    }
+    fn put_kos_sender(&mut self, setup: KosSenderSetup) {
+        self.sender = Some(setup);
+    }
+    fn take_kos_receiver(&mut self) -> Option<KosReceiverSetup> {
+        self.receiver.take()
+    }
+    fn put_kos_receiver(&mut self, setup: KosReceiverSetup) {
+        self.receiver = Some(setup);
     }
 }
 
