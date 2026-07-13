@@ -366,7 +366,17 @@ impl KosReceiverSetup {
 /// repeatedly to pay the base OTs once. In a COT the returned values are the MACs
 /// `Mᵢ = Kᵢ ⊕ choiceᵢ·Δ`. Aborts if the sender signals a failed check.
 pub fn cot_receiver(ch: &mut dyn Channel, choices: &[bool]) -> Result<Vec<[u8; 16]>> {
-    cot_receiver_core(ch, choices, |_| {})
+    if ch.kos_amortized() {
+        let mut setup = match ch.take_kos_receiver() {
+            Some(s) => s,
+            None => KosReceiverSetup::new(ch)?,
+        };
+        let r = setup.extend_receiver(ch, choices);
+        ch.put_kos_receiver(setup);
+        r
+    } else {
+        cot_receiver_core(ch, choices, |_| {})
+    }
 }
 
 /// [`cot_receiver`] with a `cheat` hook — used by tests to model a malicious receiver.
@@ -493,7 +503,20 @@ impl KosSenderSetup {
 /// the `Kᵢ` — the sender learns nothing new, so this returns `()` on success; aborts on a
 /// failed check.
 pub fn cot_sender(ch: &mut dyn Channel, messages: &[([u8; 16], [u8; 16])]) -> Result<()> {
-    KosSenderSetup::new(ch)?.extend_sender(ch, messages)
+    if ch.kos_amortized() {
+        // Reuse the session's persistent base OTs (shared with every other COT on this
+        // channel — ectf's MtAs and the garble gadgets all run A=sender), so the 128 base
+        // OTs are paid once per session, not per call.
+        let mut setup = match ch.take_kos_sender() {
+            Some(s) => s,
+            None => KosSenderSetup::new(ch)?,
+        };
+        let r = setup.extend_sender(ch, messages);
+        ch.put_kos_sender(setup);
+        r
+    } else {
+        KosSenderSetup::new(ch)?.extend_sender(ch, messages)
+    }
 }
 
 /// Fiat–Shamir weights `χᵢ ∈ GF(2^128)` bound to the committed `u` columns **and the
