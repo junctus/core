@@ -77,8 +77,40 @@ pub fn hkdf_expand_label_shared(
     hmac_sha256_shared(secret_a, secret_b, &msg)
 }
 
+/// `HKDF-Extract(salt, IKM)` under 2PC where the **salt is public** and the 32-byte
+/// **IKM is XOR-shared** (`ikm_a` party A, `ikm_b` party B) — the mirror of
+/// [`hmac_sha256_shared`], which shares the HMAC *key* rather than the message. This is
+/// the one key-schedule step TLS 1.3 needs in this direction: the **Handshake Secret**
+/// `= HKDF-Extract(Derived, (EC)DHE)`, where the salt `Derived` is public but the ECDHE
+/// shared secret (the ECtF/A2B x-coordinate shares) is held between the two parties.
+/// Returns XOR-shares of the 32-byte PRK, so neither party learns the ECDHE secret or
+/// the resulting Handshake Secret.
+pub fn hkdf_extract_shared(
+    salt: &[u8; 32],
+    ikm_a: &[u8; 32],
+    ikm_b: &[u8; 32],
+) -> Result<([u8; 32], [u8; 32])> {
+    let circuit = hmac_pub_key_circuit(salt);
+
+    // Layout: ikmA[256] ‖ ikmB[256] ‖ maskA[256] = 768 (mirrors hmac_sha256_shared).
+    let mut inputs = vec![false; 768];
+    write_be_words(&mut inputs[0..256], ikm_a);
+    write_be_words(&mut inputs[256..512], ikm_b);
+    let mut mask_bits = vec![false; 256];
+    let mut mask_raw = [0u8; 32];
+    getrandom::getrandom(&mut mask_raw).map_err(|e| Error::Rng(e.to_string()))?;
+    for (i, bit) in mask_bits.iter_mut().enumerate() {
+        *bit = (mask_raw[i / 8] >> (i % 8)) & 1 == 1;
+    }
+    inputs[512..768].copy_from_slice(&mask_bits);
+
+    let evaluator_wires: HashSet<usize> = (256..512).collect(); // ikmB
+    let out = garble::eval_2pc(&circuit, &evaluator_wires, &inputs)?; // PRK ⊕ maskA
+    Ok((bytes_from_be_words(&mask_bits), bytes_from_be_words(&out)))
+}
+
 /// The public `HkdfLabel` struct: `uint16 length ‖ (len‖"tls13 "+label) ‖ (len‖context)`.
-fn hkdf_label(label: &[u8], context: &[u8], length: u16) -> Vec<u8> {
+pub(crate) fn hkdf_label(label: &[u8], context: &[u8], length: u16) -> Vec<u8> {
     let full_label = [b"tls13 ".as_slice(), label].concat();
     let mut out = Vec::with_capacity(4 + full_label.len() + context.len());
     out.extend_from_slice(&length.to_be_bytes());
@@ -122,6 +154,63 @@ fn hmac_circuit(msg: &[u8]) -> Circuit {
         final_block.push(b.word_const(0));
     }
     final_block.push(b.word_const((64 + 32) * 8)); // bit length = 768
+    ho = compress_circuit(&mut b, &ho, &final_block);
+
+    // Output HMAC ⊕ maskA.
+    let outputs: Vec<usize> = ho
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .map(|(i, wire)| b.xor(wire, 512 + i))
+        .collect();
+    b.build(768, outputs)
+}
+
+/// HMAC-SHA256 with a **public** key and a **shared** 32-byte message (`HKDF-Extract`
+/// direction): inputs `msgA[256] ‖ msgB[256] ‖ maskA[256]`, output `HMAC ⊕ maskA`
+/// (256 bits). The key `K` (≤ 32 bytes, zero-padded to the 64-byte block) is baked in as
+/// public constants; only the 32-byte message is shared, so both pad blocks
+/// (`K⊕ipad`, `K⊕opad`) are public and the inner/outer message blocks carry the shares.
+fn hmac_pub_key_circuit(key: &[u8; 32]) -> Circuit {
+    let mut b = Builder::new(768);
+    let h0: Vec<Vec<usize>> = H0.iter().map(|&h| b.word_const(h)).collect();
+
+    // msg = msgA ⊕ msgB, 8 big-endian 32-bit words (one SHA-256 block of shared data).
+    let msg: Vec<Vec<usize>> = (0..8)
+        .map(|w| {
+            (0..32)
+                .map(|j| b.xor(w * 32 + j, 256 + w * 32 + j))
+                .collect()
+        })
+        .collect();
+
+    // K zero-padded to 64 bytes = 16 big-endian words; high 8 words are 0.
+    let mut kw = [0u32; 16];
+    for (w, slot) in kw.iter_mut().enumerate().take(8) {
+        *slot = u32::from_be_bytes(key[w * 4..w * 4 + 4].try_into().expect("4 bytes"));
+    }
+
+    // Inner: H((K⊕ipad) ‖ msg). Block 0 public (K⊕0x36…36); block 1 = msg(shared)+pad.
+    let ipad_block: Vec<Vec<usize>> = kw.iter().map(|&w| b.word_const(w ^ 0x3636_3636)).collect();
+    let mut h = compress_circuit(&mut b, &h0, &ipad_block);
+    let mut inner_block: Vec<Vec<usize>> = msg;
+    inner_block.push(b.word_const(0x8000_0000)); // 0x80 after the 32-byte message
+    for _ in 9..15 {
+        inner_block.push(b.word_const(0));
+    }
+    inner_block.push(b.word_const((64 + 32) * 8)); // bit length = 768
+    h = compress_circuit(&mut b, &h, &inner_block);
+    let inner_digest = h; // 8 words, shared
+
+    // Outer: H((K⊕opad) ‖ inner_digest). Block 0 public (K⊕0x5c…5c); final = digest+pad.
+    let opad_block: Vec<Vec<usize>> = kw.iter().map(|&w| b.word_const(w ^ 0x5c5c_5c5c)).collect();
+    let mut ho = compress_circuit(&mut b, &h0, &opad_block);
+    let mut final_block: Vec<Vec<usize>> = inner_digest;
+    final_block.push(b.word_const(0x8000_0000));
+    for _ in 9..15 {
+        final_block.push(b.word_const(0));
+    }
+    final_block.push(b.word_const((64 + 32) * 8));
     ho = compress_circuit(&mut b, &ho, &final_block);
 
     // Output HMAC ⊕ maskA.
@@ -266,5 +355,22 @@ mod tests {
                 String::from_utf8_lossy(label)
             );
         }
+    }
+
+    #[test]
+    fn hkdf_extract_under_2pc_matches_rustcrypto() {
+        // The Handshake-Secret direction: HKDF-Extract(public salt, shared IKM) =
+        // HMAC(key=salt, msg=IKM). The salt is public; the 32-byte IKM (the ECDHE shared
+        // secret) is XOR-shared. Matched against the vetted `hkdf` crate's Extract.
+        let salt: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(5).wrapping_add(9));
+        let ikm_a: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(11));
+        let ikm_b: [u8; 32] = core::array::from_fn(|i| (i as u8) ^ 0x3c);
+        let ikm = combine(&ikm_a, &ikm_b);
+
+        let (oa, ob) = hkdf_extract_shared(&salt, &ikm_a, &ikm_b).unwrap();
+        let got = combine(&oa, &ob);
+
+        let (prk, _) = Hkdf::<Sha256>::extract(Some(&salt), &ikm);
+        assert_eq!(&got[..], prk.as_slice(), "HKDF-Extract under 2PC");
     }
 }

@@ -62,9 +62,18 @@
 //! - **Key schedule** — *built*: [`hkdf::hkdf_expand_label_shared`] runs TLS 1.3's
 //!   `HKDF-Expand-Label` (HMAC-SHA256, shared secret + public label) under 2PC,
 //!   matched byte-for-byte against the vetted `hmac`/`hkdf` crates.
-//! - **Live wiring** — *remaining*: driving all this from a real TLS 1.3 handshake
-//!   state machine + record layer against an actual server (both parties jointly
-//!   playing the client). Systems integration, not a new primitive.
+//! - **Live wiring** — *built* ([`live`]): a real TLS 1.3 client state machine drives all
+//!   of the above against an **actual server** — split-scalar P-256 ECDHE
+//!   ([`live::ecdhe`]) → the full RFC 8446 §7.1 key schedule under 2PC ([`live::schedule`])
+//!   → the record layer ([`live::record`], seal + the matching 2PC open) → the handshake
+//!   driver ([`live::handshake`]), which is **interop-tested against a stock `rustls`
+//!   TLS 1.3 server** (`TLS_CHACHA20_POLY1305_SHA256`): rustls accepts the ClientHello,
+//!   its flight decrypts under the 2PC-derived key, its Finished verifies against the 2PC
+//!   MAC, and it decrypts the 2PC-protected client Finished + application data. Semi-
+//!   honest ([`live::EngineKind`] names the malicious seam); *party↔party* 2PC stays
+//!   modelled in-process (the crate's standing boundary). What remains is malicious-live
+//!   (the triple-generation residual above) + hardening (full X.509 chain-building, other
+//!   ciphersuites/curves, KeyUpdate).
 //! - The **external audit** gate, as everywhere in neo.
 
 pub mod auth;
@@ -76,6 +85,7 @@ pub mod ectf;
 pub mod garble;
 pub mod hkdf;
 pub mod kos;
+pub mod live;
 pub mod mta;
 pub mod ot;
 pub mod ot_ext;

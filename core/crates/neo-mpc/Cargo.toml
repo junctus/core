@@ -14,12 +14,16 @@ curve25519-dalek.workspace = true
 chacha20poly1305.workspace = true
 getrandom.workspace = true
 crypto-bigint.workspace = true
+# Live 2PC-TLS (M45): real P-256 curve ops for the split-scalar ECDHE key share.
+p256.workspace = true
 
 [dev-dependencies]
-# Test-only oracles: p256 (independent ECtF), num-bigint (a second bignum library
-# for the field reconstruction), hmac/hkdf/sha2 (vetted refs for the 2PC key schedule).
-p256.workspace = true
+# Test-only oracles: num-bigint (a second bignum library for the field reconstruction),
+# hmac/hkdf/sha2 (vetted refs for the 2PC key schedule), rustls/rcgen (a live TLS 1.3
+# server to interop-test the live handshake against).
 num-bigint.workspace = true
 hmac.workspace = true
 hkdf.workspace = true
 sha2.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+rcgen = "0.13"

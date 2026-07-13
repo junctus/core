@@ -59,7 +59,7 @@ curve25519-dalek = "4"
 # P-256 (RustCrypto, vetted) — used only as an *independent oracle* to validate the
 # MPC-TLS ECtF (EC point→x-coordinate share) conversion against real-curve point
 # addition; num-bigint provides the F_p arithmetic for the conversion protocol.
-p256 = { version = "0.13", default-features = false, features = ["arithmetic"] }
+p256 = { version = "0.13", default-features = false, features = ["arithmetic", "ecdsa"] }
 num-bigint = "0.4"
 # Constant-time bignum (RustCrypto) — the ECtF field arithmetic runs over its
 # constant-time modular type instead of the variable-time num-bigint.
