@@ -338,6 +338,58 @@ mod tests {
     }
 
     #[test]
+    fn networked_hmac_over_constant_round_garbling_matches_stock() {
+        // A real TLS key-schedule gadget (HMAC-SHA256) run as a **networked** 2PC over the
+        // constant-round garbled online (`garble_net`), each party on its own TCP socket:
+        // the garbler feeds keyA + its output mask, the evaluator feeds keyB and decodes
+        // `HMAC ⊕ maskA`; combined they equal the stock HMAC. Proves the live-TLS gadgets
+        // compose over the networked constant-round engine (a fixed 3 flights), not just a
+        // toy circuit.
+        use super::super::garble_net::{evaluator_run, garbler_run};
+        use super::super::live::channel::TcpChannel;
+        use std::collections::HashSet;
+        use std::net::{TcpListener, TcpStream};
+        use std::thread;
+
+        let key_a = [0x11u8; 32];
+        let key_b: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(7) ^ 0xa5);
+        let key = combine(&key_a, &key_b);
+        let msg = b"tls13 c hs traffic\x00\x01";
+        let circuit = hmac_circuit(msg);
+        let ev: HashSet<usize> = (256..512).collect(); // keyB is the evaluator's
+
+        // Garbler's output-mask share.
+        let mask: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(13) ^ 0x5a);
+        let mut g_in = vec![false; 768];
+        write_be_words(&mut g_in[0..256], &key_a);
+        write_be_words(&mut g_in[512..768], &mask);
+        let mut e_in = vec![false; 768];
+        write_be_words(&mut e_in[256..512], &key_b);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (c_g, ev_g) = (circuit.clone(), ev.clone());
+        let g = thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let mut ch = TcpChannel::from_stream(sock);
+            garbler_run(&mut ch, &c_g, &ev_g, &g_in).unwrap();
+        });
+        let mut ch = TcpChannel::from_stream(TcpStream::connect(addr).unwrap());
+        let out = evaluator_run(&mut ch, &circuit, &ev, &e_in).unwrap(); // HMAC ⊕ maskA
+        g.join().unwrap();
+
+        let ev_share = bytes_from_be_words(&out);
+        let tag: [u8; 32] = core::array::from_fn(|i| mask[i] ^ ev_share[i]);
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&key).unwrap();
+        mac.update(msg);
+        assert_eq!(
+            &tag[..],
+            mac.finalize().into_bytes().as_slice(),
+            "networked HMAC over the constant-round garbled online == stock HMAC"
+        );
+    }
+
+    #[test]
     fn hmac_under_2pc_matches_rustcrypto() {
         // Shared key + public messages of varied lengths (crossing the 1- and 2-block
         // boundaries of the inner hash), matched against the vetted `hmac` crate.

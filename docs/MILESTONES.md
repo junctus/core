@@ -401,11 +401,16 @@ inline.)
   notarized macOS release + **iOS TestFlight/App-Store**, a signed **Play-Store AAB**, reproducible signed
   release pipelines for all three, and pinning the three clients to a single audited core version (a
   shared FFI so they don't drift). Mobile is where censorship-circumvention demand is highest.
-- **M47 — Live 2PC-TLS interop breadth + performance** ⬜ (post-M45 extensions; each a bounded add on top of
-  the shipped stack). Four independent pieces, largest first: (a) **constant-round networked online** — the
-  live-TLS record/key-schedule gadgets use the bundled in-process online today; the interactive networked
-  online (`netprep::eval_authenticated`) is one round-trip per AND, so a *networked-party* full handshake at
-  practical speed wants WRK17/KRRW18 **authenticated garbling networked** (constant-round). (b) **AES-GCM** —
+- **M47 — Live 2PC-TLS interop breadth + performance** 🔨 (post-M45 extensions; each a bounded add on top of
+  the shipped stack). Four independent pieces: (a) **constant-round networked online** ✅ **built** — the
+  interactive networked online (`netprep::eval_authenticated`) is one round-trip per AND (days for a TLS
+  circuit over a WAN); `mpc_tls::garble_net` splits the garbled-circuit engine into two networked roles that
+  evaluate any circuit in a **fixed 3 flights** regardless of depth — the real SHA-256 key-schedule circuit
+  (67k ANDs) garbles+evaluates over TCP in **~135 ms**, and a networked HMAC gadget matches stock HMAC. This
+  is the perf unblocker for a *networked-party* live handshake (semi-honest garbler; networking `authgarble`'s
+  authenticated garbling is the malicious version). Remaining to actually *wire it into the live handshake*:
+  thread the channel + party role (client = one party, relay = the other) through the schedule/record/handshake
+  gadgets, then route the data plane through it. (b) **AES-GCM** —
   the AES-128 circuit + 2PC AES-CTR keystream (`mpc_tls::aes`) are built + validated (FIPS-197 + stock `aes`);
   remaining is **GHASH** (a GF(2¹²⁸) MAC, structurally the existing Poly1305 tag) to assemble the GCM AEAD,
   then `TLS_AES_128_GCM_SHA256`. (c) **x25519** — a Montgomery-curve ECtF (today's `ectf` is short-Weierstrass

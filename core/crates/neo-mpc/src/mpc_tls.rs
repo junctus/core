@@ -100,6 +100,7 @@ pub mod dualex;
 pub mod ectf;
 pub mod engine;
 pub mod garble;
+pub mod garble_net;
 pub mod hkdf;
 pub mod kos;
 pub mod live;
