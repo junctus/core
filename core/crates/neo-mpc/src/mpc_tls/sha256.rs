@@ -123,6 +123,35 @@ pub fn sha256(msg: &[u8]) -> [u8; 32] {
     out
 }
 
+/// SHA-256 **continuation** from a mid-hash chaining state: the digest of
+/// `(64-byte first block already absorbed into `state`) ‖ msg`. Used for the HMAC **inner**
+/// hash `H((K⊕ipad) ‖ msg)` once the key-dependent `ipad_state = compress(H0, K⊕ipad)` is
+/// known in the clear — the message half then finishes outside the garbled circuit.
+pub(crate) fn sha256_from_block_state(state: &[u8; 32], msg: &[u8]) -> [u8; 32] {
+    let mut h = [0u32; 8];
+    for (i, hi) in h.iter_mut().enumerate() {
+        *hi = u32::from_be_bytes(state[i * 4..i * 4 + 4].try_into().expect("4 bytes"));
+    }
+    // Total hashed length includes the 64-byte prefix block already folded into `state`.
+    let total_bits = ((64 + msg.len()) as u64) * 8;
+    let mut m = msg.to_vec();
+    m.push(0x80);
+    while m.len() % 64 != 56 {
+        m.push(0);
+    }
+    m.extend_from_slice(&total_bits.to_be_bytes());
+    for block in m.chunks(64) {
+        let mut b = [0u8; 64];
+        b.copy_from_slice(block);
+        h = compress_ref(h, &b);
+    }
+    let mut out = [0u8; 32];
+    for i in 0..8 {
+        out[i * 4..i * 4 + 4].copy_from_slice(&h[i].to_be_bytes());
+    }
+    out
+}
+
 /// One SHA-256 compression (`h' = h + block-mixing`), the reference for the circuit.
 fn compress_ref(h: [u32; 8], block: &[u8; 64]) -> [u32; 8] {
     let mut w = [0u32; 64];

@@ -36,7 +36,8 @@ use p256::{ProjectivePoint, PublicKey, Scalar};
 use super::super::convert::a2b_shared_net;
 use super::super::ectf::{ectf_a, ectf_b};
 use super::super::hkdf::{
-    hkdf_expand_label_shared_net, hkdf_extract_shared_net, hmac_sha256_shared_net,
+    expand_label_prepared_net, hkdf_extract_shared_net, hmac_prepared_net, prepare_key_net,
+    PreparedKey,
 };
 use super::super::netengine::Party;
 use super::super::sha256::sha256;
@@ -110,8 +111,11 @@ impl KeyScheduleNet {
     ) -> Result<Self> {
         let salt = derived_early(); // public constant
         let handshake_secret = hkdf_extract_shared_net(ch, party, &salt, ecdhe_share)?;
-        let client_hs = derive_secret(ch, party, &handshake_secret, b"c hs traffic", transcript_ch_sh)?;
-        let server_hs = derive_secret(ch, party, &handshake_secret, b"s hs traffic", transcript_ch_sh)?;
+        // handshake_secret keys 3 derivations (c/s hs traffic here + "derived" in the app
+        // epoch) — prepare its ipad/opad states once and reuse.
+        let pk_hs = prepare_key_net(ch, party, &handshake_secret)?;
+        let client_hs = derive_secret(ch, party, &pk_hs, b"c hs traffic", transcript_ch_sh)?;
+        let server_hs = derive_secret(ch, party, &pk_hs, b"s hs traffic", transcript_ch_sh)?;
         Ok(KeyScheduleNet {
             party,
             handshake_secret,
@@ -172,11 +176,15 @@ impl KeyScheduleNet {
     /// Advance to the application epoch: Master Secret then both application-traffic secrets
     /// over the full `CH..server Finished` transcript, all under 2PC over `ch`.
     pub fn derive_application(&mut self, ch: &mut dyn Channel, transcript_ch_sfin: &[u8]) -> Result<()> {
-        let derived = derive_secret(ch, self.party, &self.handshake_secret, b"derived", b"")?;
+        let pk_hs = prepare_key_net(ch, self.party, &self.handshake_secret)?;
+        let derived = derive_secret(ch, self.party, &pk_hs, b"derived", b"")?;
         // Master Secret = HKDF-Extract(salt=derived(shared), IKM=0) = HMAC(derived, 0^32).
-        let master = hmac_sha256_shared_net(ch, self.party, &derived, &[0u8; 32])?;
-        self.client_ap = Some(derive_secret(ch, self.party, &master, b"c ap traffic", transcript_ch_sfin)?);
-        self.server_ap = Some(derive_secret(ch, self.party, &master, b"s ap traffic", transcript_ch_sfin)?);
+        let pk_derived = prepare_key_net(ch, self.party, &derived)?;
+        let master = hmac_prepared_net(ch, self.party, &pk_derived, &[0u8; 32])?;
+        // master keys both application-traffic secrets — prepare once.
+        let pk_master = prepare_key_net(ch, self.party, &master)?;
+        self.client_ap = Some(derive_secret(ch, self.party, &pk_master, b"c ap traffic", transcript_ch_sfin)?);
+        self.server_ap = Some(derive_secret(ch, self.party, &pk_master, b"s ap traffic", transcript_ch_sfin)?);
         self.master = Some(master);
         Ok(())
     }
@@ -201,14 +209,8 @@ impl KeyScheduleNet {
     /// **KeyUpdate** (RFC 8446 §7.2) on the client write path: advance this party's client
     /// application-traffic secret share one generation via `"traffic upd"`, over `ch`.
     pub fn update_client_application(&mut self, ch: &mut dyn Channel) -> Result<()> {
-        let next = hkdf_expand_label_shared_net(
-            ch,
-            self.party,
-            &self.client_ap.expect("derive_application first"),
-            b"traffic upd",
-            b"",
-            32,
-        )?;
+        let pk = prepare_key_net(ch, self.party, &self.client_ap.expect("derive_application first"))?;
+        let next = expand_label_prepared_net(ch, self.party, &pk, b"traffic upd", b"", 32)?;
         self.client_ap = Some(next);
         Ok(())
     }
@@ -221,38 +223,42 @@ fn open_secret(ch: &mut dyn Channel, share: &[u8; 32]) -> Result<[u8; 32]> {
     Ok(core::array::from_fn(|i| share[i] ^ peer[i]))
 }
 
-/// `Derive-Secret(secret, label, messages)` under 2PC over `ch`: HKDF-Expand-Label with the
-/// public transcript hash as context. Returns this party's share.
+/// `Derive-Secret(secret, label, messages)` under 2PC over `ch`, from a **prepared** key
+/// (its ipad/opad states precomputed once): HKDF-Expand-Label with the public transcript
+/// hash as context. Returns this party's share.
 fn derive_secret(
     ch: &mut dyn Channel,
     party: Party,
-    secret_share: &[u8; 32],
+    prepared: &PreparedKey,
     label: &[u8],
     transcript: &[u8],
 ) -> Result<[u8; 32]> {
     let th = sha256(transcript);
-    hkdf_expand_label_shared_net(ch, party, secret_share, label, &th, 32)
+    expand_label_prepared_net(ch, party, prepared, label, &th, 32)
 }
 
-/// `(key, iv)` shares from a traffic-secret share: `key = HKDF-Expand-Label(secret, "key",
-/// "", 32)`, `iv = HKDF-Expand-Label(secret, "iv", "", 12)`, both under 2PC over `ch`.
+/// `(key, iv)` shares from a traffic-secret share: prepare the key once, then
+/// `HKDF-Expand-Label(secret, "key"/"iv")`. Both under 2PC over `ch`.
 fn traffic_keys(ch: &mut dyn Channel, party: Party, secret_share: &[u8; 32]) -> Result<([u8; 32], [u8; 32])> {
-    let key = hkdf_expand_label_shared_net(ch, party, secret_share, b"key", b"", 32)?;
-    let iv = hkdf_expand_label_shared_net(ch, party, secret_share, b"iv", b"", 12)?;
+    let pk = prepare_key_net(ch, party, secret_share)?;
+    let key = expand_label_prepared_net(ch, party, &pk, b"key", b"", 32)?;
+    let iv = expand_label_prepared_net(ch, party, &pk, b"iv", b"", 12)?;
     Ok((key, iv))
 }
 
 /// The Finished MAC key `HKDF-Expand-Label(secret, "finished", "", 32)` (shared), then
-/// `HMAC(finished_key, transcript_hash)` under 2PC over `ch`. Returns this party's share of
-/// the MAC (combine both to open).
+/// `HMAC(finished_key, transcript_hash)` under 2PC over `ch` — both via prepared keys.
+/// Returns this party's share of the MAC (combine both to open).
 fn finished_mac(
     ch: &mut dyn Channel,
     party: Party,
     secret_share: &[u8; 32],
     transcript_hash: &[u8; 32],
 ) -> Result<[u8; 32]> {
-    let fk = hkdf_expand_label_shared_net(ch, party, secret_share, b"finished", b"", 32)?;
-    hmac_sha256_shared_net(ch, party, &fk, transcript_hash)
+    let pk = prepare_key_net(ch, party, secret_share)?;
+    let fk = expand_label_prepared_net(ch, party, &pk, b"finished", b"", 32)?;
+    let pk_fk = prepare_key_net(ch, party, &fk)?;
+    hmac_prepared_net(ch, party, &pk_fk, transcript_hash)
 }
 
 /// **The networked handshake key-agreement driver.** Runs the ECDHE conversion and the
