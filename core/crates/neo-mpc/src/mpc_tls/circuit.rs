@@ -154,14 +154,18 @@ impl Builder {
         }
     }
 
-    /// One full adder: returns `(sum, carry_out)` for `a + b + cin`.
-    /// `sum = a ⊕ b ⊕ cin`; `cout = (a∧b) ∨ (cin ∧ (a⊕b))`.
+    /// One full adder: returns `(sum, carry_out)` for `a + b + cin`, using the
+    /// **AND-optimal 1-gate carry** — the dominant cost in a garbled circuit is AND gates
+    /// (XOR is free), so this halves-and-thirds the SHA-256/ChaCha adder cost vs the naive
+    /// 3-AND `(a∧b) ∨ (cin ∧ (a⊕b))` form.
+    /// `sum = a ⊕ b ⊕ cin`; `cout = a ⊕ ((a⊕b) ∧ (a⊕cin))` = majority(a,b,cin)
+    /// (a=0 ⇒ b∧cin; a=1 ⇒ b∨cin) — **one AND gate**.
     pub fn full_adder(&mut self, a: usize, b: usize, cin: usize) -> (usize, usize) {
         let axb = self.xor(a, b);
         let sum = self.xor(axb, cin);
-        let axb_and_cin = self.and(axb, cin);
-        let a_and_b = self.and(a, b);
-        let cout = self.or(a_and_b, axb_and_cin);
+        let axc = self.xor(a, cin);
+        let t = self.and(axb, axc);
+        let cout = self.xor(a, t);
         (sum, cout)
     }
 

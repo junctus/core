@@ -248,12 +248,6 @@ pub(crate) fn compress_circuit(
 fn xor_w(b: &mut Builder, x: &[usize], y: &[usize]) -> Vec<usize> {
     (0..32).map(|i| b.xor(x[i], y[i])).collect()
 }
-fn and_w(b: &mut Builder, x: &[usize], y: &[usize]) -> Vec<usize> {
-    (0..32).map(|i| b.and(x[i], y[i])).collect()
-}
-fn not_w(b: &mut Builder, x: &[usize]) -> Vec<usize> {
-    (0..32).map(|i| b.inv(x[i])).collect()
-}
 fn rotr(w: &[usize], n: usize) -> Vec<usize> {
     (0..32).map(|j| w[(j + n) % 32]).collect()
 }
@@ -263,18 +257,28 @@ fn shr(b: &mut Builder, w: &[usize], n: usize) -> Vec<usize> {
         .map(|j| if j + n < 32 { w[j + n] } else { z })
         .collect()
 }
+/// `Ch(x,y,z) = (x∧y) ⊕ (¬x∧z) = z ⊕ (x ∧ (y⊕z))` — the right form is **1 AND/bit**
+/// (vs 2 ANDs + a NOT for the literal definition).
 fn c_ch(b: &mut Builder, x: &[usize], y: &[usize], z: &[usize]) -> Vec<usize> {
-    let xy = and_w(b, x, y);
-    let nx = not_w(b, x);
-    let nxz = and_w(b, &nx, z);
-    xor_w(b, &xy, &nxz)
+    (0..32)
+        .map(|i| {
+            let yz = b.xor(y[i], z[i]);
+            let xyz = b.and(x[i], yz);
+            b.xor(z[i], xyz)
+        })
+        .collect()
 }
+/// `Maj(x,y,z) = (x∧y) ⊕ (x∧z) ⊕ (y∧z) = x ⊕ ((x⊕y) ∧ (x⊕z))` — **1 AND/bit** (vs 3).
+/// (x=0 ⇒ y∧z; x=1 ⇒ y∨z, i.e. the majority.)
 fn c_maj(b: &mut Builder, x: &[usize], y: &[usize], z: &[usize]) -> Vec<usize> {
-    let xy = and_w(b, x, y);
-    let xz = and_w(b, x, z);
-    let yz = and_w(b, y, z);
-    let t = xor_w(b, &xy, &xz);
-    xor_w(b, &t, &yz)
+    (0..32)
+        .map(|i| {
+            let xy = b.xor(x[i], y[i]);
+            let xz = b.xor(x[i], z[i]);
+            let t = b.and(xy, xz);
+            b.xor(x[i], t)
+        })
+        .collect()
 }
 fn c_bsig0(b: &mut Builder, x: &[usize]) -> Vec<usize> {
     let (a, c, d) = (rotr(x, 2), rotr(x, 13), rotr(x, 22));
