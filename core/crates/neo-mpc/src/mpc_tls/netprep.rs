@@ -512,6 +512,92 @@ fn beaver_and(
     Ok(z)
 }
 
+/// **Networked authenticated input** (TinyOT input protocol): the `owner` party injects
+/// its known `values` as authenticated shares `⟨vᵢ⟩`, over `ch`. Both parties draw random
+/// `⟨rᵢ⟩` ([`rand_shares`]); `rᵢ` is **partially opened to the owner only** (the peer sends
+/// its MAC-checked share and learns nothing); the owner broadcasts the public
+/// `δᵢ = vᵢ ⊕ rᵢ`; both set `⟨vᵢ⟩ = ⟨rᵢ⟩ ⊕ δᵢ`. The peer learns `δ` but not `v` (`r` stays
+/// hidden). `values` is `Some(bits)` for the owner, `None` for the peer.
+pub fn input_bits(
+    ch: &mut dyn Channel,
+    party: Party,
+    delta: &[u8; 16],
+    owner: Party,
+    values: Option<&[bool]>,
+    n: usize,
+) -> Result<Vec<Share>> {
+    let r = rand_shares(ch, party, delta, n)?;
+    let deltas: Vec<bool> = if party == owner {
+        let values =
+            values.ok_or_else(|| Error::Crypto("netprep: owner needs input values".into()))?;
+        if values.len() != n {
+            return Err(Error::Crypto("netprep: input value count mismatch".into()));
+        }
+        // Owner recovers rᵢ from the peer's MAC-checked share, then broadcasts δ.
+        let peer = ch.recv_exact(n * 17)?;
+        let mut ds = Vec::with_capacity(n);
+        for (i, ri) in r.iter().enumerate() {
+            let px = peer[i * 17] & 1 == 1;
+            let pmac: [u8; 16] = peer[i * 17 + 1..i * 17 + 17].try_into().expect("16");
+            let expect = if px { xor16(&ri.key, delta) } else { ri.key };
+            if !ct_eq(&expect, &pmac) {
+                return Err(Error::Crypto(
+                    "netprep: input-share MAC check failed (abort)".into(),
+                ));
+            }
+            ds.push(values[i] ^ (ri.x ^ px));
+        }
+        ch.send(&ds.iter().map(|&b| b as u8).collect::<Vec<u8>>())?;
+        ds
+    } else {
+        // Peer reveals its shares to the owner (MAC-checked there), then receives δ.
+        let mut msg = Vec::with_capacity(n * 17);
+        for s in &r {
+            msg.push(s.x as u8);
+            msg.extend_from_slice(&s.mac);
+        }
+        ch.send(&msg)?;
+        ch.recv_exact(n)?.iter().map(|&b| b & 1 == 1).collect()
+    };
+    Ok((0..n)
+        .map(|i| r[i].xor_const(deltas[i], party, delta))
+        .collect())
+}
+
+/// Evaluate a boolean `circuit` end-to-end over the wire under **known** per-party inputs:
+/// party A owns input wires `[0, a_owned)`, party B owns `[a_owned, input_bits)`. Each party
+/// passes only its own `my_bits`; inputs are injected via [`input_bits`], triples via
+/// [`rand_triples`], then [`eval_authenticated`]. Returns the opened output. This is the
+/// "known-input" front-end that lets a real circuit (e.g. a TLS key-schedule circuit) run
+/// through the fully-networked engine.
+pub fn eval_circuit_2pc(
+    ch: &mut dyn Channel,
+    party: Party,
+    delta: &[u8; 16],
+    circuit: &Circuit,
+    a_owned: usize,
+    my_bits: &[bool],
+) -> Result<Vec<bool>> {
+    let n_b = circuit
+        .input_bits
+        .checked_sub(a_owned)
+        .ok_or_else(|| Error::Crypto("netprep: a_owned exceeds circuit input width".into()))?;
+    let a_vals = if party == Party::A {
+        Some(my_bits)
+    } else {
+        None
+    };
+    let b_vals = if party == Party::B {
+        Some(my_bits)
+    } else {
+        None
+    };
+    let mut inputs = input_bits(ch, party, delta, Party::A, a_vals, a_owned)?;
+    inputs.extend(input_bits(ch, party, delta, Party::B, b_vals, n_b)?);
+    let triples = rand_triples(ch, party, delta, circuit.and_gates())?;
+    eval_authenticated(ch, party, delta, circuit, &inputs, &triples)
+}
+
 /// Evaluate `circuit` under distributed authenticated shares over `ch`. `inputs[i]` is this
 /// party's share of wire `i`; `triples` supplies one AND-triple per AND gate. XOR/NOT are
 /// local, each AND is a networked [`beaver_and`], and every output is MAC-checked-opened —
@@ -730,6 +816,64 @@ mod tests {
             out_a,
             circuit.eval(&in_a),
             "networked online == plaintext circuit"
+        );
+    }
+
+    #[test]
+    fn networked_known_input_circuit_matches_plaintext() {
+        // Known per-party inputs injected via the networked input-sharing protocol, then
+        // evaluated over the wire: A owns wires [0,2), B owns [2,4). The opened output
+        // must equal the plaintext circuit on the full input.
+        let da = [0x11u8; 16];
+        let db = [0x22u8; 16];
+        let circuit = small_circuit();
+        let full: [bool; 4] = [true, false, true, true];
+        let a_owned = 2;
+        let (ca, cb) = (circuit.clone(), circuit.clone());
+        let a_bits = full[..a_owned].to_vec();
+        let b_bits = full[a_owned..].to_vec();
+        let (ra, rb) = two_party(
+            move |ch| eval_circuit_2pc(ch, Party::A, &da, &ca, a_owned, &a_bits),
+            move |ch| eval_circuit_2pc(ch, Party::B, &db, &cb, a_owned, &b_bits),
+        );
+        let out_a = ra.expect("party A completes");
+        let out_b = rb.expect("party B completes");
+        assert_eq!(out_a, out_b, "both parties open the same output");
+        assert_eq!(
+            out_a,
+            circuit.eval(&full),
+            "networked known-input eval == plaintext"
+        );
+    }
+
+    #[test]
+    #[ignore] // ~30-60s: a real TLS key-schedule circuit (SHA-256 compression) over the wire
+    fn networked_online_evaluates_real_tls_circuit() {
+        // The actual SHA-256 compression circuit the TLS 1.3 key schedule runs, evaluated
+        // end-to-end over TCP through the fully-networked engine (input-sharing → F_pre →
+        // authenticated online), matching the plaintext circuit. Proves the live-TLS
+        // circuits run through the networked two-party engine, not just a toy adder.
+        use super::super::sha256::sha256_compress_circuit;
+        let da = [0x3cu8; 16];
+        let db = [0x5au8; 16];
+        let circuit = sha256_compress_circuit();
+        let full: Vec<bool> = (0..circuit.input_bits)
+            .map(|i| i.wrapping_mul(2_654_435_761) & 1 == 1)
+            .collect();
+        let a_owned = circuit.input_bits / 2;
+        let (ca, cb) = (circuit.clone(), circuit.clone());
+        let a_bits = full[..a_owned].to_vec();
+        let b_bits = full[a_owned..].to_vec();
+        let (ra, rb) = two_party(
+            move |ch| eval_circuit_2pc(ch, Party::A, &da, &ca, a_owned, &a_bits),
+            move |ch| eval_circuit_2pc(ch, Party::B, &db, &cb, a_owned, &b_bits),
+        );
+        let out_a = ra.expect("party A completes");
+        rb.expect("party B completes");
+        assert_eq!(
+            out_a,
+            circuit.eval(&full),
+            "networked online reproduces the real SHA-256 compression"
         );
     }
 

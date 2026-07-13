@@ -114,9 +114,14 @@ A **3-message, key-confirmed** PQ-hybrid AKE (`neo-crypto::handshake`):
   (honest triples satisfy `c=a∧b`; cheating-receiver, IT-MAC-forgery, and corrupted-triple aborts), and a
   **complete two-party malicious 2PC runs with no in-process modelling** — `netprep::eval_authenticated`
   evaluates a boolean circuit under the distributed shares (XOR/NOT local, each AND a networked Beaver open),
-  TCP-tested to reproduce the plaintext circuit and abort on a forged-MAC open. What remains is **not
-  crypto-primitive work**: the **external audit** (the hard gate) + the formal proofs; routing the *live-TLS*
-  gadgets through this networked engine (they use the bundled in-process online today) plus the malicious
+  including the **actual SHA-256 key-schedule circuit** (67k ANDs, via networked input-sharing → F_pre →
+  online), TCP-tested to reproduce the plaintext and abort on a forged-MAC open. **KeyUpdate** (RFC 8446 §7.2)
+  is implemented + interop-tested against rustls, and the CertificateVerify leaf key is extracted by a proper
+  DER `SubjectPublicKeyInfo` parse (OID-validated). What remains is **not crypto-primitive work**: the
+  **external audit** (the hard gate) + the formal proofs; routing the *live-TLS record/key-schedule* gadgets
+  through this networked engine (they use the bundled in-process online today — a performance question, since
+  the interactive online is one round-trip per AND); full **X.509 chain-building** (a caller-supplied
+  `webpki`/platform verifier); **AES-GCM / x25519** (each a new 2PC primitive, not hardening); plus the malicious
   ECtF-triple generation (MASCOT `sacrifice`; the arithmetic already runs over authenticated shares); live-TLS
   **hardening** (full X.509 chain-building, other ciphersuites/curves, KeyUpdate); and the KOS **Roy22** fix
   (it ships original

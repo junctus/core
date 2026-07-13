@@ -19,9 +19,19 @@
 //!   That an independent implementation completes the session end-to-end is the oracle.
 //! - **Server authentication**: the server `Finished` (bound to the ECDHE secret) is
 //!   verified, and the `CertificateVerify` ECDSA-P256 signature over the transcript is
-//!   verified against the leaf certificate's key. **Full X.509 chain-building to trust
-//!   anchors is out of scope here** (the test uses a self-signed cert) — a deployment
-//!   layers standard path validation on top.
+//!   verified against the leaf certificate's key — extracted by a **proper DER
+//!   `SubjectPublicKeyInfo` parse** ([`leaf_p256_point`]) that validates the
+//!   `{id-ecPublicKey, prime256v1}` algorithm OIDs, not a byte search. **Full X.509
+//!   chain-building** (issuer-signature path validation to a trust anchor, validity
+//!   periods, hostname) is a **caller-supplied verifier** — a deployment plugs in a
+//!   `webpki`/platform trust store; the built-in path authenticates the leaf key + the
+//!   transcript signature, which (with the ECDHE-bound Finished) already stops a passive
+//!   or key-substituting MITM, but not an untrusted-but-valid certificate.
+//! - **KeyUpdate** (RFC 8446 §7.2) is supported ([`AppSession::send_key_update`] +
+//!   inbound handling in [`recv_application`]): the traffic secret is advanced under 2PC.
+//! - **Ciphersuite/curve**: `TLS_CHACHA20_POLY1305_SHA256` + `secp256r1` only.
+//!   AES-GCM and x25519 would each need a new 2PC primitive (an AES circuit, a
+//!   Montgomery-curve ECtF) — new crypto, not hardening.
 //! - Engine-selectable ([`client_handshake`] is semi-honest; [`client_handshake_with_engine`]
 //!   runs the whole session under the malicious authenticated-garbling online). In-process
 //!   party model — see [`super`]'s boundary.
@@ -41,6 +51,7 @@ const HS_ENCRYPTED_EXTENSIONS: u8 = 0x08;
 const HS_CERTIFICATE: u8 = 0x0b;
 const HS_CERTIFICATE_VERIFY: u8 = 0x0f;
 const HS_FINISHED: u8 = 0x14;
+const HS_KEY_UPDATE: u8 = 0x18;
 
 const REC_CHANGE_CIPHER_SPEC: u8 = 20;
 const REC_ALERT: u8 = 21;
@@ -60,10 +71,37 @@ const CIPHER_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
 const SIG_ECDSA_SECP256R1_SHA256: u16 = 0x0403;
 
 /// A live application-data session after a completed handshake: the client-write and
-/// server-read record directions (each keyed to an application-traffic secret, seq 0).
+/// server-read record directions (each keyed to an application-traffic secret, seq 0), plus
+/// the key schedule + engine needed to advance them on a **KeyUpdate** (RFC 8446 §7.2).
 pub struct AppSession {
     pub client_write: Direction,
     pub server_read: Direction,
+    schedule: KeySchedule,
+    engine: EngineKind,
+}
+
+impl AppSession {
+    /// Send a TLS 1.3 **KeyUpdate** and rekey the client write path (RFC 8446 §7.2): the
+    /// KeyUpdate handshake message is sealed under the *current* client key, then the client
+    /// application-traffic secret is advanced and `client_write` reset to the new key (seq 0).
+    /// `request_update` asks the server to KeyUpdate its write path in return.
+    pub fn send_key_update(&mut self, ch: &mut dyn Channel, request_update: bool) -> Result<()> {
+        let msg = handshake_message(HS_KEY_UPDATE, &[request_update as u8]);
+        let zeros = vec![0u8; msg.len()];
+        let rec = self.client_write.seal(REC_HANDSHAKE, &msg, &zeros)?;
+        ch.send(&rec)?;
+        let new_keys = self.schedule.update_client_application()?;
+        self.client_write = Direction::with_engine(self.engine, &new_keys);
+        Ok(())
+    }
+
+    /// Advance the server read path one KeyUpdate generation (called when an inbound
+    /// KeyUpdate is received): rekey `server_read` to the next server application secret.
+    fn apply_server_key_update(&mut self) -> Result<()> {
+        let new_keys = self.schedule.update_server_application()?;
+        self.server_read = Direction::with_engine(self.engine, &new_keys);
+        Ok(())
+    }
 }
 
 // ---- little-endian-free wire writers -----------------------------------------
@@ -227,18 +265,88 @@ fn parse_server_hello(body: &[u8]) -> Result<ServerHello> {
     })
 }
 
-/// Locate a P-256 (`prime256v1`) uncompressed public point inside a leaf certificate's
-/// DER: the `subjectPublicKeyInfo` ends in `BIT STRING { 0x00 unused, 0x04 ‖ X ‖ Y }`,
-/// i.e. the byte run `03 42 00 04 <64 bytes>`. Minimal, targeted to the ECDSA-P256 case
-/// (what the interop cert uses); full X.509 parsing is out of scope (see boundary).
-fn find_p256_point(cert_der: &[u8]) -> Option<[u8; 65]> {
-    cert_der
-        .windows(4)
-        .position(|w| w == [0x03, 0x42, 0x00, 0x04])
-        .and_then(|i| {
-            let start = i + 3; // at the 0x04
-            cert_der.get(start..start + 65)?.try_into().ok()
-        })
+/// A minimal DER TLV cursor: each [`next`](Der::next) yields `(tag, value)` and advances.
+struct Der<'a> {
+    b: &'a [u8],
+    p: usize,
+}
+impl<'a> Der<'a> {
+    fn new(b: &'a [u8]) -> Self {
+        Der { b, p: 0 }
+    }
+    fn next(&mut self) -> Option<(u8, &'a [u8])> {
+        let tag = *self.b.get(self.p)?;
+        self.p += 1;
+        let l0 = *self.b.get(self.p)?;
+        self.p += 1;
+        let len = if l0 < 0x80 {
+            l0 as usize
+        } else {
+            // Long form: low 7 bits = number of length octets (reject absurd widths).
+            let n = (l0 & 0x7f) as usize;
+            if n == 0 || n > 4 {
+                return None;
+            }
+            let mut l = 0usize;
+            for _ in 0..n {
+                l = (l << 8) | *self.b.get(self.p)? as usize;
+                self.p += 1;
+            }
+            l
+        };
+        let end = self.p.checked_add(len)?; // no overflow even for a 4-octet length on 32-bit
+        let val = self.b.get(self.p..end)?;
+        self.p = end;
+        Some((tag, val))
+    }
+}
+
+const OID_EC_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]; // 1.2.840.10045.2.1
+const OID_PRIME256V1: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07]; // 1.2.840.10045.3.1.7
+
+/// Extract the leaf certificate's P-256 public point by a **positional** DER walk
+/// (RFC 5280): `Certificate → tbsCertificate`, then the `subjectPublicKeyInfo` at its
+/// *structural position* — the field immediately after `subject`
+/// (`[0]version? · serialNumber · signature · issuer · validity · subject · SPKI · …`) —
+/// **not** the first SPKI-shaped SEQUENCE (which a hostile cert could smuggle into
+/// `subject`/`issuer`/an extension: a parser differential vs. a real validator). The SPKI
+/// algorithm must be `{id-ecPublicKey, prime256v1}` and its `subjectPublicKey` the BIT
+/// STRING `0x00 ‖ 0x04 ‖ X ‖ Y`. Full **chain-building to a trust anchor** (issuer
+/// signatures, validity, hostname) is a caller-supplied verifier — see the boundary.
+fn leaf_p256_point(cert_der: &[u8]) -> Option<[u8; 65]> {
+    let (_, cert_body) = Der::new(cert_der).next()?; // Certificate SEQUENCE
+    let (_, tbs) = Der::new(cert_body).next()?; // tbsCertificate SEQUENCE (first element)
+    let mut fields = Der::new(tbs);
+    let mut fld = fields.next()?;
+    if fld.0 == 0xA0 {
+        fld = fields.next()?; // skip optional [0] EXPLICIT version
+    }
+    // `fld` is now serialNumber; skip it + signature + issuer + validity + subject (5),
+    // leaving `fld` = subjectPublicKeyInfo at its exact structural position.
+    for _ in 0..5 {
+        fld = fields.next()?;
+    }
+    let (tag, spki) = fld;
+    if tag != 0x30 {
+        return None; // SubjectPublicKeyInfo is a SEQUENCE
+    }
+    let mut inner = Der::new(spki);
+    let (0x30, alg) = inner.next()? else {
+        return None;
+    };
+    let mut a = Der::new(alg);
+    let is_ec_p256 = matches!(a.next(), Some((0x06, oid)) if oid == OID_EC_PUBLIC_KEY)
+        && matches!(a.next(), Some((0x06, curve)) if curve == OID_PRIME256V1);
+    if !is_ec_p256 {
+        return None;
+    }
+    // subjectPublicKey BIT STRING: 0x00 unused-bits ‖ 0x04 ‖ X ‖ Y (65-byte point).
+    match inner.next()? {
+        (0x03, bits) if bits.len() == 66 && bits[0] == 0x00 && bits[1] == 0x04 => {
+            bits[1..66].try_into().ok()
+        }
+        _ => None,
+    }
 }
 
 /// Verify the server's `CertificateVerify` (ECDSA-P256 over the transcript). `signed`
@@ -248,7 +356,7 @@ fn verify_certificate_verify(leaf: &[u8], signed: &[u8], sig_der: &[u8]) -> Resu
     use p256::ecdsa::signature::Verifier;
     use p256::ecdsa::{Signature, VerifyingKey};
 
-    let point = find_p256_point(leaf)
+    let point = leaf_p256_point(leaf)
         .ok_or_else(|| Error::Crypto("certverify: no P-256 key in leaf cert".into()))?;
     let vk = VerifyingKey::from_sec1_bytes(&point)
         .map_err(|_| Error::Crypto("certverify: bad P-256 key".into()))?;
@@ -487,6 +595,8 @@ pub fn client_handshake_with_engine(
     Ok(AppSession {
         client_write,
         server_read,
+        schedule: ks,
+        engine,
     })
 }
 
@@ -509,11 +619,14 @@ fn verify_server_certificate_verify(
     leaf: Option<&[u8]>,
     transcript_before_cv: Option<[u8; 32]>,
 ) -> Result<()> {
-    let cv = flight.iter().find(|m| m[0] == HS_CERTIFICATE_VERIFY);
-    let cv = match cv {
-        Some(cv) => cv,
-        None => return Ok(()), // no CertificateVerify (e.g. PSK) — nothing to check here
-    };
+    // This client always performs a full (non-PSK) ECDHE handshake, so the server MUST
+    // authenticate via CertificateVerify — a flight without it is unauthenticated and aborts.
+    let cv = flight
+        .iter()
+        .find(|m| m[0] == HS_CERTIFICATE_VERIFY)
+        .ok_or_else(|| {
+            Error::Crypto("tls: server flight missing CertificateVerify — abort".into())
+        })?;
     let leaf =
         leaf.ok_or_else(|| Error::Crypto("tls: CertificateVerify without Certificate".into()))?;
     let th = transcript_before_cv
@@ -550,7 +663,30 @@ pub fn recv_application(ch: &mut dyn Channel, sess: &mut AppSession) -> Result<V
             REC_APPLICATION_DATA => {
                 let (inner_ct, pt) = sess.server_read.open(&rec)?;
                 match inner_ct {
-                    REC_HANDSHAKE => continue, // NewSessionTicket etc. — skip
+                    REC_HANDSHAKE => {
+                        // Post-handshake messages, possibly coalesced in one record (RFC 8446
+                        // §5.1). Handle each: a KeyUpdate (§7.2) rekeys the read path (the record
+                        // was decrypted under the old key) and, if update_requested, KeyUpdates
+                        // our write path back; NewSessionTicket etc. are skipped.
+                        let mut buf = pt.as_slice();
+                        while let Some((msg, consumed)) = try_take_handshake(buf) {
+                            if msg[0] == HS_KEY_UPDATE {
+                                // KeyUpdate ::= enum { not_requested(0), requested(1) }: exactly
+                                // one body byte, value 0 or 1 (RFC 8446 §4.6.3) — else abort.
+                                if msg.len() != 5 || msg[4] > 1 {
+                                    return Err(Error::Crypto(
+                                        "tls: malformed KeyUpdate (illegal_parameter)".into(),
+                                    ));
+                                }
+                                sess.apply_server_key_update()?;
+                                if msg[4] == 1 {
+                                    sess.send_key_update(ch, false)?;
+                                }
+                            }
+                            buf = &buf[consumed..];
+                        }
+                        continue;
+                    }
                     REC_APPLICATION_DATA => return Ok(pt),
                     REC_ALERT => return Err(Error::Crypto(format!("tls: server alert {pt:?}"))),
                     other => {
@@ -575,6 +711,67 @@ mod tests {
     use super::super::channel::{Loopback, TcpChannel};
     use super::super::schedule::TrafficKeys;
     use super::*;
+
+    /// DER TLV: `tag ‖ length ‖ value`.
+    fn der(tag: u8, val: &[u8]) -> Vec<u8> {
+        let mut v = vec![tag];
+        let n = val.len();
+        if n < 128 {
+            v.push(n as u8);
+        } else if n < 256 {
+            v.extend_from_slice(&[0x81, n as u8]);
+        } else {
+            v.extend_from_slice(&[0x82, (n >> 8) as u8, n as u8]);
+        }
+        v.extend_from_slice(val);
+        v
+    }
+
+    /// A SubjectPublicKeyInfo SEQUENCE for a given P-256 uncompressed point.
+    fn spki(point: &[u8; 65]) -> Vec<u8> {
+        let alg = der(
+            0x30,
+            &[der(0x06, OID_EC_PUBLIC_KEY), der(0x06, OID_PRIME256V1)].concat(),
+        );
+        let mut bitstr = vec![0x00];
+        bitstr.extend_from_slice(point);
+        der(0x30, &[alg, der(0x03, &bitstr)].concat())
+    }
+
+    #[test]
+    fn leaf_p256_point_binds_to_the_spki_position_not_first_match() {
+        // Parser-differential guard: a hostile cert places a decoy SPKI-shaped SEQUENCE in
+        // the `subject` field (an earlier position). The positional parser must return the
+        // GENUINE key at the subjectPublicKeyInfo slot, never the smuggled one.
+        let real: [u8; 65] = core::array::from_fn(|i| if i == 0 { 0x04 } else { i as u8 });
+        let decoy: [u8; 65] = core::array::from_fn(|i| if i == 0 { 0x04 } else { 0xff ^ i as u8 });
+
+        let version = der(0xA0, &der(0x02, &[0x02])); // [0] EXPLICIT INTEGER 2 (v3)
+        let serial = der(0x02, &[0x2a]);
+        let signature = der(0x30, &[]);
+        let issuer = der(0x30, &[]);
+        let validity = der(0x30, &[]);
+        let subject = spki(&decoy); // smuggled: `subject` shaped like an SPKI
+        let real_spki = spki(&real);
+        let tbs = der(
+            0x30,
+            &[
+                version, serial, signature, issuer, validity, subject, real_spki,
+            ]
+            .concat(),
+        );
+        let cert = der(0x30, &tbs); // Certificate ::= SEQUENCE { tbsCertificate, ... }
+
+        assert_eq!(
+            leaf_p256_point(&cert),
+            Some(real),
+            "must extract the genuine SPKI key, not the decoy smuggled into `subject`"
+        );
+        assert_ne!(leaf_p256_point(&cert), Some(decoy), "decoy must never win");
+        // Truncated / malformed DER must not panic — just fail to parse.
+        assert_eq!(leaf_p256_point(&cert[..cert.len() / 2]), None);
+        assert_eq!(leaf_p256_point(&[0x30, 0x82, 0xff, 0xff]), None);
+    }
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::Arc;
@@ -668,6 +865,27 @@ mod tests {
             echo, payload,
             "rustls echoed the 2PC-encrypted application record"
         );
+    }
+
+    #[test]
+    #[ignore] // ~5 min (semi-honest garbling of the handshake + a KeyUpdate); run explicitly
+    fn live_handshake_with_key_update_against_rustls() {
+        // After a real handshake, the 2PC client performs a TLS 1.3 KeyUpdate (RFC 8446
+        // §7.2): it rekeys its write path under 2PC and keeps sending — rustls must process
+        // the KeyUpdate, rekey its read path, and still decrypt + echo the post-update
+        // application record. Interop proof that the 2PC KeyUpdate is wire-correct.
+        let addr = spawn_rustls_echo_server();
+        let mut ch = TcpChannel::connect(addr).unwrap();
+        let mut session = client_handshake(&mut ch, "localhost").expect("handshake");
+
+        session
+            .send_key_update(&mut ch, false)
+            .expect("send KeyUpdate + rekey write");
+
+        let payload = b"post-keyupdate ping";
+        send_application(&mut ch, &mut session, payload).expect("send under updated key");
+        let echo = recv_application(&mut ch, &mut session).expect("recv echo");
+        assert_eq!(echo, payload, "rustls decrypted the post-KeyUpdate record");
     }
 
     #[test]

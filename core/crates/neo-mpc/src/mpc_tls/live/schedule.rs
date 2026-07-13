@@ -281,6 +281,37 @@ impl KeySchedule {
     pub fn server_application_secret(&self) -> Secret2 {
         self.server_ap.expect("derive_application first")
     }
+
+    /// **KeyUpdate** (RFC 8446 §7.2) on the client write path: advance the client
+    /// application-traffic secret one generation —
+    /// `secret' = HKDF-Expand-Label(secret, "traffic upd", "", 32)` (empty context, **not** a
+    /// transcript hash), under 2PC — and return the fresh key/IV (the record layer resets its
+    /// sequence number to 0). Sent when the client emits a `KeyUpdate` handshake message.
+    pub fn update_client_application(&mut self) -> Result<TrafficKeys> {
+        self.client_ap = Some(traffic_update(
+            self.engine,
+            &self.client_ap.expect("derive_application first"),
+        )?);
+        self.client_application_keys()
+    }
+
+    /// **KeyUpdate** on the server read path: advance the server application-traffic secret
+    /// one generation and return the fresh key/IV. Applied when the peer sends a `KeyUpdate`.
+    pub fn update_server_application(&mut self) -> Result<TrafficKeys> {
+        self.server_ap = Some(traffic_update(
+            self.engine,
+            &self.server_ap.expect("derive_application first"),
+        )?);
+        self.server_application_keys()
+    }
+}
+
+/// One TLS 1.3 KeyUpdate generation of a traffic secret:
+/// `HKDF-Expand-Label(secret, "traffic upd", "", 32)` under 2PC (empty context).
+fn traffic_update(engine: EngineKind, secret: &Secret2) -> Result<Secret2> {
+    let (a, b) =
+        hkdf_expand_label_shared_engine(engine, &secret.a, &secret.b, b"traffic upd", b"", 32)?;
+    Ok(Secret2 { a, b })
 }
 
 #[cfg(test)]
@@ -399,6 +430,34 @@ mod tests {
         );
         // Cross-check the untouched `master`/`derived` public constant too.
         assert_eq!(derived_early(), derived0, "public Derived(Early)");
+    }
+
+    #[test]
+    fn key_update_matches_stock() {
+        // TLS 1.3 KeyUpdate (RFC 8446 §7.2): the advanced application-traffic secret + its
+        // fresh key/IV match the stock HKDF-Expand-Label(secret, "traffic upd", "", ·).
+        let ecdhe: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(9).wrapping_add(4));
+        let (ea, eb) = split(&ecdhe);
+        let mut ks =
+            KeySchedule::derive_handshake(EngineKind::Semihonest, &ea, &eb, b"<CH||SH>").unwrap();
+        ks.derive_application(b"<CH..sfin>").unwrap();
+
+        let cap0 = ks.client_application_secret().open();
+        let expected_next: [u8; 32] = ref_hkdf_expand_label(&cap0, b"traffic upd", b"", 32)
+            .try_into()
+            .unwrap();
+
+        let keys = ks.update_client_application().unwrap();
+        assert_eq!(
+            ks.client_application_secret().open(),
+            expected_next,
+            "KeyUpdate advances the secret via 'traffic upd'"
+        );
+        assert_eq!(
+            core::array::from_fn::<u8, 32, _>(|i| keys.key_a[i] ^ keys.key_b[i]).to_vec(),
+            ref_hkdf_expand_label(&expected_next, b"key", b"", 32),
+            "post-KeyUpdate traffic key"
+        );
     }
 
     #[test]
