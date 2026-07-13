@@ -56,35 +56,74 @@ enum Role {
     B,
 }
 
-/// Entry point for the `neo mpc2pc` subcommand.
+/// Timings from one completed two-party session (for terse serve-mode logging).
+pub struct SessionReport {
+    pub ectf: std::time::Duration,
+    pub garble: std::time::Duration,
+}
+
+/// Entry point for the `neo mpc2pc` subcommand. `--listen` becomes a **persistent** party-A
+/// server (one session per inbound connection, verbose); `--connect` runs one party-B session.
 pub fn run(listen: Option<String>, connect: Option<String>) -> anyhow::Result<()> {
     match (listen, connect) {
-        (Some(addr), None) => {
-            println!("neo mpc2pc — party A (garbler). Binding {addr}, waiting for the peer…");
-            let listener = TcpListener::bind(&addr).with_context(|| format!("bind {addr}"))?;
-            let (sock, peer) = listener.accept().context("accept peer")?;
-            println!("  peer connected from {peer}");
-            let mut ch = TcpChannel::from_stream(sock);
-            run_session(Role::A, &mut ch)
-        }
+        (Some(addr), None) => serve(&addr, true),
         (None, Some(addr)) => {
             println!("neo mpc2pc — party B (evaluator). Connecting to {addr}…");
             let sock = TcpStream::connect(&addr).with_context(|| format!("connect {addr}"))?;
             println!("  connected");
             let mut ch = TcpChannel::from_stream(sock);
-            run_session(Role::B, &mut ch)
+            run_session(Role::B, &mut ch, true)?;
+            Ok(())
         }
         _ => bail!("provide exactly one of --listen <addr> (party A) or --connect <addr> (party B)"),
     }
 }
 
+/// **Persistent party-A server.** Bind `addr` and serve one networked 2PC-TLS session
+/// (party A / garbler) per inbound connection, forever — each on its own thread, so a
+/// misbehaving or slow peer can't wedge the listener. This is what `neo run
+/// --mpc2pc-listen <addr>` runs in-process alongside the relay: a standing 2PC-TLS
+/// co-processor endpoint. `verbose` prints the full per-session transcript (CLI); when
+/// false (relay mode) each session logs a single `tracing` summary line to the journal.
+pub fn serve(addr: &str, verbose: bool) -> anyhow::Result<()> {
+    let listener = TcpListener::bind(addr).with_context(|| format!("bind {addr}"))?;
+    tracing::info!("mpc2pc: serving networked 2PC-TLS (party A) on {addr}");
+    if verbose {
+        println!("neo mpc2pc — party A (garbler). Serving on {addr}, one session per peer…");
+    }
+    for stream in listener.incoming() {
+        let stream = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("mpc2pc: accept failed: {e}");
+                continue;
+            }
+        };
+        let peer = stream.peer_addr().ok();
+        std::thread::spawn(move || {
+            let mut ch = TcpChannel::from_stream(stream);
+            match run_session(Role::A, &mut ch, verbose) {
+                Ok(rep) => tracing::info!(
+                    "mpc2pc: served {peer:?} — ECtF {:?}, garbled SHA-256 {:?}",
+                    rep.ectf,
+                    rep.garble
+                ),
+                Err(e) => tracing::warn!("mpc2pc: session with {peer:?} failed: {e}"),
+            }
+        });
+    }
+    Ok(())
+}
+
 /// Run the full two-party session on an established channel: ECtF ECDHE conversion, then
 /// the garbled SHA-256 key-schedule circuit, self-verifying each.
-fn run_session(role: Role, ch: &mut dyn Channel) -> anyhow::Result<()> {
-    ectf_ecdhe(role, ch)?;
-    garbled_key_schedule(role, ch)?;
-    println!("\n✓ networked 2PC-TLS crypto complete and self-verified over the wire.");
-    Ok(())
+fn run_session(role: Role, ch: &mut dyn Channel, verbose: bool) -> anyhow::Result<SessionReport> {
+    let ectf = ectf_ecdhe(role, ch, verbose)?;
+    let garble = garbled_key_schedule(role, ch, verbose)?;
+    if verbose {
+        println!("\n✓ networked 2PC-TLS crypto complete and self-verified over the wire.");
+    }
+    Ok(SessionReport { ectf, garble })
 }
 
 // ---- 1. ECDHE conversion (ECtF) ------------------------------------------------------
@@ -119,9 +158,12 @@ fn scalar_from_bytes(b: &[u8; 32]) -> anyhow::Result<Scalar> {
         .ok_or_else(|| anyhow!("peer scalar not in field"))
 }
 
-/// The networked ECtF ECDHE conversion + a demo-only correctness check.
-fn ectf_ecdhe(role: Role, ch: &mut dyn Channel) -> anyhow::Result<()> {
-    println!("\n[1/2] ECDHE conversion (ECtF) — split-scalar, neither party holds the secret");
+/// The networked ECtF ECDHE conversion + a demo-only correctness check. Returns the ECtF
+/// protocol elapsed time.
+fn ectf_ecdhe(role: Role, ch: &mut dyn Channel, verbose: bool) -> anyhow::Result<std::time::Duration> {
+    if verbose {
+        println!("\n[1/2] ECDHE conversion (ECtF) — split-scalar, neither party holds the secret");
+    }
 
     // The public server key share Y. In TLS this arrives in the clear from the server; here
     // party A mints an ephemeral one and discards the private scalar, so neither party knows
@@ -155,7 +197,9 @@ fn ectf_ecdhe(role: Role, ch: &mut dyn Channel) -> anyhow::Result<()> {
         Role::B => ectf_b(ch, (&px, &py), &P256_PRIME_BE).map_err(|e| anyhow!("ectf_b: {e}"))?,
     };
     let elapsed = t.elapsed();
-    println!("  ECtF protocol done in {elapsed:?} (Gilboa MtA over networked KOS-COT)");
+    if verbose {
+        println!("  ECtF protocol done in {elapsed:?} (Gilboa MtA over networked KOS-COT)");
+    }
 
     // Demo-only verification: open both the x-shares and the scalar shares, reconstruct, and
     // check against x(Z) computed directly with the vetted p256 crate. (This reveal is NOT
@@ -176,12 +220,13 @@ fn ectf_ecdhe(role: Role, ch: &mut dyn Channel) -> anyhow::Result<()> {
     let z_point = (y_point * joint_scalar).to_affine();
     let expected_x = point_x(&z_point);
 
-    if recon_be == expected_x {
-        println!("  ✓ reconstructed x(Z) matches p256's x((k_a+k_b)·Y) — ECDHE conversion correct");
-    } else {
+    if recon_be != expected_x {
         bail!("ECtF reconstruction mismatch — x(Z) != p256 reference");
     }
-    Ok(())
+    if verbose {
+        println!("  ✓ reconstructed x(Z) matches p256's x((k_a+k_b)·Y) — ECDHE conversion correct");
+    }
+    Ok(elapsed)
 }
 
 /// Independent big-endian serialization of a reconstructed field element.
@@ -203,10 +248,16 @@ fn demo_inputs(width: usize) -> Vec<bool> {
 
 /// Garble (A) / evaluate (B) the real SHA-256 compression circuit over the wire in a fixed
 /// 3 flights, with split input ownership; the evaluator self-verifies against the plaintext.
-fn garbled_key_schedule(role: Role, ch: &mut dyn Channel) -> anyhow::Result<()> {
+fn garbled_key_schedule(
+    role: Role,
+    ch: &mut dyn Channel,
+    verbose: bool,
+) -> anyhow::Result<std::time::Duration> {
     let circuit: Circuit = sha256_compress_circuit();
     let ands = circuit.and_gates();
-    println!("\n[2/2] Garbled key-schedule circuit — SHA-256 compression ({ands} AND gates)");
+    if verbose {
+        println!("\n[2/2] Garbled key-schedule circuit — SHA-256 compression ({ands} AND gates)");
+    }
 
     // Split input ownership: the evaluator (B) owns the second half of the input wires.
     let ev_wires: std::collections::HashSet<usize> =
@@ -217,20 +268,25 @@ fn garbled_key_schedule(role: Role, ch: &mut dyn Channel) -> anyhow::Result<()> 
     match role {
         Role::A => {
             garbler_run(ch, &circuit, &ev_wires, &inputs).map_err(|e| anyhow!("garbler: {e}"))?;
-            println!("  ✓ garbled + served the circuit in {:?} (constant 3 flights)", t.elapsed());
+            let elapsed = t.elapsed();
+            if verbose {
+                println!("  ✓ garbled + served the circuit in {elapsed:?} (constant 3 flights)");
+            }
+            Ok(elapsed)
         }
         Role::B => {
             let out =
                 evaluator_run(ch, &circuit, &ev_wires, &inputs).map_err(|e| anyhow!("eval: {e}"))?;
             let elapsed = t.elapsed();
-            if out == circuit.eval(&inputs) {
+            if out != circuit.eval(&inputs) {
+                bail!("garbled evaluation != plaintext circuit");
+            }
+            if verbose {
                 println!(
                     "  ✓ evaluated over the wire in {elapsed:?} — output matches the plaintext circuit"
                 );
-            } else {
-                bail!("garbled evaluation != plaintext circuit");
             }
+            Ok(elapsed)
         }
     }
-    Ok(())
 }

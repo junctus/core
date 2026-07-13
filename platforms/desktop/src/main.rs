@@ -78,6 +78,12 @@ enum Command {
         /// Bridge a TUN device through the tunnel (needs `--features tun` and root).
         #[arg(long)]
         tun: bool,
+        /// Also stand up a networked 2PC-TLS co-processor endpoint on this address
+        /// (party A / garbler), served in-process alongside the node — one session per
+        /// inbound connection. Off by default. On a relay, open this TCP port in the
+        /// firewall; peers reach it with `neo mpc2pc --connect <this-addr>`.
+        #[arg(long = "mpc2pc-listen")]
+        mpc2pc_listen: Option<String>,
     },
     /// Run a discovery seed: verify, health-check, and attest relays; serve
     /// signed snapshots over HTTP. Relays no user traffic. Put TLS in front.
@@ -303,7 +309,18 @@ async fn main() -> anyhow::Result<()> {
             threshold,
             identity,
             tun,
+            mpc2pc_listen,
         } => {
+            // Opt-in: stand up the networked 2PC-TLS co-processor endpoint in-process,
+            // on its own thread, alongside the node/relay. Default off — no behavior
+            // change unless `--mpc2pc-listen` is passed.
+            if let Some(addr) = mpc2pc_listen {
+                std::thread::spawn(move || {
+                    if let Err(e) = mpc2pc::serve(&addr, false) {
+                        tracing::error!("mpc2pc listener exited: {e}");
+                    }
+                });
+            }
             run_command(RunArgs {
                 relay,
                 announce_addr,
