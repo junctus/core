@@ -11,6 +11,7 @@ use clap::{Parser, Subcommand};
 use neo_core::NodeIdentity;
 use tokio::net::TcpListener;
 
+mod committee2pc;
 mod defaults;
 mod discovery;
 mod doh;
@@ -214,6 +215,36 @@ enum Command {
         /// response from the two members' shares.
         #[arg(long)]
         handshake: Option<String>,
+    },
+
+    /// **Client-reconstruct committee 2PC-TLS exit** (experimental, audit-gated): two
+    /// members jointly run TLS 1.3 to a destination so **neither sees the session key or
+    /// plaintext**; the client XOR-shares its request across the members and reconstructs the
+    /// response from their two shares. Run three processes: `--role lead --party <bind> \
+    /// --client-listen <bind>`, `--role follower --party <lead-addr> --client-listen <bind>`,
+    /// and `--role client --lead <A-client> --follower <B-client> --dest <host:port>`.
+    Committee2pc {
+        /// `lead` (member A, dials the destination), `follower` (member B), or `client`.
+        #[arg(long)]
+        role: String,
+        /// Member↔member party channel: lead **binds** it; follower **connects** to it.
+        #[arg(long)]
+        party: Option<String>,
+        /// Member: the address to accept the client on.
+        #[arg(long)]
+        client_listen: Option<String>,
+        /// Client: the lead member's client address.
+        #[arg(long)]
+        lead: Option<String>,
+        /// Client: the follower member's client address.
+        #[arg(long)]
+        follower: Option<String>,
+        /// Client: the destination `host:port`.
+        #[arg(long)]
+        dest: Option<String>,
+        /// Client: the request bytes (default: `GET /`).
+        #[arg(long)]
+        request: Option<String>,
     },
 }
 
@@ -443,6 +474,15 @@ async fn main() -> anyhow::Result<()> {
             full,
             handshake,
         } => mpc2pc::run(listen, connect, full, handshake)?,
+        Command::Committee2pc {
+            role,
+            party,
+            client_listen,
+            lead,
+            follower,
+            dest,
+            request,
+        } => committee2pc::run(&role, party, client_listen, lead, follower, dest, request)?,
     }
     Ok(())
 }
