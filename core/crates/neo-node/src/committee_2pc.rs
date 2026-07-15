@@ -15,17 +15,19 @@
 //! request-shares in and the response-shares out (the `FRAME_COMMITTEE_2PC` handler + client
 //! selection) wraps it.
 
+use std::collections::HashMap;
 use std::net::TcpStream as StdTcpStream;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
-use neo_core::{Error, Result};
+use neo_core::{Error, NodeId, NodeIdentity, Result};
 use neo_crypto::Session;
 use p256::elliptic_curve::rand_core::OsRng;
 use p256::{NonZeroScalar, Scalar};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
-use crate::run::{read_frame, write_frame};
+use crate::run::{connect_verified, read_frame, write_frame};
 use neo_mpc::mpc_tls::live::channel::{AmortizingChannel, Channel, TcpChannel};
 use neo_mpc::mpc_tls::live::handshake::{
     committee_handshake_net, committee_recv_app, committee_send_app,
@@ -69,6 +71,9 @@ pub struct Committee2pcPayload {
     /// The **lead's** relay address `host:port` — the follower dials it (with [`LINK_FRAME`] +
     /// `token`) to establish the member↔member 2PC link. Empty in the lead's own payload.
     pub lead_addr: String,
+    /// The **lead's** node id — the follower authenticates the link peer via `connect_verified`
+    /// (all-zero in the lead's own payload).
+    pub lead_id: [u8; 32],
     /// The clearnet destination `host:port` (both members need it; the lead dials it).
     pub dest: String,
     /// This member's XOR-share of the request.
@@ -84,6 +89,7 @@ impl Committee2pcPayload {
         out.push(COMMITTEE_2PC_MAGIC);
         out.push(self.lead as u8);
         out.extend_from_slice(&self.token);
+        out.extend_from_slice(&self.lead_id);
         out.extend_from_slice(&(self.lead_addr.len() as u16).to_be_bytes());
         out.extend_from_slice(self.lead_addr.as_bytes());
         out.extend_from_slice(&(self.dest.len() as u16).to_be_bytes());
@@ -115,10 +121,11 @@ impl Committee2pcPayload {
         };
         let lead = take(&mut cur, 1)?[0] != 0;
         let token: [u8; 16] = take(&mut cur, 16)?.try_into().expect("16");
+        let lead_id: [u8; 32] = take(&mut cur, 32)?.try_into().expect("32");
         let lead_addr = take_str(&mut cur)?;
         let dest = take_str(&mut cur)?;
         let request_share = cur.to_vec();
-        Ok(Some(Self { lead, token, lead_addr, dest, request_share }))
+        Ok(Some(Self { lead, token, lead_id, lead_addr, dest, request_share }))
     }
 }
 
@@ -274,6 +281,79 @@ pub async fn run_member(
     out
 }
 
+// ── Rendezvous + member endpoint ──
+
+type LinkTx = oneshot::Sender<(TcpStream, Session)>;
+
+/// Rendezvous: a committee-2PC **lead**, on reaching its circuit endpoint, registers
+/// `token → sender` and awaits the follower's link; the follower dials the lead's relay port
+/// with `LINK_FRAME`+token, and the lead's serve loop ([`handle_link`]) hands the authenticated
+/// `(stream, session)` to the waiting endpoint via this map.
+fn rendezvous() -> &'static Mutex<HashMap<[u8; 16], LinkTx>> {
+    static R: OnceLock<Mutex<HashMap<[u8; 16], LinkTx>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// How long a lead waits for its follower's link (and vice-versa for the arrival-order race).
+const LINK_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Run a committee-2PC member's whole flow for its circuit-endpoint `payload`, returning this
+/// member's XOR-share of the response plaintext. The **lead** registers a rendezvous slot and
+/// awaits the follower's authenticated link; the **follower** dials the lead (verifying its
+/// node id), sends `LINK_FRAME`+token, and that connection *is* the link. Both then run the 2PC
+/// over the encrypted session.
+pub async fn run_member_flow(
+    payload: Committee2pcPayload,
+    identity: &NodeIdentity,
+) -> Result<Vec<u8>> {
+    let (role, stream, session) = if payload.lead {
+        let (tx, rx) = oneshot::channel();
+        rendezvous().lock().expect("rendezvous poisoned").insert(payload.token, tx);
+        match tokio::time::timeout(LINK_TIMEOUT, rx).await {
+            Ok(Ok((stream, session))) => (Party::A, stream, session),
+            _ => {
+                rendezvous().lock().expect("rendezvous poisoned").remove(&payload.token);
+                return Err(Error::Config("committee2pc: follower link timed out".into()));
+            }
+        }
+    } else {
+        // Dial the lead (authenticated); this connection becomes the member link.
+        let lead_id = NodeId::from_bytes(payload.lead_id);
+        let (mut stream, mut result) =
+            connect_verified(&payload.lead_addr, identity, &lead_id).await?;
+        write_frame(&mut stream, &result.session.seal(&[LINK_FRAME])?).await?;
+        write_frame(&mut stream, &result.session.seal(&payload.token)?).await?;
+        (Party::B, stream, result.session)
+    };
+    run_member(role, stream, session, payload.dest, payload.request_share).await
+}
+
+/// The relay's `LINK_FRAME` dispatch: a follower has opened an authenticated link for the 2PC.
+/// Read the rendezvous token (the next session frame) and hand this `(stream, session)` to the
+/// lead's waiting endpoint. Polls briefly for the lead's registration (the two circuits arrive
+/// independently, so the follower may beat the lead).
+pub async fn handle_link(mut stream: TcpStream, mut session: Session) -> Result<()> {
+    let token_frame = read_frame(&mut stream).await?;
+    let token: [u8; 16] = session
+        .open(&token_frame)?
+        .as_slice()
+        .try_into()
+        .map_err(|_| Error::Decode("committee2pc: bad link token".into()))?;
+
+    let deadline = tokio::time::Instant::now() + LINK_TIMEOUT;
+    let tx = loop {
+        if let Some(tx) = rendezvous().lock().expect("rendezvous poisoned").remove(&token) {
+            break tx;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Error::Config("committee2pc: no lead awaiting this link token".into()));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let _ = tx.send((stream, session));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +399,7 @@ mod tests {
             lead: false,
             token: [7u8; 16],
             lead_addr: "10.0.0.1:443".into(),
+            lead_id: [3u8; 32],
             dest: "example.com:443".into(),
             request_share: b"a-random-request-share".to_vec(),
         };
@@ -327,6 +408,7 @@ mod tests {
         assert!(!got.lead);
         assert_eq!(got.token, p.token);
         assert_eq!(got.lead_addr, p.lead_addr);
+        assert_eq!(got.lead_id, p.lead_id);
         assert_eq!(got.dest, p.dest);
         assert_eq!(got.request_share, p.request_share);
         // A normal text exit target (e.g. "host:port" / "mux") is NOT a committee2pc payload.
