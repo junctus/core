@@ -126,7 +126,7 @@ fn rand_index(n: usize) -> Option<usize> {
 
 /// Fetch `/snapshot` from each mirror in turn; return the relays from the first
 /// snapshot that verifies against the trusted witnesses at the given threshold.
-async fn fetch_relays(
+pub(crate) async fn fetch_relays(
     mirrors: &[String],
     witnesses: &[[u8; 32]],
     threshold: usize,
