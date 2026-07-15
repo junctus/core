@@ -61,6 +61,14 @@ fn host_of(dest: &str) -> &str {
 /// How long the lead waits for the destination TCP connect before giving up, so a
 /// blackholed `dest` can't pin the `spawn_blocking` thread (mirrors `exit_splice`).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound each destination read/write so a server that stops responding cannot
+/// retain the committee's blocking worker indefinitely.
+const DEST_IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// Hard wall-clock budget for one member's complete 2PC session.
+const SESSION_TIMEOUT: Duration = Duration::from_secs(90);
+/// Bounded bridge depth in each direction. Backpressure is essential because an
+/// authenticated but malicious peer controls the rate and size of incoming frames.
+const PARTY_QUEUE_DEPTH: usize = 16;
 
 /// Cap on concurrent pending committee-lead rendezvous slots, so a burst of lead
 /// circuits can't grow the rendezvous map without bound (each slot is also pinned by
@@ -253,6 +261,8 @@ fn member_2pc_blocking(
         let addr = dial_addr
             .ok_or_else(|| Error::Config("committee2pc: lead has no vetted destination".into()))?;
         let sock = crate::netif::connect_scoped_blocking(addr, CONNECT_TIMEOUT)?;
+        sock.set_read_timeout(Some(DEST_IO_TIMEOUT))?;
+        sock.set_write_timeout(Some(DEST_IO_TIMEOUT))?;
         Some(TcpChannel::from_stream(sock))
     } else {
         None
@@ -287,19 +297,19 @@ fn member_2pc_blocking(
 
 /// A blocking neo-mpc [`Channel`] bridged over an authenticated neo [`Session`]: the sync 2PC
 /// engine `send`/`recv`s here; the async pump tasks in [`run_member`] seal/open each message
-/// and do the socket I/O. Crossing is via `tokio::sync::mpsc` (unbounded → no backpressure
-/// deadlock; each handshake's traffic is finite). `blocking_send`/`blocking_recv` are safe from
-/// the `spawn_blocking` thread.
+/// and do the socket I/O. Crossing is via bounded `tokio::sync::mpsc` queues, so a malicious
+/// party cannot make the relay buffer frames without limit. `blocking_send`/`blocking_recv`
+/// are safe from the `spawn_blocking` thread.
 struct SessionChannel {
-    to_pump: mpsc::UnboundedSender<Vec<u8>>,
-    from_pump: mpsc::UnboundedReceiver<Vec<u8>>,
+    to_pump: mpsc::Sender<Vec<u8>>,
+    from_pump: mpsc::Receiver<Vec<u8>>,
     rx: Vec<u8>,
 }
 
 impl Channel for SessionChannel {
     fn send(&mut self, buf: &[u8]) -> Result<()> {
         self.to_pump
-            .send(buf.to_vec())
+            .blocking_send(buf.to_vec())
             .map_err(|_| Error::Crypto("committee2pc: session pump closed (send)".into()))
     }
     fn recv(&mut self, buf: &mut [u8]) -> Result<usize> {
@@ -333,8 +343,8 @@ pub async fn run_member(
 ) -> Result<Vec<u8>> {
     let (mut rd, mut wr) = stream.into_split();
     let session = Arc::new(Mutex::new(session));
-    let (to_pump_tx, mut to_pump_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let (from_pump_tx, from_pump_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (to_pump_tx, mut to_pump_rx) = mpsc::channel::<Vec<u8>>(PARTY_QUEUE_DEPTH);
+    let (from_pump_tx, from_pump_rx) = mpsc::channel::<Vec<u8>>(PARTY_QUEUE_DEPTH);
 
     // Read: wire → open → 2PC.
     let sess_r = session.clone();
@@ -343,7 +353,7 @@ pub async fn run_member(
             let opened = sess_r.lock().expect("session poisoned").open(&frame);
             match opened {
                 Ok(pt) => {
-                    if from_pump_tx.send(pt).is_err() {
+                    if from_pump_tx.send(pt).await.is_err() {
                         break;
                     }
                 }
@@ -368,20 +378,31 @@ pub async fn run_member(
         }
     });
 
-    let out = tokio::task::spawn_blocking(move || {
+    let mut worker = tokio::task::spawn_blocking(move || {
         let mut ch = SessionChannel {
             to_pump: to_pump_tx,
             from_pump: from_pump_rx,
             rx: Vec::new(),
         };
         member_2pc_blocking(role, &mut ch, &dest, dial_addr, &request_share)
-    })
-    .await
-    .map_err(|e| Error::Config(format!("committee2pc: blocking task join: {e}")))?;
+    });
 
-    read_task.abort();
-    write_task.abort();
-    out
+    match tokio::time::timeout(SESSION_TIMEOUT, &mut worker).await {
+        Ok(joined) => {
+            read_task.abort();
+            write_task.abort();
+            joined.map_err(|e| Error::Config(format!("committee2pc: blocking task join: {e}")))?
+        }
+        Err(_) => {
+            // Dropping the pumps closes both bounded channels, causing any blocked
+            // SessionChannel operation to return. Destination socket reads/writes
+            // have their own shorter OS deadlines as a second line of defense.
+            read_task.abort();
+            write_task.abort();
+            worker.abort();
+            Err(Error::Config("committee2pc: session timed out".into()))
+        }
+    }
 }
 
 // ── Rendezvous + member endpoint ──
@@ -428,6 +449,11 @@ pub async fn run_member_flow(
                     "committee2pc: too many pending committee links".into(),
                 ));
             }
+            if map.contains_key(&payload.token) {
+                return Err(Error::Config(
+                    "committee2pc: duplicate rendezvous token".into(),
+                ));
+            }
             map.insert(payload.token, tx);
         }
         match tokio::time::timeout(LINK_TIMEOUT, rx).await {
@@ -467,7 +493,9 @@ pub async fn run_member_flow(
 /// lead's waiting endpoint. Polls briefly for the lead's registration (the two circuits arrive
 /// independently, so the follower may beat the lead).
 pub async fn handle_link(mut stream: TcpStream, mut session: Session) -> Result<()> {
-    let token_frame = read_frame(&mut stream).await?;
+    let token_frame = tokio::time::timeout(LINK_TIMEOUT, read_frame(&mut stream))
+        .await
+        .map_err(|_| Error::Config("committee2pc: link token timed out".into()))??;
     let token: [u8; 16] = session
         .open(&token_frame)?
         .as_slice()

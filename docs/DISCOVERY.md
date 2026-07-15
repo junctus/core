@@ -166,13 +166,15 @@ path selection. See `MILESTONES.md` M36.
 installer). See that directory's README.
 
 Trust is explicit and k-of-n: `discovery.junctus.org` is witness #1 and mirror
-#1, not a trust root. Stand up more independent seeds and raise the client
-threshold to dilute any single operator.
+#1, not a quorum by itself. The production default is two signatures and fails
+closed while the baked bundle contains only this one witness. Stand up a second
+independently operated seed, add its key to the client bundle, and keep the
+threshold at two before enabling zero-configuration discovery.
 
 ## Using it
 
 ```bash
-# Zero-config client — discovers a relay and connects:
+# Client with a provisioned two-witness bundle — discovers and connects:
 neo run
 
 # Run a public relay that registers with the seeds:
@@ -187,6 +189,10 @@ Mirrors and trusted witnesses come from (in order) CLI flags
 the baked-in constants in `platforms/desktop/src/defaults.rs`. A client refuses
 to trust a snapshot from a witness it hasn't been told about — trust is never
 implicit.
+
+For a single-seed local development network, pass `--threshold 1` explicitly.
+That override removes the independent-witness security property and is not a
+production configuration.
 
 ## DoH rendezvous bootstrap (M18)
 

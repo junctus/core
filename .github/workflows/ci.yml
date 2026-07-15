@@ -63,31 +63,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
-      # Surface RustSec advisories against the committed lockfile. This gate FAILS on
-      # any vulnerability, so a new one on any crate breaks CI; lower-severity warnings
-      # (unmaintained / unsound / yanked transitive crates) are printed but do not gate,
-      # because they are all transitive and can't be resolved without a major upstream
-      # bump — a permanently-red gate just gets ignored. The `--ignore`d IDs below are
-      # the current vulnerabilities that are NOT on a security-critical neo path; each
-      # is tracked, revisit on the next `libp2p` / `reqwest` bump. (The former
-      # `sharks`/RUSTSEC-2024-0398 ignore was removed — that dep is gone, migrated to
-      # the bias-free `blahaj` fork.)
-      #
-      #   rustls-webpki 0.101.7 (RUSTSEC-2026-0098/0099/0104): pulled by `libp2p-tls`
-      #     for the discovery substrate's *self-signed* peer certs — the name-constraint
-      #     and CRL-parse bugs do not apply to that usage. neo's security-critical
-      #     destination cert-chain verification (committee 2PC-TLS) uses the PATCHED
-      #     `rustls-webpki 0.103.13`, which is unaffected.
-      #   ring 0.16.20 (RUSTSEC-2025-0009): AES panic on overflow-checked (debug) builds
-      #     only; via `rcgen 0.11` under `libp2p-tls`, used solely to mint the libp2p
-      #     self-signed cert.
-      #   hickory-proto 0.24 (RUSTSEC-2026-0119): DNS name-compression CPU blowup,
-      #     bounded by request-size caps; not on the onion data path.
+      # The libp2p 0.56 umbrella crate locks its optional `dns` backend even though
+      # neo never enables or reaches it (`cargo tree ... -i hickory-proto` is empty).
+      # Upstream libp2p-dns still pins vulnerable hickory 0.25 and RUSTSEC-2026-0118
+      # has no fixed release. Keep these narrowly-scoped exceptions only until an
+      # upstream release moves to hickory >=0.26.1; every reachable vulnerability
+      # remains a hard failure and all advisory warnings remain visible.
       - name: Audit dependencies
         run: >-
           cargo audit
-          --ignore RUSTSEC-2026-0098
-          --ignore RUSTSEC-2026-0099
-          --ignore RUSTSEC-2026-0104
-          --ignore RUSTSEC-2025-0009
+          --ignore RUSTSEC-2026-0118
           --ignore RUSTSEC-2026-0119

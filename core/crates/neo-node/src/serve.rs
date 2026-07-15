@@ -54,7 +54,10 @@ pub async fn serve_connection<R: NextHop>(
     policy: ExitPolicy,
     committee: Option<CommitteeServing<'_>>,
 ) -> Result<Served> {
-    let mode = session.open(&read_frame(&mut stream).await?)?;
+    let mode_frame = tokio::time::timeout(crate::run::HANDSHAKE_TIMEOUT, read_frame(&mut stream))
+        .await
+        .map_err(|_| Error::Config("connection mode timed out".into()))??;
+    let mode = session.open(&mode_frame)?;
     match mode.as_slice() {
         [FRAME_MESSAGE] => {
             let outcome =

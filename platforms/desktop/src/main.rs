@@ -38,10 +38,10 @@ enum Command {
     },
     /// Run a neo node.
     ///
-    /// With no flags, runs as a **client**: discovers relays from the seed
-    /// mirrors and connects — zero configuration. With `--relay`, runs as a
-    /// public relay that registers with the seeds. `--listen`/`--connect` still
-    /// drive the manual two-process M1 handshake for local testing.
+    /// With no flags, runs as a **client** using the baked discovery trust
+    /// bundle (which must contain the production witness quorum). With `--relay`,
+    /// runs as a public relay that registers with the seeds. `--listen`/`--connect`
+    /// still drive the manual two-process M1 handshake for local testing.
     Run {
         /// Run as a public relay: register with seeds and serve handshakes.
         #[arg(long, conflicts_with = "connect")]
@@ -619,7 +619,7 @@ fn resolve_interface_index(spec: &str) -> anyhow::Result<u32> {
 }
 
 /// Dispatch `neo run` to the right role: TUN tunnel, manual M1, relay, or the
-/// zero-configuration client.
+/// discovery-configured client.
 async fn run_command(args: RunArgs) -> anyhow::Result<()> {
     // Manual/TUN modes keep the original explicit-peer behavior.
     if args.tun || (!args.relay && (args.listen.is_some() || args.connect.is_some())) {
@@ -747,14 +747,7 @@ fn generate_identity(output: &Path, force: bool) -> anyhow::Result<()> {
 
     let identity = NodeIdentity::generate()?;
     let bytes = identity.to_bytes();
-    std::fs::write(output, &bytes)?;
-
-    // Restrict the secret to the owner on Unix; other platforms fall back to defaults.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(output, std::fs::Permissions::from_mode(0o600))?;
-    }
+    roles::write_secret_file(output, &bytes, force)?;
 
     println!("node id : {}", identity.id());
     println!(

@@ -12,7 +12,7 @@
 //! of a peer address).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use neo_core::NodeIdentity;
@@ -31,6 +31,55 @@ use crate::tunnel::{runtime, NeoTunnelError};
 const QUEUE_DEPTH: usize = 512;
 /// Snapshot fetch timeout per mirror.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_SNAPSHOT_BODY: usize = 34 * 1024 * 1024;
+
+#[derive(Default)]
+struct InterfaceState {
+    index: u32,
+    users: usize,
+}
+
+fn interface_state() -> &'static Mutex<InterfaceState> {
+    static STATE: OnceLock<Mutex<InterfaceState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(InterfaceState::default()))
+}
+
+/// Lease the process-wide socket scope without allowing concurrent sessions to
+/// silently reroute one another. Index 0 is a real unscoped configuration, not
+/// "leave whatever a prior session selected".
+pub(crate) struct InterfaceLease {
+    index: u32,
+}
+
+pub(crate) fn acquire_interface(index: u32) -> Result<InterfaceLease, NeoTunnelError> {
+    let mut state = interface_state().lock().expect("interface state poisoned");
+    if state.users != 0 && state.index != index {
+        return Err(NeoTunnelError::Connect {
+            detail: format!(
+                "network interface conflict: {} active, {index} requested",
+                state.index
+            ),
+        });
+    }
+    if state.users == 0 {
+        neo_node::netif::set_bound_interface(index);
+        state.index = index;
+    }
+    state.users += 1;
+    Ok(InterfaceLease { index })
+}
+
+impl Drop for InterfaceLease {
+    fn drop(&mut self) {
+        let mut state = interface_state().lock().expect("interface state poisoned");
+        debug_assert_eq!(state.index, self.index);
+        state.users = state.users.saturating_sub(1);
+        if state.users == 0 {
+            state.index = 0;
+            neo_node::netif::set_bound_interface(0);
+        }
+    }
+}
 
 /// Picks a fresh circuit of `hops` relays for each flow from a verified snapshot.
 struct SnapshotPicker {
@@ -153,7 +202,10 @@ pub(crate) async fn fetch_relays(
     for mirror in mirrors {
         let url = format!("{}/snapshot", mirror.trim_end_matches('/'));
         match client.get(&url).send().await {
-            Ok(resp) => match resp.bytes().await {
+            Ok(resp) if !resp.status().is_success() => {
+                last = format!("{mirror}: HTTP {}", resp.status());
+            }
+            Ok(resp) => match read_limited(resp, MAX_SNAPSHOT_BODY).await {
                 Ok(bytes) => match SignedSnapshot::from_bytes(&bytes) {
                     Ok(snapshot) => {
                         let hwm = SNAPSHOT_HWM.load(Ordering::Relaxed);
@@ -183,6 +235,29 @@ pub(crate) async fn fetch_relays(
     Err(NeoTunnelError::Discovery { detail: last })
 }
 
+async fn read_limited(
+    mut resp: reqwest::Response,
+    max_body: usize,
+) -> Result<Vec<u8>, NeoTunnelError> {
+    if resp.content_length().is_some_and(|n| n > max_body as u64) {
+        return Err(NeoTunnelError::Discovery {
+            detail: format!("response body exceeds {max_body} bytes"),
+        });
+    }
+    let mut out = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| NeoTunnelError::Discovery {
+        detail: format!("reading body: {e}"),
+    })? {
+        if out.len().saturating_add(chunk.len()) > max_body {
+            return Err(NeoTunnelError::Discovery {
+                detail: format!("response body exceeds {max_body} bytes"),
+            });
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
+
 /// A live multi-hop tunnel. Drive it from the OS packet loop exactly like
 /// [`crate::tunnel::NeoTunnelSession`].
 #[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
@@ -192,6 +267,7 @@ pub struct NeoTunnelStackSession {
     task: Mutex<Option<JoinHandle<()>>>,
     closed: AtomicBool,
     relay_count: u32,
+    interface: Mutex<Option<InterfaceLease>>,
 }
 
 impl NeoTunnelStackSession {
@@ -209,9 +285,7 @@ impl NeoTunnelStackSession {
         // failed once the tunnel was up). Process-wide, exactly like the relay's
         // `--net-interface`. The one-time mirror fetch below runs before the TUN
         // is the default route, so it doesn't need this. Index 0 = unscoped.
-        if net_interface_index != 0 {
-            neo_node::netif::set_bound_interface(net_interface_index);
-        }
+        let interface = acquire_interface(net_interface_index)?;
         let identity = NodeIdentity::from_bytes(&secret).map_err(|_| NeoTunnelError::Identity)?;
 
         let mut witnesses = Vec::with_capacity(witnesses_hex.len());
@@ -272,6 +346,7 @@ impl NeoTunnelStackSession {
             task: Mutex::new(Some(task)),
             closed: AtomicBool::new(false),
             relay_count,
+            interface: Mutex::new(Some(interface)),
         })
     }
 
@@ -315,6 +390,16 @@ impl NeoTunnelStackSession {
         if let Some(task) = self.task.lock().expect("task lock poisoned").take() {
             task.abort();
         }
+        self.interface
+            .lock()
+            .expect("interface lock poisoned")
+            .take();
+    }
+}
+
+impl Drop for NeoTunnelStackSession {
+    fn drop(&mut self) {
+        self.close_inner();
     }
 }
 
@@ -391,6 +476,24 @@ mod tests {
     fn make_relay_at(addr: &str, exit: bool) -> PeerRecord {
         let id = NodeIdentity::generate().unwrap();
         PeerRecord::build_signed(&id, vec![addr.into()], true, exit, now_unix() + 3600, 1).unwrap()
+    }
+
+    #[test]
+    fn interface_leases_reject_conflicts_and_reset_on_last_drop() {
+        let first = acquire_interface(41).unwrap();
+        let second = acquire_interface(41).unwrap();
+        assert!(acquire_interface(42).is_err());
+        assert_eq!(
+            neo_node::netif::bound_interface().map(|i| i.get()),
+            Some(41)
+        );
+        drop(first);
+        assert_eq!(
+            neo_node::netif::bound_interface().map(|i| i.get()),
+            Some(41)
+        );
+        drop(second);
+        assert_eq!(neo_node::netif::bound_interface(), None);
     }
 
     #[test]
@@ -526,5 +629,26 @@ mod tests {
             fetch_relays(&[mirror], &[stranger], 1).await.is_err(),
             "a snapshot with no trusted signature must be rejected"
         );
+    }
+
+    #[tokio::test]
+    async fn snapshot_fetch_rejects_an_oversized_body_before_reading_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut scratch = [0u8; 512];
+            let _ = sock.read(&mut scratch).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                MAX_SNAPSHOT_BODY + 1
+            );
+            sock.write_all(response.as_bytes()).await.unwrap();
+        });
+        let resp = reqwest::get(format!("http://{addr}/snapshot"))
+            .await
+            .unwrap();
+        assert!(read_limited(resp, MAX_SNAPSHOT_BODY).await.is_err());
     }
 }

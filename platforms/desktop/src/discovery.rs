@@ -26,12 +26,21 @@ use neo_discovery::PeerRecord;
 use crate::defaults::{DiscoveryConfig, CACHE_MAX_AGE};
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Parser-compatible cap: 4096 relay records of at most 8192 bytes plus framing.
+const MAX_SNAPSHOT_BODY: usize = 34 * 1024 * 1024;
+/// Committee descriptors are experimental metadata and should remain compact.
+const MAX_COMMITTEE_LIST_BODY: usize = 16 * 1024 * 1024;
 
 /// `~/.neo`, created if absent — holds the snapshot cache and node identity.
 pub fn neo_dir() -> Result<PathBuf> {
     let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
     let dir = PathBuf::from(home).join(".neo");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
     Ok(dir)
 }
 
@@ -131,7 +140,7 @@ async fn fetch_from_mirror(
             return Ok(snapshot);
         }
     }
-    let body = fetch_one(client, &format!("{mirror}/snapshot")).await?;
+    let body = fetch_one(client, &format!("{mirror}/snapshot"), MAX_SNAPSHOT_BODY).await?;
     let snapshot = SignedSnapshot::from_bytes(&body).context("malformed snapshot")?;
     accept_snapshot(snapshot, cfg, now, hwm)
 }
@@ -179,12 +188,12 @@ fn accept_snapshot(
     Ok(snapshot)
 }
 
-async fn fetch_one(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
+async fn fetch_one(client: &reqwest::Client, url: &str, max_body: usize) -> Result<Vec<u8>> {
     let resp = client.get(url).send().await.context("request failed")?;
     if !resp.status().is_success() {
         bail!("HTTP {}", resp.status());
     }
-    Ok(resp.bytes().await.context("reading body")?.to_vec())
+    read_limited(resp, max_body).await
 }
 
 /// Fetch a body and whether the seed marked it a delta (`X-Neo-Diff: delta`)
@@ -199,10 +208,23 @@ async fn fetch_with_kind(client: &reqwest::Client, url: &str) -> Result<(Vec<u8>
         .get("x-neo-diff")
         .map(|v| v.as_bytes() == b"delta")
         .unwrap_or(false);
-    Ok((
-        resp.bytes().await.context("reading body")?.to_vec(),
-        is_delta,
-    ))
+    Ok((read_limited(resp, MAX_SNAPSHOT_BODY).await?, is_delta))
+}
+
+/// Stream a response under an allocation cap. Parser limits are too late if an
+/// untrusted mirror can first make `Response::bytes` allocate an arbitrary body.
+async fn read_limited(mut resp: reqwest::Response, max_body: usize) -> Result<Vec<u8>> {
+    if resp.content_length().is_some_and(|n| n > max_body as u64) {
+        bail!("response body exceeds {max_body} bytes");
+    }
+    let mut out = Vec::new();
+    while let Some(chunk) = resp.chunk().await.context("reading body")? {
+        if out.len().saturating_add(chunk.len()) > max_body {
+            bail!("response body exceeds {max_body} bytes");
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
 }
 
 /// The cached snapshot's relay set, to use as a delta base. Parsed only — the
@@ -301,7 +323,13 @@ pub async fn publish_committee(cfg: &DiscoveryConfig, descriptor: &[u8]) -> Resu
 pub async fn fetch_committees(cfg: &DiscoveryConfig) -> Result<Vec<Vec<u8>>> {
     let client = http_client()?;
     for mirror in &cfg.mirrors {
-        if let Ok(bytes) = fetch_one(&client, &format!("{mirror}/committee")).await {
+        if let Ok(bytes) = fetch_one(
+            &client,
+            &format!("{mirror}/committee"),
+            MAX_COMMITTEE_LIST_BODY,
+        )
+        .await
+        {
             if let Some(list) = parse_committee_list(&bytes) {
                 return Ok(list);
             }

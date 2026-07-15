@@ -36,7 +36,7 @@ use neo_crypto::{create_packet_keyed, process, Processed, ReplayCache, Session, 
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::forward::{Hop, NextHop};
-use crate::run::{connect_verified, read_frame, write_frame};
+use crate::run::{connect_verified, connect_verified_ephemeral, read_frame, write_frame};
 
 /// Length of the end-to-end return-path integrity tag.
 const RETURN_MAC_LEN: usize = 16;
@@ -77,7 +77,7 @@ fn xor_layer(data: &mut [u8], key: &[u8; 32]) {
 /// Client: send `request` to the exit through `circuit` and return the exit's
 /// response, received back through the same circuit (layers peeled).
 pub async fn request_response(
-    identity: &NodeIdentity,
+    _identity: &NodeIdentity,
     circuit: &[Hop],
     request: &[u8],
 ) -> Result<Vec<u8>> {
@@ -94,7 +94,7 @@ pub async fn request_response(
     let (packet, secrets) = create_packet_keyed(&hops, request)?;
 
     let (mut stream, mut result) =
-        connect_verified(&circuit[0].addr, identity, &circuit[0].id).await?;
+        connect_verified_ephemeral(&circuit[0].addr, &circuit[0].id).await?;
     let framed = result.session.seal(&packet.to_bytes())?;
     write_frame(&mut stream, &framed).await?;
 

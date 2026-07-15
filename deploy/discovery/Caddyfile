@@ -22,8 +22,6 @@ discovery.junctus.org {
 		header_up X-Forwarded-For {remote_host}
 	}
 
-	log {
-		output file /var/log/caddy/discovery.junctus.org.log
-		format json
-	}
+	# Do not retain client IP/path/User-Agent access logs. Snapshot consumers are
+	# privacy-tool users; operational metrics must be aggregate and non-identifying.
 }

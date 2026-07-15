@@ -1,19 +1,18 @@
 //! Baked-in discovery defaults and config resolution.
 //!
 //! This is the *entire* configuration a user needs for `neo run` to find the
-//! network: a list of seed mirrors to fetch a relay snapshot from, and the
-//! witness public keys that snapshot must be signed by. Everything else is
-//! discovered.
+//! network: a list of seed mirrors to fetch a relay snapshot from, and a quorum
+//! of independent witness public keys that snapshot must be signed by.
 //!
 //! ## Operator setup (discovery.junctus.org)
 //!
-//! After you generate the seed's witness identity on the server
+//! After independent operators generate their witness identities
 //! (`neo identity generate --output witness.key` → prints its node id; the
-//! service also exposes the key at `GET /witness`), paste the hex key into
-//! [`BAKED_WITNESSES`] and ship the rebuilt client. Until then, users can point
-//! at your seed with `--mirror`/`--witness` or the `NEO_MIRRORS`/`NEO_WITNESSES`
-//! environment variables. Trust is explicit by design: a client will not accept
-//! a snapshot from a witness it hasn't been told to trust.
+//! service also exposes the key at `GET /witness`), paste at least two hex keys
+//! into [`BAKED_WITNESSES`] and ship the rebuilt client. Until then, production
+//! discovery fails closed; a threshold-1 override is for local development only.
+//! Trust is explicit by design: a client will not accept a snapshot from a
+//! witness it hasn't been told to trust.
 
 use std::time::Duration;
 
@@ -33,8 +32,10 @@ pub const BAKED_WITNESSES: &[&str] = &[
 ];
 
 /// Default minimum number of distinct trusted witnesses that must sign a
-/// snapshot. Capped to the number of known witnesses at resolution time.
-pub const DEFAULT_THRESHOLD: usize = 1;
+/// snapshot. The baked bundle must contain at least two
+/// independently-operated witnesses before zero-configuration discovery works;
+/// failing closed is preferable to silently presenting 1-of-1 as a quorum.
+pub const DEFAULT_THRESHOLD: usize = 2;
 
 /// How long a cached snapshot is trusted offline before a refetch is forced,
 /// independent of the snapshot's own expiry (belt and suspenders).
@@ -129,7 +130,7 @@ mod tests {
         let cfg = DiscoveryConfig::resolve(
             &["https://example.org/".to_string()],
             &["ab".repeat(32)], // 64 hex chars
-            None,
+            Some(1),
         )
         .unwrap();
         assert_eq!(cfg.mirrors, vec!["https://example.org"]); // trailing slash trimmed
@@ -150,6 +151,17 @@ mod tests {
             let mut key = [0u8; 32];
             hex::decode_to_slice(hexkey.trim(), &mut key)
                 .unwrap_or_else(|_| panic!("baked witness is not 32-byte hex: {hexkey}"));
+        }
+    }
+
+    #[test]
+    fn production_default_requires_an_independent_witness_quorum() {
+        let result = DiscoveryConfig::resolve(&[], &[], None);
+        if BAKED_WITNESSES.len() < DEFAULT_THRESHOLD {
+            assert!(
+                result.is_err(),
+                "an incomplete trust bundle must fail closed"
+            );
         }
     }
 
