@@ -53,10 +53,17 @@ fn seal_key(return_secret: &[u8; 32]) -> [u8; 32] {
     blake3::derive_key("neo-committee-partial-seal-v1", return_secret)
 }
 
-/// XOR `data` with a keystream derived from `key` (one sealed partial, one key).
-fn xor_mask(data: &mut [u8], key: &[u8; 32]) {
+/// XOR `data` with a keystream derived from `key` **and the chunk index**. The index
+/// is essential: a member's return secret (hence `key`) is fixed for the whole circuit,
+/// so without a per-chunk nonce every chunk's partial would be masked with the *same*
+/// keystream — a two-time pad that lets a forwarding relay recover the XOR of any two of
+/// that member's partials. Mixing `chunk_index` into the XOF gives each chunk an
+/// independent keystream.
+fn xor_mask(data: &mut [u8], key: &[u8; 32], chunk_index: u32) {
     let mut ks = vec![0u8; data.len()];
-    blake3::Hasher::new_keyed(key).finalize_xof().fill(&mut ks);
+    let mut h = blake3::Hasher::new_keyed(key);
+    h.update(&chunk_index.to_le_bytes());
+    h.finalize_xof().fill(&mut ks);
     for (b, k) in data.iter_mut().zip(&ks) {
         *b ^= k;
     }
@@ -65,9 +72,15 @@ fn xor_mask(data: &mut [u8], key: &[u8; 32]) {
     ks.zeroize();
 }
 
-fn seal_mac(key: &[u8; 32], body: &[u8]) -> [u8; SEAL_MAC_LEN] {
+fn seal_mac(key: &[u8; 32], body: &[u8], chunk_index: u32) -> [u8; SEAL_MAC_LEN] {
     let mac_key = blake3::derive_key("neo-committee-partial-mac-v1", key);
-    let full = blake3::keyed_hash(&mac_key, body);
+    // Bind the chunk index into the tag too, so a relay can't lift a member's sealed
+    // partial from one chunk and replay it at another position (the index the client
+    // opens with wouldn't match).
+    let mut h = blake3::Hasher::new_keyed(&mac_key);
+    h.update(&chunk_index.to_le_bytes());
+    h.update(body);
+    let full = h.finalize();
     let mut out = [0u8; SEAL_MAC_LEN];
     out.copy_from_slice(&full.as_bytes()[..SEAL_MAC_LEN]);
     out
@@ -85,12 +98,13 @@ pub fn seal_partial(
     return_secret: &[u8; 32],
     share: &KeyShare,
     ct: &Ciphertext,
+    chunk_index: u32,
 ) -> Result<Vec<u8>> {
     let partial = threshold::partial_decrypt(share, ct)?;
     let key = seal_key(return_secret);
     let mut body = partial.to_bytes().to_vec();
-    xor_mask(&mut body, &key);
-    let mac = seal_mac(&key, &body);
+    xor_mask(&mut body, &key, chunk_index);
+    let mac = seal_mac(&key, &body, chunk_index);
     body.extend_from_slice(&mac);
     Ok(body)
 }
@@ -98,19 +112,19 @@ pub fn seal_partial(
 /// The client opens one sealed partial with a member's return secret. Fails if
 /// the MAC does not match (wrong key / tampered), so a member can never open a
 /// blob sealed to a different member.
-pub fn open_partial(return_secret: &[u8; 32], sealed: &[u8]) -> Result<Partial> {
+pub fn open_partial(return_secret: &[u8; 32], sealed: &[u8], chunk_index: u32) -> Result<Partial> {
     if sealed.len() != SEALED_PARTIAL_LEN {
         return Err(Error::Decode("sealed partial has the wrong length".into()));
     }
     let key = seal_key(return_secret);
     let (body, mac) = sealed.split_at(PARTIAL_LEN);
-    if !ct_eq(mac, &seal_mac(&key, body)) {
+    if !ct_eq(mac, &seal_mac(&key, body, chunk_index)) {
         return Err(Error::Crypto(
             "sealed partial failed its integrity check".into(),
         ));
     }
     let mut plain = body.to_vec();
-    xor_mask(&mut plain, &key);
+    xor_mask(&mut plain, &key, chunk_index);
     Partial::from_bytes(&plain)
 }
 
@@ -160,9 +174,14 @@ impl CommitteeChunk {
         })
     }
 
-    fn add_partial(&mut self, return_secret: &[u8; 32], share: &KeyShare) -> Result<()> {
+    fn add_partial(
+        &mut self,
+        return_secret: &[u8; 32],
+        share: &KeyShare,
+        chunk_index: u32,
+    ) -> Result<()> {
         self.sealed_partials
-            .push(seal_partial(return_secret, share, &self.ciphertext)?);
+            .push(seal_partial(return_secret, share, &self.ciphertext, chunk_index)?);
         Ok(())
     }
 }
@@ -187,12 +206,12 @@ impl CommitteeResponse {
         share: &KeyShare,
     ) -> Result<Self> {
         let mut chunks = Vec::new();
-        for piece in response.chunks(CHUNK_PLAINTEXT.max(1)) {
+        for (i, piece) in response.chunks(CHUNK_PLAINTEXT.max(1)).enumerate() {
             let mut chunk = CommitteeChunk {
                 ciphertext: threshold::encrypt(commitments, piece)?,
                 sealed_partials: Vec::new(),
             };
-            chunk.add_partial(return_secret, share)?;
+            chunk.add_partial(return_secret, share, i as u32)?;
             chunks.push(chunk);
         }
         if chunks.is_empty() {
@@ -200,7 +219,7 @@ impl CommitteeResponse {
                 ciphertext: threshold::encrypt(commitments, &[])?,
                 sealed_partials: Vec::new(),
             };
-            chunk.add_partial(return_secret, share)?;
+            chunk.add_partial(return_secret, share, 0)?;
             chunks.push(chunk);
         }
         Ok(Self { chunks })
@@ -208,8 +227,8 @@ impl CommitteeResponse {
 
     /// A **forwarding** member adds its sealed partial to every chunk.
     pub fn add_member(&mut self, return_secret: &[u8; 32], share: &KeyShare) -> Result<()> {
-        for chunk in &mut self.chunks {
-            chunk.add_partial(return_secret, share)?;
+        for (i, chunk) in self.chunks.iter_mut().enumerate() {
+            chunk.add_partial(return_secret, share, i as u32)?;
         }
         Ok(())
     }
@@ -255,12 +274,12 @@ pub fn open_response(
     return_secrets: &[[u8; 32]],
 ) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    for chunk in &response.chunks {
+    for (i, chunk) in response.chunks.iter().enumerate() {
         let mut partials = Vec::new();
         let mut seen = HashSet::new();
         for sealed in &chunk.sealed_partials {
             for secret in return_secrets {
-                if let Ok(p) = open_partial(secret, sealed) {
+                if let Ok(p) = open_partial(secret, sealed, i as u32) {
                     if seen.insert(p.member()) {
                         partials.push(p);
                     }
@@ -1026,12 +1045,42 @@ mod tests {
     fn a_sealed_partial_opens_only_with_its_own_secret() {
         let (_c, shares) = committee(3, 3);
         let ct = threshold::encrypt(&_c, b"x").unwrap();
-        let sealed = seal_partial(&secret(7), &shares[0], &ct).unwrap();
+        let sealed = seal_partial(&secret(7), &shares[0], &ct, 0).unwrap();
         assert_eq!(sealed.len(), SEALED_PARTIAL_LEN);
-        assert!(open_partial(&secret(7), &sealed).is_ok());
+        assert!(open_partial(&secret(7), &sealed, 0).is_ok());
         assert!(
-            open_partial(&secret(8), &sealed).is_err(),
+            open_partial(&secret(8), &sealed, 0).is_err(),
             "the wrong return secret must fail the MAC, not yield a forged partial"
+        );
+        // The chunk index the client opens with must match the one it was sealed under:
+        // a partial lifted from chunk 0 must not verify at chunk 1 (binds position, and
+        // is what gives each chunk an independent keystream — no two-time pad).
+        assert!(
+            open_partial(&secret(7), &sealed, 1).is_err(),
+            "a partial sealed for one chunk index must not open at another"
+        );
+    }
+
+    #[test]
+    fn same_member_reuses_no_keystream_across_chunks() {
+        // Two chunks sealed by the SAME member (same return secret). Before the
+        // per-chunk nonce this was a two-time pad: seal(a) XOR seal(b) leaked
+        // partial(a) XOR partial(b). With chunk_index bound into the keystream, the
+        // two masked bodies must not share a keystream — i.e. XORing the two sealed
+        // bodies must NOT equal XORing the two underlying partials.
+        let (c, shares) = committee(3, 3);
+        let ct0 = threshold::encrypt(&c, b"chunk-zero").unwrap();
+        let ct1 = threshold::encrypt(&c, b"chunk-one!").unwrap();
+        let s0 = seal_partial(&secret(7), &shares[0], &ct0, 0).unwrap();
+        let s1 = seal_partial(&secret(7), &shares[0], &ct1, 1).unwrap();
+        let p0 = threshold::partial_decrypt(&shares[0], &ct0).unwrap().to_bytes();
+        let p1 = threshold::partial_decrypt(&shares[0], &ct1).unwrap().to_bytes();
+        let sealed_xor: Vec<u8> =
+            s0[..PARTIAL_LEN].iter().zip(&s1[..PARTIAL_LEN]).map(|(a, b)| a ^ b).collect();
+        let partial_xor: Vec<u8> = p0.iter().zip(p1.iter()).map(|(a, b)| a ^ b).collect();
+        assert_ne!(
+            sealed_xor, partial_xor,
+            "distinct per-chunk keystreams must not cancel to reveal the partials' XOR"
         );
     }
 

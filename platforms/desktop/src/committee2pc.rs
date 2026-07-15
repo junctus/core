@@ -130,8 +130,11 @@ fn member(role: Party, party_addr: String, client_addr: String) -> anyhow::Resul
     // Accept one client.
     println!("  binding client endpoint {client_addr}, waiting for a client…");
     let cl = TcpListener::bind(&client_addr).with_context(|| format!("bind client {client_addr}"))?;
-    let (mut client, cpeer) = cl.accept().context("accept client")?;
-    println!("  client connected from {cpeer}");
+    // Do not print the client's source address: co-locating it with `dest` (below) on one
+    // member's stdout would materialise a client↔destination correlation. The member sees
+    // the socket regardless (direct-connect demo), but it must not be logged next to dest.
+    let (mut client, _cpeer) = cl.accept().context("accept client")?;
+    println!("  client connected");
 
     // The client tells us the destination + this member's request share.
     let dest = String::from_utf8(recv_frame(&mut client)?).context("dest not utf-8")?;

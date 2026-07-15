@@ -28,7 +28,10 @@ use crate::tunnel_stack::fetch_relays;
 /// onion circuits route *through* — disjoint from both members, so no member
 /// learns the client. Mirrors what the desktop `committee2pc-onion` command picks.
 struct Committee {
-    path: Vec<Hop>,
+    /// The lead's own anonymizing path (disjoint from the follower's).
+    lead_path: Vec<Hop>,
+    /// The follower's own anonymizing path (disjoint from the lead's).
+    follower_path: Vec<Hop>,
     lead: Hop,
     follower: Hop,
 }
@@ -54,10 +57,10 @@ fn hop_of(r: &PeerRecord) -> Option<Hop> {
 /// from the rest — all distinct, so the two members are disjoint from the path
 /// that anonymizes the client. Needs ≥3 relays and at least one exit.
 fn pick_committee(relays: &[&PeerRecord]) -> Result<Committee, NeoTunnelError> {
-    if relays.len() < 3 {
+    if relays.len() < 4 {
         return Err(NeoTunnelError::Discovery {
             detail: format!(
-                "committee 2PC needs ≥3 relays (2 members + ≥1 disjoint path hop); found {}",
+                "committee 2PC needs ≥4 relays (2 members + a disjoint path hop for each); found {}",
                 relays.len()
             ),
         });
@@ -81,7 +84,10 @@ fn pick_committee(relays: &[&PeerRecord]) -> Result<Committee, NeoTunnelError> {
         })?;
     let lead_i = idx.remove(lead_pos);
     let follower_i = idx.remove(0);
-    let path_i = idx.remove(0);
+    // A separate path hop for each member, so the two circuits are node-disjoint — no
+    // single relay sees the client using both committee halves.
+    let lead_path_i = idx.remove(0);
+    let follower_path_i = idx.remove(0);
 
     let addr_err = || NeoTunnelError::Discovery {
         detail: "a chosen relay has no dialable address".to_string(),
@@ -89,7 +95,8 @@ fn pick_committee(relays: &[&PeerRecord]) -> Result<Committee, NeoTunnelError> {
     Ok(Committee {
         lead: hop_of(relays[lead_i]).ok_or_else(addr_err)?,
         follower: hop_of(relays[follower_i]).ok_or_else(addr_err)?,
-        path: vec![hop_of(relays[path_i]).ok_or_else(addr_err)?],
+        lead_path: vec![hop_of(relays[lead_path_i]).ok_or_else(addr_err)?],
+        follower_path: vec![hop_of(relays[follower_path_i]).ok_or_else(addr_err)?],
     })
 }
 
@@ -177,7 +184,8 @@ pub fn committee_fetch(
         let committee = pick_committee(&live)?;
         neo_node::committee_2pc::committee_2pc_fetch(
             &identity,
-            &committee.path,
+            &committee.lead_path,
+            &committee.follower_path,
             &committee.lead,
             &committee.follower,
             &dest,
@@ -222,29 +230,39 @@ mod tests {
     }
 
     #[test]
-    fn pick_committee_needs_three_relays_and_an_exit() {
-        // Too few relays → rejected.
-        let two = [relay(9001, true), relay(9002, false)];
-        let two_refs: Vec<&PeerRecord> = two.iter().collect();
-        assert!(pick_committee(&two_refs).is_err());
+    fn pick_committee_needs_four_relays_and_an_exit() {
+        // Too few relays → rejected (need ≥4: 2 members + a disjoint path hop each).
+        let three = [relay(9001, true), relay(9002, false), relay(9003, false)];
+        let three_refs: Vec<&PeerRecord> = three.iter().collect();
+        assert!(pick_committee(&three_refs).is_err());
 
-        // Three relays but no exit → rejected.
-        let no_exit = [relay(9003, false), relay(9004, false), relay(9005, false)];
+        // Four relays but no exit → rejected.
+        let no_exit = [
+            relay(9003, false),
+            relay(9004, false),
+            relay(9005, false),
+            relay(9006, false),
+        ];
         let no_exit_refs: Vec<&PeerRecord> = no_exit.iter().collect();
         assert!(pick_committee(&no_exit_refs).is_err());
 
-        // Three relays with an exit → a committee whose members are distinct from
-        // each other and from the path, with an exit-capable lead.
-        let ok = [relay(9006, true), relay(9007, false), relay(9008, false)];
+        // Four relays with an exit → a committee whose two members each have their own
+        // path hop, all four relays distinct (the two circuits are node-disjoint), with
+        // an exit-capable lead.
+        let ok = [
+            relay(9006, true),
+            relay(9007, false),
+            relay(9008, false),
+            relay(9009, false),
+        ];
         let ok_refs: Vec<&PeerRecord> = ok.iter().collect();
         let c = pick_committee(&ok_refs).expect("valid committee");
-        assert_eq!(c.path.len(), 1);
-        assert_ne!(c.lead.id, c.follower.id);
-        assert_ne!(c.lead.id, c.path[0].id);
-        assert_ne!(c.follower.id, c.path[0].id);
-        let lead_is_exit = ok
-            .iter()
-            .any(|r| r.id == c.lead.id && r.exit);
+        assert_eq!(c.lead_path.len(), 1);
+        assert_eq!(c.follower_path.len(), 1);
+        let ids = [c.lead.id, c.follower.id, c.lead_path[0].id, c.follower_path[0].id];
+        let distinct: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(distinct.len(), 4, "lead, follower, and both path hops must be distinct");
+        let lead_is_exit = ok.iter().any(|r| r.id == c.lead.id && r.exit);
         assert!(lead_is_exit, "the lead must be an exit-capable relay");
     }
 }

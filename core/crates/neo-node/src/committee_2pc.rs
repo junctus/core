@@ -14,14 +14,30 @@
 //! thread. This module is the per-member primitive; the Sphinx transport that carries the
 //! request-shares in and the response-shares out (the `FRAME_COMMITTEE_2PC` handler + client
 //! selection) wraps it.
+//!
+//! ## Security scope (honest boundary)
+//!
+//! This deployed path drives the **networked semi-honest** 2PC engine
+//! (`committee_handshake_net` → `garble_net`/`netengine` + the unauthenticated ECtF MtA). The
+//! **confidentiality** split it provides is real — neither member assembles the TLS session key
+//! or the plaintext (the request is XOR-shared and only public handshake values are opened), and
+//! the destination certificate is chain-verified by *both* members. But it does **not yet**
+//! provide **malicious-2PC security**: a member that actively deviates from the protocol is not
+//! guaranteed to be caught on this path. The malicious-secure engine (`EngineKind::Malicious`
+//! authenticated garbling) and the networked authenticated preprocessing ([`neo_mpc::mpc_tls::netprep`],
+//! [`neo_mpc::mpc_tls::kos`], [`neo_mpc::mpc_tls::spdz`]) are built and tested, but routing this
+//! live handshake through them is remaining work — so "malicious-secure" describes the *toolkit*,
+//! not (yet) this deployed path. Treat committee-2PC today as a semi-honest split-trust exit.
 
 use std::collections::HashMap;
-use std::net::TcpStream as StdTcpStream;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use neo_core::{Error, NodeId, NodeIdentity, Result};
 use neo_crypto::Session;
+
+use crate::circuit::ExitPolicy;
 use p256::elliptic_curve::rand_core::OsRng;
 use p256::{NonZeroScalar, Scalar};
 use tokio::net::TcpStream;
@@ -40,6 +56,64 @@ use neo_mpc::mpc_tls::netengine::Party;
 /// The host portion of a `host:port` destination (TLS SNI).
 fn host_of(dest: &str) -> &str {
     dest.rsplit_once(':').map(|(h, _)| h).unwrap_or(dest)
+}
+
+/// How long the lead waits for the destination TCP connect before giving up, so a
+/// blackholed `dest` can't pin the `spawn_blocking` thread (mirrors `exit_splice`).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Cap on concurrent pending committee-lead rendezvous slots, so a burst of lead
+/// circuits can't grow the rendezvous map without bound (each slot is also pinned by
+/// the accept-loop handshake semaphore, but this bounds the map directly).
+const MAX_PENDING_RENDEZVOUS: usize = 512;
+
+/// Resolve a committee destination `host:port` to one **safe, public** address the lead
+/// may egress to. This is the SSRF / open-proxy guard for the committee-2PC exit path:
+/// it enforces the reduced-harm port denylist and rejects any resolved address in an
+/// internal range (loopback unless `allow_loopback`, RFC1918, link-local / cloud
+/// metadata `169.254.169.254`, ULA, CGNAT, …) — the same protection `exit_splice` and
+/// every other egress path already apply, which this newer path was missing. Returning
+/// the concrete vetted address (which the caller then dials verbatim) closes the
+/// DNS-rebinding TOCTOU: the socket connects to the exact IP that was vetted, not a
+/// re-resolution that could return an internal address.
+async fn resolve_safe_dest(dest: &str, policy: &ExitPolicy) -> Result<SocketAddr> {
+    let port = dest
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+        .ok_or_else(|| Error::Config("committee2pc: destination has no parseable port".into()))?;
+    if !policy.permits_port(port) {
+        return Err(Error::Config(format!(
+            "committee2pc: exit refuses port {port} (reduced-harm policy)"
+        )));
+    }
+    let mut saw_internal = false;
+    for addr in tokio::net::lookup_host(dest)
+        .await
+        .map_err(|_| Error::Config("committee2pc: destination did not resolve".into()))?
+    {
+        // Normalize an IPv4-mapped IPv6 to its embedded V4 so a mapped internal literal
+        // (`::ffff:127.0.0.1`, `::ffff:169.254.169.254`) can't slip past — mirrors
+        // `neo_core::net::is_safe_dial_target`.
+        let ip = match addr.ip() {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+            other => other,
+        };
+        let internal = if ip.is_loopback() {
+            !policy.allow_loopback
+        } else {
+            neo_core::net::is_internal_ip(&ip)
+        };
+        if internal {
+            saw_internal = true;
+            continue;
+        }
+        return Ok(addr);
+    }
+    Err(Error::Config(if saw_internal {
+        "committee2pc: exit refuses non-public destination".into()
+    } else {
+        "committee2pc: destination did not resolve to a usable address".into()
+    }))
 }
 
 /// The shared server-certificate verifier a committee member authenticates the destination
@@ -94,8 +168,8 @@ pub struct Committee2pcPayload {
 }
 
 impl Committee2pcPayload {
-    /// `MAGIC ‖ lead(1) ‖ token(16) ‖ lead_addr_len(u16) ‖ lead_addr ‖ dest_len(u16) ‖ dest ‖
-    /// request_share`.
+    /// `MAGIC ‖ lead(1) ‖ token(16) ‖ lead_id(32) ‖ lead_addr_len(u16) ‖ lead_addr ‖
+    /// dest_len(u16) ‖ dest ‖ request_share`.
     pub fn encode(&self) -> Vec<u8> {
         let mut out =
             Vec::with_capacity(22 + self.lead_addr.len() + self.dest.len() + self.request_share.len());
@@ -153,16 +227,21 @@ fn member_2pc_blocking(
     role: Party,
     party_link: &mut dyn Channel,
     dest: &str,
+    dial_addr: Option<SocketAddr>,
     request_share: &[u8],
 ) -> Result<Vec<u8>> {
     // Wrap the (encrypted-session-bridged) member link so the whole session shares one KOS
     // base-OT setup.
     let mut party = AmortizingChannel::new(party_link);
 
-    // The lead dials the destination; the follower has no server socket.
+    // The lead dials the destination; the follower has no server socket. The address was
+    // SSRF-vetted by `resolve_safe_dest` in `run_member_flow`; dialing it verbatim (with an
+    // interface scope + connect timeout) keeps the vetted-IP → dialed-IP identity, so no
+    // DNS re-resolution can redirect the connect to an internal target.
     let mut server = if role == Party::A {
-        let sock = StdTcpStream::connect(dest)
-            .map_err(|e| Error::Config(format!("committee2pc: dial destination {dest}: {e}")))?;
+        let addr = dial_addr
+            .ok_or_else(|| Error::Config("committee2pc: lead has no vetted destination".into()))?;
+        let sock = crate::netif::connect_scoped_blocking(addr, CONNECT_TIMEOUT)?;
         Some(TcpChannel::from_stream(sock))
     } else {
         None
@@ -238,6 +317,7 @@ pub async fn run_member(
     stream: TcpStream,
     session: Session,
     dest: String,
+    dial_addr: Option<SocketAddr>,
     request_share: Vec<u8>,
 ) -> Result<Vec<u8>> {
     let (mut rd, mut wr) = stream.into_split();
@@ -284,7 +364,7 @@ pub async fn run_member(
 
     let out = tokio::task::spawn_blocking(move || {
         let mut ch = SessionChannel { to_pump: to_pump_tx, from_pump: from_pump_rx, rx: Vec::new() };
-        member_2pc_blocking(role, &mut ch, &dest, &request_share)
+        member_2pc_blocking(role, &mut ch, &dest, dial_addr, &request_share)
     })
     .await
     .map_err(|e| Error::Config(format!("committee2pc: blocking task join: {e}")))?;
@@ -318,10 +398,28 @@ const LINK_TIMEOUT: Duration = Duration::from_secs(20);
 pub async fn run_member_flow(
     payload: Committee2pcPayload,
     identity: &NodeIdentity,
+    policy: ExitPolicy,
 ) -> Result<Vec<u8>> {
+    // SSRF / open-proxy + reduced-harm-port guard for the lead's egress. Vet the
+    // client-supplied destination up front — before occupying a rendezvous slot or
+    // touching the network — and carry the concrete vetted address to the blocking
+    // dial so it connects to exactly that IP (no re-resolution → no DNS-rebind TOCTOU).
+    let dial_addr = if payload.lead {
+        Some(resolve_safe_dest(&payload.dest, &policy).await?)
+    } else {
+        None
+    };
     let (role, stream, session) = if payload.lead {
         let (tx, rx) = oneshot::channel();
-        rendezvous().lock().expect("rendezvous poisoned").insert(payload.token, tx);
+        {
+            let mut map = rendezvous().lock().expect("rendezvous poisoned");
+            if map.len() >= MAX_PENDING_RENDEZVOUS {
+                return Err(Error::Config(
+                    "committee2pc: too many pending committee links".into(),
+                ));
+            }
+            map.insert(payload.token, tx);
+        }
         match tokio::time::timeout(LINK_TIMEOUT, rx).await {
             Ok(Ok((stream, session))) => (Party::A, stream, session),
             _ => {
@@ -338,7 +436,7 @@ pub async fn run_member_flow(
         write_frame(&mut stream, &result.session.seal(&payload.token)?).await?;
         (Party::B, stream, result.session)
     };
-    run_member(role, stream, session, payload.dest, payload.request_share).await
+    run_member(role, stream, session, payload.dest, dial_addr, payload.request_share).await
 }
 
 /// The relay's `LINK_FRAME` dispatch: a follower has opened an authenticated link for the 2PC.
@@ -370,30 +468,52 @@ pub async fn handle_link(mut stream: TcpStream, mut session: Session) -> Result<
 // ── Client ──
 
 /// Client: fetch `dest` through a **self-formed 2-member committee** (`lead` + `follower`,
-/// picked from the attested pool), anonymized via `path` (relays disjoint from the members —
-/// so no member ever sees the client). The request is XOR-shared across the two members (so
-/// neither sees it); one onion circuit is built to each member as its endpoint carrying that
-/// member's share; the response is reconstructed by XORing the two members' returned shares
-/// (with TLS inner padding + content-type stripped). No member ever holds the session key or
-/// plaintext.
+/// picked from the attested pool). Each member is reached by its **own** onion circuit —
+/// `lead_path`→`lead` and `follower_path`→`follower` — and the two circuits must be
+/// **node-disjoint**: no relay may sit on both, or that single relay would see the client
+/// using *both* committee halves and could correlate them (the exact linkage the split-trust
+/// model exists to deny). The request is XOR-shared across the two members (so neither sees
+/// it); each circuit carries that member's share to it as the endpoint; the response is
+/// reconstructed by XORing the two members' returned shares (with TLS inner padding +
+/// content-type stripped). No member ever holds the session key or plaintext.
 pub async fn committee_2pc_fetch(
     identity: &NodeIdentity,
-    path: &[Hop],
+    lead_path: &[Hop],
+    follower_path: &[Hop],
     lead: &Hop,
     follower: &Hop,
     dest: &str,
     request: &[u8],
 ) -> Result<Vec<u8>> {
+    // Enforce node-disjointness across the two members' circuits (defense in depth — a
+    // caller that reused a path hop, or picked the same node twice, would silently hand one
+    // relay a client-correlation vantage across the committee). Includes the members
+    // themselves, so `lead == follower` or a member appearing in the other's path is caught.
+    let mut lead_ids = std::collections::HashSet::new();
+    for h in lead_path.iter().chain(std::iter::once(lead)) {
+        lead_ids.insert(h.id);
+    }
+    for h in follower_path.iter().chain(std::iter::once(follower)) {
+        if lead_ids.contains(&h.id) {
+            return Err(Error::Config(
+                "committee2pc: the two members' circuits must be node-disjoint (a relay on both \
+                 could correlate the client across both committee halves)"
+                    .into(),
+            ));
+        }
+    }
+
     let mut token = [0u8; 16];
     getrandom::getrandom(&mut token).map_err(|e| Error::Rng(e.to_string()))?;
     let mut share_a = vec![0u8; request.len()];
     getrandom::getrandom(&mut share_a).map_err(|e| Error::Rng(e.to_string()))?;
     let share_b: Vec<u8> = request.iter().zip(&share_a).map(|(r, a)| r ^ a).collect();
 
-    // One circuit per member; the member is the endpoint, path hops are the disjoint prefix.
-    let lead_circuit: Vec<Hop> = path.iter().cloned().chain(std::iter::once(lead.clone())).collect();
+    // One circuit per member over its own disjoint path; the member is the endpoint.
+    let lead_circuit: Vec<Hop> =
+        lead_path.iter().cloned().chain(std::iter::once(lead.clone())).collect();
     let follower_circuit: Vec<Hop> =
-        path.iter().cloned().chain(std::iter::once(follower.clone())).collect();
+        follower_path.iter().cloned().chain(std::iter::once(follower.clone())).collect();
 
     let lead_payload = Committee2pcPayload {
         lead: true,
@@ -500,5 +620,88 @@ mod tests {
         assert!(Committee2pcPayload::decode(b"mux").unwrap().is_none());
         // Truncated committee2pc payloads error, not panic.
         assert!(Committee2pcPayload::decode(&enc[..10]).is_err());
+    }
+
+    #[tokio::test]
+    async fn committee_fetch_refuses_non_disjoint_member_circuits() {
+        // The two members' onion circuits must be node-disjoint, or a single relay on both
+        // could correlate the client across the committee. The guard runs before any network
+        // I/O, so a non-disjoint selection is rejected up front.
+        let id = NodeIdentity::generate().unwrap();
+        let hop = |n: u8| Hop {
+            id: NodeId::from_bytes([n; 32]),
+            sphinx: [0u8; 32],
+            addr: "127.0.0.1:0".into(),
+        };
+        let (lead, follower) = (hop(1), hop(2));
+
+        // A relay shared between the lead's and follower's paths → refused.
+        let shared = hop(9);
+        assert!(
+            committee_2pc_fetch(
+                &id,
+                std::slice::from_ref(&shared),
+                std::slice::from_ref(&shared),
+                &lead,
+                &follower,
+                "example.com:443",
+                b"x",
+            )
+            .await
+            .is_err(),
+            "a relay on both members' paths must be refused"
+        );
+
+        // A member appearing in the other member's path → refused.
+        assert!(
+            committee_2pc_fetch(&id, &[hop(3)], std::slice::from_ref(&lead), &lead, &follower, "example.com:443", b"x")
+                .await
+                .is_err(),
+            "a member appearing in the other's path must be refused"
+        );
+
+        // lead == follower → refused (the member's id is in both circuits).
+        assert!(
+            committee_2pc_fetch(&id, &[hop(3)], &[hop(4)], &lead, &lead, "example.com:443", b"x")
+                .await
+                .is_err(),
+            "lead == follower must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn committee_egress_refuses_ssrf_and_abuse_ports() {
+        // The lead's SSRF / open-proxy guard: internal destinations are refused so a
+        // client can't turn the exit relay into a proxy into loopback / RFC1918 / the
+        // cloud-metadata service (IP literals resolve locally, so this is network-free).
+        let prod = ExitPolicy { allow_loopback: false, offer_exit: true };
+        for t in [
+            "127.0.0.1:443",               // loopback
+            "10.0.0.5:443",                // RFC1918
+            "192.168.1.1:80",              // RFC1918
+            "169.254.169.254:80",          // cloud metadata (link-local)
+            "[::1]:443",                   // v6 loopback
+            "[::ffff:127.0.0.1]:443",      // mapped loopback must not slip past
+            "[::ffff:169.254.169.254]:80", // mapped metadata
+        ] {
+            assert!(
+                resolve_safe_dest(t, &prod).await.is_err(),
+                "{t} must be refused as a committee egress target"
+            );
+        }
+        // The reduced-harm port policy applies even to a public IP.
+        assert!(resolve_safe_dest("1.1.1.1:25", &prod).await.is_err(), "SMTP refused");
+        assert!(resolve_safe_dest("1.1.1.1:22", &prod).await.is_err(), "SSH refused");
+        // A missing/garbage port errors rather than panics.
+        assert!(resolve_safe_dest("1.1.1.1", &prod).await.is_err());
+        // A public target on an allowed port resolves to a concrete address to dial.
+        assert!(resolve_safe_dest("1.1.1.1:443", &prod).await.is_ok());
+        // Loopback is permitted only when explicitly opted in (local dev/test).
+        let dev = ExitPolicy { allow_loopback: true, offer_exit: true };
+        assert!(resolve_safe_dest("127.0.0.1:443", &dev).await.is_ok());
+        assert!(
+            resolve_safe_dest("10.0.0.5:443", &dev).await.is_err(),
+            "allow_loopback must not open RFC1918"
+        );
     }
 }

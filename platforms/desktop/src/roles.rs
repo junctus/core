@@ -347,14 +347,16 @@ pub async fn run_committee_2pc(
     println!("this node : {} (committee-2pc client)", identity.id());
     let snapshot = discovery::obtain_snapshot(&cfg).await?;
     let relays = snapshot.relays(now_unix());
-    if relays.len() < 3 {
+    if relays.len() < 4 {
         bail!(
-            "committee-2pc needs ≥3 relays (2 committee members + ≥1 disjoint path hop); found {}",
+            "committee-2pc needs ≥4 relays (2 committee members + a disjoint path hop for each); found {}",
             relays.len()
         );
     }
-    // Shuffle, then pick: lead = an exit-capable relay (it egresses); follower + one path hop
-    // from the rest, all distinct (members disjoint from the path).
+    // Shuffle, then pick: lead = an exit-capable relay (it egresses); a follower; and a
+    // SEPARATE path hop for each member — all distinct, so the lead's and follower's onion
+    // circuits are node-disjoint (no single relay sees the client using both committee
+    // halves, which would let it correlate them).
     let mut idx: Vec<usize> = (0..relays.len()).collect();
     for i in (1..idx.len()).rev() {
         let mut b = [0u8; 8];
@@ -367,7 +369,8 @@ pub async fn run_committee_2pc(
         .context("no exit-capable relay to lead the committee")?;
     let lead_i = idx.remove(lead_pos);
     let follower_i = idx.remove(0);
-    let path_i = idx.remove(0);
+    let lead_path_i = idx.remove(0);
+    let follower_path_i = idx.remove(0);
     let hop_of = |r: &PeerRecord| -> Result<Hop> {
         Ok(Hop {
             id: r.id,
@@ -377,15 +380,23 @@ pub async fn run_committee_2pc(
     };
     let lead = hop_of(relays[lead_i])?;
     let follower = hop_of(relays[follower_i])?;
-    let path = vec![hop_of(relays[path_i])?];
+    let lead_path = vec![hop_of(relays[lead_path_i])?];
+    let follower_path = vec![hop_of(relays[follower_path_i])?];
     println!(
-        "committee: lead {} @ {} + follower {} @ {}; anonymized via path hop {} @ {}",
-        lead.id, lead.addr, follower.id, follower.addr, path[0].id, path[0].addr
+        "committee: lead {} @ {} (via {}) + follower {} @ {} (via {}) — node-disjoint paths",
+        lead.id, lead.addr, lead_path[0].id, follower.id, follower.addr, follower_path[0].id
     );
 
-    let response =
-        neo_node::committee_2pc::committee_2pc_fetch(&identity, &path, &lead, &follower, &dest, request.as_bytes())
-            .await?;
+    let response = neo_node::committee_2pc::committee_2pc_fetch(
+        &identity,
+        &lead_path,
+        &follower_path,
+        &lead,
+        &follower,
+        &dest,
+        request.as_bytes(),
+    )
+    .await?;
     let text = String::from_utf8_lossy(&response);
     let status = text.lines().next().unwrap_or("(no status line)");
     println!("✓ committee 2PC-TLS fetch of {dest} — server responded: {status}");

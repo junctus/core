@@ -397,7 +397,7 @@ pub async fn serve_circuit<R: NextHop>(
                         "committee2pc: lead node does not offer clearnet exit".into(),
                     ));
                 }
-                let share = crate::committee_2pc::run_member_flow(cp, identity).await?;
+                let share = crate::committee_2pc::run_member_flow(cp, identity, policy).await?;
                 let mut sink = ExitFrameSink::new(pw, pw_sealer, secret);
                 return sink.send_payload(&share).await;
             }

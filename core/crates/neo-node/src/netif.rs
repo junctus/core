@@ -45,13 +45,20 @@ pub fn bound_interface() -> Option<NonZeroU32> {
 /// (`IP_BOUND_IF`/`IPV6_BOUND_IF`); Linux binds by interface **name**
 /// (`SO_BINDTODEVICE`), so the index is resolved to a name first.
 fn scope_to_interface(sock: &TcpSocket, target: &SocketAddr) -> Result<()> {
+    apply_interface_scope(SockRef::from(sock), target)
+}
+
+/// Apply the process-wide interface scope to any [`SockRef`] (a tokio `TcpSocket` or
+/// a blocking `socket2::Socket`), unless the target is loopback. Shared by the async
+/// [`connect_scoped`]/[`listen_scoped`] paths and the blocking
+/// [`connect_scoped_blocking`] egress path.
+fn apply_interface_scope(sref: SockRef<'_>, target: &SocketAddr) -> Result<()> {
     if target.ip().is_loopback() {
         return Ok(());
     }
     let Some(index) = bound_interface() else {
         return Ok(());
     };
-    let sref = SockRef::from(sock);
 
     #[cfg(target_vendor = "apple")]
     match target {
@@ -117,6 +124,31 @@ async fn dial_one(target: SocketAddr) -> Result<TcpStream> {
     };
     scope_to_interface(&sock, &target)?;
     Ok(sock.connect(target).await?)
+}
+
+/// Blocking, interface-scoped dial with a connect timeout, for the **synchronous**
+/// committee-2PC egress path (which drives `std::net` sockets under `spawn_blocking`,
+/// where the async [`connect_scoped`] can't be used). `target` must already be a
+/// concrete, SSRF-vetted address — dialing the exact vetted IP (rather than
+/// re-resolving a hostname here) is what closes the DNS-rebinding TOCTOU. Honors
+/// [`set_bound_interface`] (loopback stays unscoped) exactly like [`connect_scoped`],
+/// and bounds the connect with `timeout` so a blackholed destination can't pin the
+/// blocking thread.
+pub fn connect_scoped_blocking(
+    target: SocketAddr,
+    timeout: std::time::Duration,
+) -> Result<std::net::TcpStream> {
+    use socket2::{Domain, Socket, Type};
+    let domain = match target {
+        SocketAddr::V4(_) => Domain::IPV4,
+        SocketAddr::V6(_) => Domain::IPV6,
+    };
+    let sock = Socket::new(domain, Type::STREAM, None)
+        .map_err(|e| Error::Config(format!("scoped dial: socket: {e}")))?;
+    apply_interface_scope(SockRef::from(&sock), &target)?;
+    sock.connect_timeout(&target.into(), timeout)
+        .map_err(|e| Error::Config(format!("scoped dial: connect {target}: {e}")))?;
+    Ok(sock.into())
 }
 
 /// Bind a listener on `addr`, scoping it to the configured interface. A drop-in

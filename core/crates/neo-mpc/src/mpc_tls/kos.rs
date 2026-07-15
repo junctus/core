@@ -46,9 +46,11 @@
 //!   extension and found flaws in prior consistency-check proofs; the practical responses in
 //!   the field are (a) run KOS with **conservative concrete parameters**, or (b) switch to
 //!   the VOLE-based SoftSpokenOT protocol entirely. This module already takes route (a): the
-//!   check runs over the full **GF(2^128)** field with `K + SIGMA = 192` random blinding
-//!   rows — *more* than the reference implementation [libOTe](https://github.com/osu-crypto/libOTe)
-//!   uses for its KOS check (`numExtra = 128`) — and the `χ` challenge is Fiat–Shamir-bound
+//!   check runs over the full **GF(2^128)** field with `SIGMA = κ = 128` extra random
+//!   blinding rows (`K + SIGMA = 256` total) — so the statistical soundness/leakage margin
+//!   is `2⁻¹²⁸`, at or above the reference implementation
+//!   [libOTe](https://github.com/osu-crypto/libOTe)'s KOS `numExtra = 128` statistical
+//!   parameter — and the `χ` challenge is Fiat–Shamir-bound
 //!   to the committed `u` columns (and, in the amortized path, the batch index). So there is
 //!   **no missing one-line "Roy22 patch"**: the residual is proof/bound-level, not an
 //!   implementation deficiency, and the concrete parameters here meet or exceed the reference.
@@ -66,8 +68,11 @@ use super::ot;
 /// Base-OT / security parameter (field width `κ = 128`).
 pub const K: usize = 128;
 
-/// Statistical parameter: extra random rows that blind the check's `(x, t)`.
-const SIGMA: usize = 64;
+/// Statistical parameter: extra random rows that blind the check's `(x, t)`. Set to
+/// `κ = 128` so the check's statistical soundness / leakage margin is `2⁻¹²⁸`, matching
+/// the stack's 128-bit target (a smaller σ would cap the malicious-OT statistical
+/// guarantee below the computational security level everything else is built to).
+const SIGMA: usize = 128;
 
 /// `GF(2^128)` reduction: `x^128 ≡ x^7 + x^2 + x + 1` (the AES-GCM polynomial,
 /// irreducible), low byte `0x87`.

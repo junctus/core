@@ -791,6 +791,12 @@ fn relay_recv(party: &mut dyn Channel) -> Result<Vec<u8>> {
     if len > MAX_FLIGHT_BYTES {
         return Err(Error::Crypto("committee: oversized relay".into()));
     }
+    // A relayed message always carries at least a 1-byte handshake-type tag; every caller
+    // indexes `m[0]`. Reject a zero-length frame here so a dishonest lead can't crash the
+    // follower's 2PC thread by relaying a `len == 0` frame (the message is attacker-chosen).
+    if len == 0 {
+        return Err(Error::Crypto("committee: empty relay frame".into()));
+    }
     party.recv_exact(len)
 }
 

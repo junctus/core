@@ -477,16 +477,26 @@ async fn post_register(
     if !state.check_and_stamp_cooldown(ip) {
         return (StatusCode::TOO_MANY_REQUESTS, "slow down\n".to_string());
     }
-    // Per-key cooldown: bounds one identity's registration rate across IPs.
-    if !state.check_and_stamp_key_cooldown(record.id) {
+    // Per-key cooldown: bounds one identity's *accepted* registration rate across
+    // IPs. We only check here (without stamping); the stamp is applied after
+    // `admit` accepts the record as new-or-newer. That way replaying a victim's
+    // public record (with a freshly-ground PoW) is an idempotent no-op — it is
+    // rejected as `already current` and never burns the victim's refresh quota.
+    let key_id = record.id;
+    if !state.check_key_cooldown(&key_id) {
         return (StatusCode::TOO_MANY_REQUESTS, "slow down\n".to_string());
     }
 
     match state.registry.lock().expect("registry").admit(record) {
-        Ok(true) => (
-            StatusCode::ACCEPTED,
-            "registered — pending dial-back health check\n".to_string(),
-        ),
+        Ok(true) => {
+            // A genuinely new-or-newer record: stamp the per-key cooldown so the
+            // next accepted refresh for this identity is rate-limited.
+            state.stamp_key_cooldown(key_id);
+            (
+                StatusCode::ACCEPTED,
+                "registered — pending dial-back health check\n".to_string(),
+            )
+        }
         Ok(false) => (StatusCode::OK, "already current\n".to_string()),
         Err(e) => (StatusCode::BAD_REQUEST, format!("rejected: {e}\n")),
     }
@@ -509,19 +519,29 @@ impl AppState {
         true
     }
 
-    /// Enforce the per-key cooldown; records the timestamp when it passes.
-    fn check_and_stamp_key_cooldown(&self, id: NodeId) -> bool {
-        let mut guard = self.key_cooldowns.lock().expect("key cooldowns");
+    /// Check the per-key cooldown **without** stamping it. Returns `false` if this
+    /// identity registered an accepted record too recently. The stamp is applied
+    /// separately, via [`stamp_key_cooldown`](Self::stamp_key_cooldown), only once
+    /// a record is actually admitted — so a replay that is rejected as
+    /// `already current` never advances (or burns) the victim's cooldown.
+    fn check_key_cooldown(&self, id: &NodeId) -> bool {
+        let guard = self.key_cooldowns.lock().expect("key cooldowns");
         let now = Instant::now();
-        if let Some(last) = guard.get(&id) {
+        if let Some(last) = guard.get(id) {
             if now.duration_since(*last) < self.cooldown {
                 return false;
             }
         }
+        true
+    }
+
+    /// Stamp the per-key cooldown for an identity whose record was just accepted.
+    fn stamp_key_cooldown(&self, id: NodeId) {
+        let mut guard = self.key_cooldowns.lock().expect("key cooldowns");
+        let now = Instant::now();
         guard.insert(id, now);
         let cooldown = self.cooldown;
         guard.retain(|_, last| now.duration_since(*last) < cooldown * 4);
-        true
     }
 }
 
@@ -876,6 +896,28 @@ mod tests {
         assert!(!state.check_and_stamp_cooldown(ip));
         // A different IP is unaffected.
         assert!(state.check_and_stamp_cooldown("203.0.113.8".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn per_key_cooldown_only_burns_on_acceptance() {
+        let state = test_state();
+        let id = NodeIdentity::generate().unwrap();
+        let key = id.id();
+
+        // Checking the cooldown must not, on its own, advance it: a request that
+        // is not admitted (e.g. a replay rejected as `already current`) can be
+        // checked any number of times without burning the identity's quota.
+        assert!(state.check_key_cooldown(&key));
+        assert!(state.check_key_cooldown(&key));
+
+        // Only an accepted registration stamps the cooldown, which then blocks a
+        // rapid follow-up refresh for the same identity.
+        state.stamp_key_cooldown(key);
+        assert!(!state.check_key_cooldown(&key));
+
+        // A different identity is unaffected.
+        let other = NodeIdentity::generate().unwrap();
+        assert!(state.check_key_cooldown(&other.id()));
     }
 
     #[tokio::test]
