@@ -12,6 +12,7 @@
 
 pub mod circuit;
 pub mod committee;
+pub mod committee_2pc;
 pub mod forward;
 pub mod mux;
 pub mod netif;

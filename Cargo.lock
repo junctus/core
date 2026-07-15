@@ -2774,6 +2774,7 @@ dependencies = [
  "neo-routing",
  "neo-slicing",
  "neo-verify",
+ "p256",
  "smoltcp",
  "socket2 0.5.10",
  "tokio",

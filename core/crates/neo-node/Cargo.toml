@@ -23,6 +23,8 @@ neo-mpc.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 blake3.workspace = true
+# The committee member's ephemeral ECDHE scalar share for 2PC-TLS (committee_2pc).
+p256.workspace = true
 socket2.workspace = true
 getrandom.workspace = true
 zeroize.workspace = true
