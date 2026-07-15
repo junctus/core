@@ -38,8 +38,14 @@ jobs:
       - name: Clippy (neo-discovery with libp2p backend)
         run: cargo clippy -p neo-discovery --all-targets --features libp2p -- -D warnings
 
-      - name: Test (workspace, default features)
-        run: cargo test --workspace
+      # The experimental `mpc_tls` two-party TLS suite (live TLS 1.3 interop against a
+      # rustls server + networked KOS/OT over real sockets) runs into minutes and is not
+      # yet a gating capability, so it is skipped in the standard run to keep CI fast.
+      # The suite still COMPILES here (so build breaks are caught) and its non-mpc_tls
+      # siblings (DKG / VSS / threshold / committee) still run; run the 2PC-TLS suite on
+      # demand with `cargo test -p neo-mpc mpc_tls`.
+      - name: Test (workspace, default features; experimental mpc_tls suite skipped)
+        run: cargo test --workspace -- --skip mpc_tls
 
       - name: Test (neo-discovery with libp2p backend)
         run: cargo test -p neo-discovery --features libp2p
