@@ -55,7 +55,9 @@ pub use webpki_verifier::WebpkiVerifier;
 #[cfg(feature = "live-tls-webpki")]
 mod webpki_verifier {
     use super::*;
-    use rustls_pki_types::{CertificateDer, ServerName, SignatureVerificationAlgorithm, UnixTime};
+    use rustls_pki_types::{
+        CertificateDer, ServerName, SignatureVerificationAlgorithm, TrustAnchor, UnixTime,
+    };
     use webpki::ring as alg;
     use webpki::{anchor_from_trusted_cert, EndEntityCert, KeyUsage};
 
@@ -70,24 +72,34 @@ mod webpki_verifier {
     ];
 
     /// Full X.509 chain-building verifier (`rustls-webpki`): validates the server chain to
-    /// the configured DER trust anchors, checks the subject name, and verifies the
+    /// the configured trust anchors, checks the subject name, and verifies the
     /// CertificateVerify signature — all via vetted `webpki`, not hand-rolled.
+    ///
+    /// Anchors are stored pre-parsed and owned so a single verifier is cheaply reused across
+    /// every handshake (a relay validates against the same ~150-cert bundle each time).
     pub struct WebpkiVerifier {
-        roots: Vec<Vec<u8>>,
+        anchors: Vec<TrustAnchor<'static>>,
     }
 
     impl WebpkiVerifier {
-        /// Trust the given DER root certificates (the platform store / `webpki-roots`; for a
-        /// self-signed server, the server cert itself). Validates they parse as anchors.
+        /// Trust the given **DER root certificates** — e.g. a self-signed server's own cert,
+        /// or a private CA. Each must parse as a trust anchor.
         pub fn with_roots(root_ders: &[Vec<u8>]) -> Result<Self> {
+            let mut anchors = Vec::with_capacity(root_ders.len());
             for r in root_ders {
                 let der = CertificateDer::from(r.as_slice());
-                anchor_from_trusted_cert(&der)
+                let anchor = anchor_from_trusted_cert(&der)
                     .map_err(|e| Error::Crypto(format!("webpki: bad root cert: {e}")))?;
+                anchors.push(anchor.to_owned());
             }
-            Ok(WebpkiVerifier {
-                roots: root_ders.to_vec(),
-            })
+            Ok(WebpkiVerifier { anchors })
+        }
+
+        /// Trust **pre-parsed anchors** directly — e.g. the Mozilla CA bundle a caller passes
+        /// from `webpki-roots` (`TLS_SERVER_ROOTS.to_vec()`). Which anchors to trust is caller
+        /// policy; this crate only performs the verification against them.
+        pub fn with_trust_anchors(anchors: Vec<TrustAnchor<'static>>) -> Self {
+            WebpkiVerifier { anchors }
         }
     }
 
@@ -119,16 +131,6 @@ mod webpki_verifier {
             let ee = EndEntityCert::try_from(&leaf_der)
                 .map_err(|e| Error::Crypto(format!("certverify: bad leaf cert: {e}")))?;
 
-            let root_ders: Vec<CertificateDer> = self
-                .roots
-                .iter()
-                .map(|r| CertificateDer::from(r.as_slice()))
-                .collect();
-            let anchors: Vec<_> = root_ders
-                .iter()
-                .map(|c| anchor_from_trusted_cert(c))
-                .collect::<std::result::Result<_, _>>()
-                .map_err(|e| Error::Crypto(format!("certverify: bad anchor: {e}")))?;
             let intermediates: Vec<CertificateDer> = chain[1..]
                 .iter()
                 .map(|c| CertificateDer::from(c.as_slice()))
@@ -137,7 +139,7 @@ mod webpki_verifier {
             // 1. Chain-building to the trust anchors + subject-name match.
             ee.verify_for_usage(
                 CHAIN_ALGS,
-                &anchors,
+                &self.anchors,
                 &intermediates,
                 UnixTime::now(),
                 KeyUsage::server_auth(),

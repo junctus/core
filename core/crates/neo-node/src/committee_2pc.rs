@@ -34,12 +34,23 @@ use neo_mpc::mpc_tls::live::channel::{AmortizingChannel, Channel, TcpChannel};
 use neo_mpc::mpc_tls::live::handshake::{
     committee_handshake_net, committee_recv_app, committee_send_app,
 };
-use neo_mpc::mpc_tls::live::verify::LeafKeyVerifier;
+use neo_mpc::mpc_tls::live::verify::WebpkiVerifier;
 use neo_mpc::mpc_tls::netengine::Party;
 
 /// The host portion of a `host:port` destination (TLS SNI).
 fn host_of(dest: &str) -> &str {
     dest.rsplit_once(':').map(|(h, _)| h).unwrap_or(dest)
+}
+
+/// The shared server-certificate verifier a committee member authenticates the destination
+/// with: **full X.509 chain-building** to the baked-in Mozilla trust anchors (`webpki-roots`),
+/// so members can safely reach arbitrary clearnet TLS servers — not just a pinned leaf. Built
+/// once (the ~150-anchor bundle) and reused across every handshake. **Both** members verify
+/// locally (the lead relays the server's raw records to the follower), so a single dishonest
+/// member cannot slip a forged certificate past the other.
+fn server_verifier() -> &'static WebpkiVerifier {
+    static V: OnceLock<WebpkiVerifier> = OnceLock::new();
+    V.get_or_init(|| WebpkiVerifier::with_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.to_vec()))
 }
 
 // ── Wire protocol ──
@@ -164,7 +175,7 @@ fn member_2pc_blocking(
         server.as_mut().map(|c| c as &mut dyn Channel),
         host_of(dest),
         &scalar,
-        &LeafKeyVerifier,
+        server_verifier(),
     )
     .map_err(|e| Error::Crypto(format!("committee2pc handshake: {e}")))?;
 

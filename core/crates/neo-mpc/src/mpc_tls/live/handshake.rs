@@ -1357,6 +1357,28 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "live-tls-webpki")]
+    #[ignore] // ~15s release: full handshake + webpki chain-building via pre-parsed anchors
+    fn live_handshake_with_webpki_trust_anchors() {
+        // As above but through `with_trust_anchors` — the constructor a relay uses to pass the
+        // `webpki-roots` Mozilla bundle: parse the self-signed cert into an owned trust anchor
+        // and trust it directly (rather than as a DER via `with_roots`).
+        use super::super::verify::WebpkiVerifier;
+        use rustls::pki_types::CertificateDer;
+        let (addr, root) = spawn_rustls_echo_server_cert();
+        let der = CertificateDer::from(root.as_slice());
+        let anchor = webpki::anchor_from_trusted_cert(&der).unwrap().to_owned();
+        let verifier = WebpkiVerifier::with_trust_anchors(vec![anchor]);
+        let mut ch = TcpChannel::connect(addr).unwrap();
+        let mut session =
+            client_handshake_verified(&mut ch, "localhost", EngineKind::Semihonest, &verifier)
+                .expect("2PC TLS 1.3 handshake with webpki trust-anchor validation");
+        let payload = b"webpki-anchor ping";
+        send_application(&mut ch, &mut session, payload).unwrap();
+        assert_eq!(recv_application(&mut ch, &mut session).unwrap(), payload);
+    }
+
+    #[test]
     fn committee_handshake_against_rustls_and_echo() {
         // The committee-model end-to-end proof: TWO exit-committee members, each holding only
         // its own ECDHE scalar share, jointly complete a real TLS 1.3 handshake against a
