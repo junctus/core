@@ -94,7 +94,12 @@ pub(crate) fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
 }
 
 /// Plaintext `HKDF-Expand-Label` (length ≤ 32), for the public branch.
-pub(crate) fn hkdf_expand_label(secret: &[u8; 32], label: &[u8], context: &[u8], length: u16) -> Vec<u8> {
+pub(crate) fn hkdf_expand_label(
+    secret: &[u8; 32],
+    label: &[u8],
+    context: &[u8],
+    length: u16,
+) -> Vec<u8> {
     let mut msg = hkdf_label(label, context, length);
     msg.push(0x01); // T(1)
     hmac_sha256(secret, &msg)[..length as usize].to_vec()

@@ -45,10 +45,10 @@ use p256::{ProjectivePoint, PublicKey, Scalar};
 use super::super::engine::EngineKind;
 use super::super::netengine::Party;
 use super::super::session::{open_tls13_record_net, seal_tls13_record_net};
-use super::netschedule::{derive_ecdhe_share_net, KeyScheduleNet};
 use super::super::sha256::sha256;
 use super::channel::{read_tls_record, Channel};
 use super::ecdhe::ClientKeyShare;
+use super::netschedule::{derive_ecdhe_share_net, KeyScheduleNet};
 use super::record::Direction;
 use super::schedule::{hkdf_expand_label, hmac_sha256, KeySchedule};
 use super::verify::ServerCertVerifier;
@@ -834,14 +834,20 @@ fn tls13_nonce(iv: &[u8; 12], seq: u64) -> [u8; 12] {
 
 /// Cleartext `(key, iv)` from a handshake-traffic secret (RFC 8446 §7.3).
 fn cleartext_traffic_keys(secret: &[u8; 32]) -> ([u8; 32], [u8; 12]) {
-    let key: [u8; 32] = hkdf_expand_label(secret, b"key", b"", 32).try_into().expect("32");
-    let iv: [u8; 12] = hkdf_expand_label(secret, b"iv", b"", 12).try_into().expect("12");
+    let key: [u8; 32] = hkdf_expand_label(secret, b"key", b"", 32)
+        .try_into()
+        .expect("32");
+    let iv: [u8; 12] = hkdf_expand_label(secret, b"iv", b"", 12)
+        .try_into()
+        .expect("12");
     (key, iv)
 }
 
 /// Cleartext Finished MAC = `HMAC(HKDF-Expand-Label(secret,"finished","",32), transcript_hash)`.
 fn cleartext_finished(secret: &[u8; 32], transcript_hash: &[u8; 32]) -> [u8; 32] {
-    let fk: [u8; 32] = hkdf_expand_label(secret, b"finished", b"", 32).try_into().expect("32");
+    let fk: [u8; 32] = hkdf_expand_label(secret, b"finished", b"", 32)
+        .try_into()
+        .expect("32");
     hmac_sha256(&fk, transcript_hash)
 }
 
@@ -858,7 +864,13 @@ fn cleartext_open_record(
     let nonce = tls13_nonce(iv, seq);
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
     let mut inner = cipher
-        .decrypt(Nonce::from_slice(&nonce), Payload { msg: record_body, aad: &header })
+        .decrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: record_body,
+                aad: &header,
+            },
+        )
         .map_err(|_| Error::Crypto("tls: server record failed to decrypt/authenticate".into()))?;
     while inner.last() == Some(&0) {
         inner.pop();
@@ -885,7 +897,13 @@ fn cleartext_seal_record(
     let nonce = tls13_nonce(iv, seq);
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
     let sealed = cipher
-        .encrypt(Nonce::from_slice(&nonce), Payload { msg: &inner, aad: &header })
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: &inner,
+                aad: &header,
+            },
+        )
         .map_err(|_| Error::Crypto("tls: client record seal failed".into()))?;
     let mut record = header.to_vec();
     record.extend_from_slice(&sealed);
@@ -1075,7 +1093,11 @@ pub fn committee_handshake_net(
                 tbsf = Some(sha256(&transcript));
                 transcript.extend_from_slice(msg);
             }
-            other => return Err(Error::Crypto(format!("committee: unexpected flight msg {other}"))),
+            other => {
+                return Err(Error::Crypto(format!(
+                    "committee: unexpected flight msg {other}"
+                )))
+            }
         }
     }
 
@@ -1100,7 +1122,7 @@ pub fn committee_handshake_net(
     let cfin_msg = handshake_message(HS_FINISHED, &cfin);
     let (chk, chiv) = cleartext_traffic_keys(&client_hs);
     let fin_record = cleartext_seal_record(&chk, &chiv, 0, REC_HANDSHAKE, &cfin_msg)?;
-    if let Some(s) = server.as_deref_mut() {
+    if let Some(s) = server {
         s.send(&fin_record)?;
     }
 
@@ -1180,7 +1202,9 @@ pub fn committee_recv_app(
                     &record,
                 )?;
                 if !ok {
-                    return Err(Error::Crypto("committee: app record tag verify failed".into()));
+                    return Err(Error::Crypto(
+                        "committee: app record tag verify failed".into(),
+                    ));
                 }
                 session.sr_seq += 1;
                 // Return this member's full inner-plaintext share (content ‖ content_type ‖
@@ -1189,7 +1213,11 @@ pub fn committee_recv_app(
                 return Ok(inner_share);
             }
             REC_ALERT => return Err(Error::Crypto("committee: server alert".into())),
-            other => return Err(Error::Crypto(format!("committee: unexpected record {other}"))),
+            other => {
+                return Err(Error::Crypto(format!(
+                    "committee: unexpected record {other}"
+                )))
+            }
         }
     }
     Err(Error::Crypto("committee: no application record".into()))
@@ -1397,12 +1425,15 @@ mod tests {
         let verifier =
             WebpkiVerifier::with_roots(&[other.cert.der().to_vec()]).expect("build verifier");
         let mut ch = TcpChannel::connect(addr).unwrap();
-        let err =
-            match client_handshake_verified(&mut ch, "localhost", EngineKind::Semihonest, &verifier)
-            {
-                Ok(_) => panic!("a cert that does not chain to the trusted anchor must be rejected"),
-                Err(e) => e,
-            };
+        let err = match client_handshake_verified(
+            &mut ch,
+            "localhost",
+            EngineKind::Semihonest,
+            &verifier,
+        ) {
+            Ok(_) => panic!("a cert that does not chain to the trusted anchor must be rejected"),
+            Err(e) => e,
+        };
         let msg = format!("{err}").to_lowercase();
         assert!(
             msg.contains("cert") || msg.contains("chain"),
@@ -1434,9 +1465,15 @@ mod tests {
         let b = thread::spawn(move || {
             let mut party = TcpChannel::from_stream(TcpStream::connect(paddr).unwrap());
             let x2 = Scalar::from(0x0f0f_a5a5_1234_5678u64);
-            let mut sess =
-                committee_handshake_net(&mut party, Party::B, None, "localhost", &x2, &LeafKeyVerifier)
-                    .expect("party B handshake");
+            let mut sess = committee_handshake_net(
+                &mut party,
+                Party::B,
+                None,
+                "localhost",
+                &x2,
+                &LeafKeyVerifier,
+            )
+            .expect("party B handshake");
             committee_send_app(&mut party, &mut sess, None, &vec![0u8; pl]).unwrap();
             committee_recv_app(&mut party, &mut sess, None).unwrap()
         });
@@ -1467,7 +1504,10 @@ mod tests {
         }
         let ct = inner.pop();
         assert_eq!(ct, Some(REC_APPLICATION_DATA), "inner content_type");
-        assert_eq!(inner, payload, "rustls echoed the committee 2PC-TLS application record");
+        assert_eq!(
+            inner, payload,
+            "rustls echoed the committee 2PC-TLS application record"
+        );
     }
 
     #[test]
@@ -1494,9 +1534,15 @@ mod tests {
             let mut raw = TcpChannel::from_stream(TcpStream::connect(paddr).unwrap());
             let mut party = AmortizingChannel::new(&mut raw);
             let x2 = Scalar::from(0x0f0f_a5a5_1234_5678u64);
-            let mut sess =
-                committee_handshake_net(&mut party, Party::B, None, "localhost", &x2, &LeafKeyVerifier)
-                    .expect("party B handshake");
+            let mut sess = committee_handshake_net(
+                &mut party,
+                Party::B,
+                None,
+                "localhost",
+                &x2,
+                &LeafKeyVerifier,
+            )
+            .expect("party B handshake");
             committee_send_app(&mut party, &mut sess, None, &vec![0u8; pl]).unwrap();
             committee_recv_app(&mut party, &mut sess, None).unwrap()
         });

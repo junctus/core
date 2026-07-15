@@ -156,28 +156,46 @@ impl KeyScheduleNet {
 
     /// This party's shares of the client handshake `(key, iv)` (the IV is 12 bytes; both are
     /// XOR-shares — the record layer opens the IV and keeps the key shared).
-    pub fn client_handshake_keys_share(&self, ch: &mut dyn Channel) -> Result<([u8; 32], [u8; 32])> {
+    pub fn client_handshake_keys_share(
+        &self,
+        ch: &mut dyn Channel,
+    ) -> Result<([u8; 32], [u8; 32])> {
         traffic_keys(ch, self.party, &self.client_hs)
     }
     /// This party's shares of the server handshake `(key, iv)`.
-    pub fn server_handshake_keys_share(&self, ch: &mut dyn Channel) -> Result<([u8; 32], [u8; 32])> {
+    pub fn server_handshake_keys_share(
+        &self,
+        ch: &mut dyn Channel,
+    ) -> Result<([u8; 32], [u8; 32])> {
         traffic_keys(ch, self.party, &self.server_hs)
     }
 
     /// This party's share of the server's Finished MAC over `transcript_hash`
     /// (`Hash(CH..CertVerify)`); combine both parties' shares to compare to the wire value.
-    pub fn server_finished_share(&self, ch: &mut dyn Channel, transcript_hash: &[u8; 32]) -> Result<[u8; 32]> {
+    pub fn server_finished_share(
+        &self,
+        ch: &mut dyn Channel,
+        transcript_hash: &[u8; 32],
+    ) -> Result<[u8; 32]> {
         finished_mac(ch, self.party, &self.server_hs, transcript_hash)
     }
     /// This party's share of the client's Finished MAC over `transcript_hash`
     /// (`Hash(CH..server Finished)`); combined and placed on the wire.
-    pub fn client_finished_share(&self, ch: &mut dyn Channel, transcript_hash: &[u8; 32]) -> Result<[u8; 32]> {
+    pub fn client_finished_share(
+        &self,
+        ch: &mut dyn Channel,
+        transcript_hash: &[u8; 32],
+    ) -> Result<[u8; 32]> {
         finished_mac(ch, self.party, &self.client_hs, transcript_hash)
     }
 
     /// Advance to the application epoch: Master Secret then both application-traffic secrets
     /// over the full `CH..server Finished` transcript, all under 2PC over `ch`.
-    pub fn derive_application(&mut self, ch: &mut dyn Channel, transcript_ch_sfin: &[u8]) -> Result<()> {
+    pub fn derive_application(
+        &mut self,
+        ch: &mut dyn Channel,
+        transcript_ch_sfin: &[u8],
+    ) -> Result<()> {
         // Reuse the Handshake Secret prepared in derive_handshake (no second prepare).
         let derived = derive_secret(ch, self.party, &self.hs_prepared, b"derived", b"")?;
         // Master Secret = HKDF-Extract(salt=derived(shared), IKM=0) = HMAC(derived, 0^32).
@@ -185,8 +203,20 @@ impl KeyScheduleNet {
         let master = hmac_prepared_net(ch, self.party, &pk_derived, &[0u8; 32])?;
         // master keys both application-traffic secrets — prepare once.
         let pk_master = prepare_key_net(ch, self.party, &master)?;
-        self.client_ap = Some(derive_secret(ch, self.party, &pk_master, b"c ap traffic", transcript_ch_sfin)?);
-        self.server_ap = Some(derive_secret(ch, self.party, &pk_master, b"s ap traffic", transcript_ch_sfin)?);
+        self.client_ap = Some(derive_secret(
+            ch,
+            self.party,
+            &pk_master,
+            b"c ap traffic",
+            transcript_ch_sfin,
+        )?);
+        self.server_ap = Some(derive_secret(
+            ch,
+            self.party,
+            &pk_master,
+            b"s ap traffic",
+            transcript_ch_sfin,
+        )?);
         self.master = Some(master);
         Ok(())
     }
@@ -200,18 +230,36 @@ impl KeyScheduleNet {
         self.server_ap.expect("derive_application first")
     }
     /// This party's shares of the client application `(key, iv)`.
-    pub fn client_application_keys_share(&self, ch: &mut dyn Channel) -> Result<([u8; 32], [u8; 32])> {
-        traffic_keys(ch, self.party, &self.client_ap.expect("derive_application first"))
+    pub fn client_application_keys_share(
+        &self,
+        ch: &mut dyn Channel,
+    ) -> Result<([u8; 32], [u8; 32])> {
+        traffic_keys(
+            ch,
+            self.party,
+            &self.client_ap.expect("derive_application first"),
+        )
     }
     /// This party's shares of the server application `(key, iv)`.
-    pub fn server_application_keys_share(&self, ch: &mut dyn Channel) -> Result<([u8; 32], [u8; 32])> {
-        traffic_keys(ch, self.party, &self.server_ap.expect("derive_application first"))
+    pub fn server_application_keys_share(
+        &self,
+        ch: &mut dyn Channel,
+    ) -> Result<([u8; 32], [u8; 32])> {
+        traffic_keys(
+            ch,
+            self.party,
+            &self.server_ap.expect("derive_application first"),
+        )
     }
 
     /// **KeyUpdate** (RFC 8446 §7.2) on the client write path: advance this party's client
     /// application-traffic secret share one generation via `"traffic upd"`, over `ch`.
     pub fn update_client_application(&mut self, ch: &mut dyn Channel) -> Result<()> {
-        let pk = prepare_key_net(ch, self.party, &self.client_ap.expect("derive_application first"))?;
+        let pk = prepare_key_net(
+            ch,
+            self.party,
+            &self.client_ap.expect("derive_application first"),
+        )?;
         let next = expand_label_prepared_net(ch, self.party, &pk, b"traffic upd", b"", 32)?;
         self.client_ap = Some(next);
         Ok(())
@@ -241,7 +289,11 @@ fn derive_secret(
 
 /// `(key, iv)` shares from a traffic-secret share: prepare the key once, then
 /// `HKDF-Expand-Label(secret, "key"/"iv")`. Both under 2PC over `ch`.
-fn traffic_keys(ch: &mut dyn Channel, party: Party, secret_share: &[u8; 32]) -> Result<([u8; 32], [u8; 32])> {
+fn traffic_keys(
+    ch: &mut dyn Channel,
+    party: Party,
+    secret_share: &[u8; 32],
+) -> Result<([u8; 32], [u8; 32])> {
     let pk = prepare_key_net(ch, party, secret_share)?;
     let key = expand_label_prepared_net(ch, party, &pk, b"key", b"", 32)?;
     let iv = expand_label_prepared_net(ch, party, &pk, b"iv", b"", 12)?;
@@ -280,9 +332,9 @@ pub fn client_key_agreement_net(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use super::super::channel::TcpChannel;
     use super::super::super::hkdf::hkdf_label;
+    use super::super::channel::TcpChannel;
+    use super::*;
     use hkdf::Hkdf;
     use hmac::{Hmac, Mac};
     use p256::elliptic_curve::sec1::ToEncodedPoint;
@@ -402,7 +454,11 @@ mod tests {
         let sa = a.join().unwrap();
 
         // ECDHE share reconstruction == the real P-256 shared-secret x-coordinate.
-        assert_eq!(xor32(&sa.ecdhe, &sb.ecdhe), zx, "networked ECDHE == p256 x(Z)");
+        assert_eq!(
+            xor32(&sa.ecdhe, &sb.ecdhe),
+            zx,
+            "networked ECDHE == p256 x(Z)"
+        );
 
         // Reference schedule from the true secret.
         let derived0 = super::super::schedule::derived_early();

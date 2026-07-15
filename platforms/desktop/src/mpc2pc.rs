@@ -38,10 +38,12 @@ use neo_mpc::mpc_tls::ectf::{ectf_a, ectf_b};
 use neo_mpc::mpc_tls::engine::EngineKind;
 use neo_mpc::mpc_tls::garble_net::{evaluator_run, garbler_run};
 use neo_mpc::mpc_tls::live::channel::{AmortizingChannel, Channel, TcpChannel};
-use neo_mpc::mpc_tls::live::handshake::{committee_handshake_net, committee_recv_app, committee_send_app};
+use neo_mpc::mpc_tls::live::handshake::{
+    committee_handshake_net, committee_recv_app, committee_send_app,
+};
 use neo_mpc::mpc_tls::live::netschedule::{derive_ecdhe_share_net, KeyScheduleNet};
-use neo_mpc::mpc_tls::live::verify::LeafKeyVerifier;
 use neo_mpc::mpc_tls::live::schedule::KeySchedule;
+use neo_mpc::mpc_tls::live::verify::LeafKeyVerifier;
 use neo_mpc::mpc_tls::netengine::Party;
 use neo_mpc::mpc_tls::sha256::{sha256, sha256_compress_circuit};
 
@@ -81,7 +83,9 @@ pub fn run(
         (Some(addr), None) => {
             if let Some(dest) = handshake {
                 // Committee lead (party A): accept one member, dial the destination.
-                println!("neo mpc2pc — committee lead (party A). Binding {addr}, waiting for peer…");
+                println!(
+                    "neo mpc2pc — committee lead (party A). Binding {addr}, waiting for peer…"
+                );
                 let listener = TcpListener::bind(&addr).with_context(|| format!("bind {addr}"))?;
                 let (sock, peer) = listener.accept().context("accept peer")?;
                 println!("  peer member connected from {peer}");
@@ -92,7 +96,11 @@ pub fn run(
             }
         }
         (None, Some(addr)) => {
-            let role = if handshake.is_some() { "committee follower (party B)" } else { "party B (evaluator)" };
+            let role = if handshake.is_some() {
+                "committee follower (party B)"
+            } else {
+                "party B (evaluator)"
+            };
             println!("neo mpc2pc — {role}. Connecting to {addr}…");
             let sock = TcpStream::connect(&addr).with_context(|| format!("connect {addr}"))?;
             println!("  connected");
@@ -105,7 +113,9 @@ pub fn run(
                 }
             }
         }
-        _ => bail!("provide exactly one of --listen <addr> (party A) or --connect <addr> (party B)"),
+        _ => {
+            bail!("provide exactly one of --listen <addr> (party A) or --connect <addr> (party B)")
+        }
     }
 }
 
@@ -120,7 +130,9 @@ pub fn serve(addr: &str, verbose: bool, full: bool) -> anyhow::Result<()> {
     let mode = if full { "full key-agreement" } else { "demo" };
     tracing::info!("mpc2pc: serving networked 2PC-TLS (party A, {mode}) on {addr}");
     if verbose {
-        println!("neo mpc2pc — party A (garbler). Serving on {addr} ({mode}), one session per peer…");
+        println!(
+            "neo mpc2pc — party A (garbler). Serving on {addr} ({mode}), one session per peer…"
+        );
     }
     for stream in listener.incoming() {
         let stream = match stream {
@@ -200,7 +212,11 @@ fn scalar_from_bytes(b: &[u8; 32]) -> anyhow::Result<Scalar> {
 
 /// The networked ECtF ECDHE conversion + a demo-only correctness check. Returns the ECtF
 /// protocol elapsed time.
-fn ectf_ecdhe(role: Role, ch: &mut dyn Channel, verbose: bool) -> anyhow::Result<std::time::Duration> {
+fn ectf_ecdhe(
+    role: Role,
+    ch: &mut dyn Channel,
+    verbose: bool,
+) -> anyhow::Result<std::time::Duration> {
     if verbose {
         println!("\n[1/2] ECDHE conversion (ECtF) — split-scalar, neither party holds the secret");
     }
@@ -219,8 +235,9 @@ fn ectf_ecdhe(role: Role, ch: &mut dyn Channel, verbose: bool) -> anyhow::Result
         Role::B => {
             let buf = ch.recv_exact(65).map_err(|e| anyhow!("recv Y: {e}"))?;
             let enc = EncodedPoint::from_bytes(&buf).map_err(|e| anyhow!("decode Y: {e}"))?;
-            let aff: AffinePoint = Option::<AffinePoint>::from(AffinePoint::from_encoded_point(&enc))
-                .ok_or_else(|| anyhow!("Y is not a valid P-256 point"))?;
+            let aff: AffinePoint =
+                Option::<AffinePoint>::from(AffinePoint::from_encoded_point(&enc))
+                    .ok_or_else(|| anyhow!("Y is not a valid P-256 point"))?;
             ProjectivePoint::from(aff)
         }
     };
@@ -253,7 +270,8 @@ fn ectf_ecdhe(role: Role, ch: &mut dyn Channel, verbose: bool) -> anyhow::Result
     let peer_k = scalar_from_bytes(&peer[32..64].try_into().unwrap())?;
 
     let prime = BigUint::from_bytes_be(&P256_PRIME_BE);
-    let recon = (BigUint::from_bytes_be(&my_x_share) + BigUint::from_bytes_be(&peer_x_share)) % &prime;
+    let recon =
+        (BigUint::from_bytes_be(&my_x_share) + BigUint::from_bytes_be(&peer_x_share)) % &prime;
     let recon_be = bu_to_be32(&recon);
 
     let joint_scalar = k + peer_k; // scalar addition is commutative → both parties agree
@@ -307,7 +325,7 @@ fn garbled_key_schedule(
     let t = Instant::now();
     match role {
         Role::A => {
-            garbler_run(ch, &circuit, &ev_wires, &inputs).map_err(|e| anyhow!("garbler: {e}"))?;
+            garbler_run(ch, circuit, &ev_wires, &inputs).map_err(|e| anyhow!("garbler: {e}"))?;
             let elapsed = t.elapsed();
             if verbose {
                 println!("  ✓ garbled + served the circuit in {elapsed:?} (constant 3 flights)");
@@ -316,7 +334,7 @@ fn garbled_key_schedule(
         }
         Role::B => {
             let out =
-                evaluator_run(ch, &circuit, &ev_wires, &inputs).map_err(|e| anyhow!("eval: {e}"))?;
+                evaluator_run(ch, circuit, &ev_wires, &inputs).map_err(|e| anyhow!("eval: {e}"))?;
             let elapsed = t.elapsed();
             if out != circuit.eval(&inputs) {
                 bail!("garbled evaluation != plaintext circuit");
@@ -350,7 +368,11 @@ fn party_of(role: Role) -> Party {
 /// (ECtF + A2B) then the full TLS 1.3 key schedule — then self-verify the combined shares
 /// against the vetted in-process [`KeySchedule`] reference. Both parties run the identical
 /// gadget sequence so the channel stays in lockstep.
-fn full_key_agreement(role: Role, ch: &mut dyn Channel, verbose: bool) -> anyhow::Result<SessionReport> {
+fn full_key_agreement(
+    role: Role,
+    ch: &mut dyn Channel,
+    verbose: bool,
+) -> anyhow::Result<SessionReport> {
     let party = party_of(role);
 
     // Public server key share Y: A mints an ephemeral one and discards the scalar; B receives.
@@ -364,12 +386,17 @@ fn full_key_agreement(role: Role, ch: &mut dyn Channel, verbose: bool) -> anyhow
         Role::B => {
             let buf = ch.recv_exact(65).map_err(|e| anyhow!("recv Y: {e}"))?;
             let enc = EncodedPoint::from_bytes(&buf).map_err(|e| anyhow!("decode Y: {e}"))?;
-            let aff: AffinePoint = Option::<AffinePoint>::from(AffinePoint::from_encoded_point(&enc))
-                .ok_or_else(|| anyhow!("Y is not a valid P-256 point"))?;
+            let aff: AffinePoint =
+                Option::<AffinePoint>::from(AffinePoint::from_encoded_point(&enc))
+                    .ok_or_else(|| anyhow!("Y is not a valid P-256 point"))?;
             ProjectivePoint::from(aff)
         }
     };
-    let y_sec1 = y_point.to_affine().to_encoded_point(false).as_bytes().to_vec();
+    let y_sec1 = y_point
+        .to_affine()
+        .to_encoded_point(false)
+        .as_bytes()
+        .to_vec();
 
     // This party's ephemeral scalar share.
     let x = random_scalar();
@@ -378,7 +405,8 @@ fn full_key_agreement(role: Role, ch: &mut dyn Channel, verbose: bool) -> anyhow
         println!("\n[1/3] Networked ECDHE conversion (ECtF + A2B) — over the channel");
     }
     let t = Instant::now();
-    let ecdhe = derive_ecdhe_share_net(ch, party, &x, &y_sec1).map_err(|e| anyhow!("ecdhe: {e}"))?;
+    let ecdhe =
+        derive_ecdhe_share_net(ch, party, &x, &y_sec1).map_err(|e| anyhow!("ecdhe: {e}"))?;
     let ectf_elapsed = t.elapsed();
     if verbose {
         println!("  done in {ectf_elapsed:?} — this party holds an XOR-share of x(Z)");
@@ -403,7 +431,9 @@ fn full_key_agreement(role: Role, ch: &mut dyn Channel, verbose: bool) -> anyhow
     let server_ap = ks.server_application_secret_share();
     let sched_elapsed = t.elapsed();
     if verbose {
-        println!("  done in {sched_elapsed:?} — shares of every traffic secret, key & Finished MAC");
+        println!(
+            "  done in {sched_elapsed:?} — shares of every traffic secret, key & Finished MAC"
+        );
         println!("\n[3/3] Self-verification against the in-process reference schedule");
     }
 
@@ -411,11 +441,21 @@ fn full_key_agreement(role: Role, ch: &mut dyn Channel, verbose: bool) -> anyhow
     // against the vetted in-process KeySchedule oracle. (The protocol above leaks none of these.)
     let mut msg = Vec::with_capacity(256);
     msg.extend_from_slice(&scalar_bytes(&x));
-    for s in [&ecdhe, &client_hs, &server_hs, &client_hs_key, &server_finished, &client_ap, &server_ap] {
+    for s in [
+        &ecdhe,
+        &client_hs,
+        &server_hs,
+        &client_hs_key,
+        &server_finished,
+        &client_ap,
+        &server_ap,
+    ] {
         msg.extend_from_slice(s);
     }
     ch.send(&msg).map_err(|e| anyhow!("send verify: {e}"))?;
-    let peer = ch.recv_exact(256).map_err(|e| anyhow!("recv verify: {e}"))?;
+    let peer = ch
+        .recv_exact(256)
+        .map_err(|e| anyhow!("recv verify: {e}"))?;
     let peer_x = scalar_from_bytes(&peer[0..32].try_into().unwrap())?;
     let peer_share = |i: usize| -> [u8; 32] { peer[32 + i * 32..64 + i * 32].try_into().unwrap() };
 
@@ -428,23 +468,57 @@ fn full_key_agreement(role: Role, ch: &mut dyn Channel, verbose: bool) -> anyhow
     }
 
     // In-process reference schedule from the reconstructed secret (split trivially).
-    let mut refks = KeySchedule::derive_handshake(EngineKind::Semihonest, &expected_ecdhe, &[0u8; 32], CH_SH)
-        .map_err(|e| anyhow!("reference schedule: {e}"))?;
-    check("client_hs secret", &xor32(&client_hs, &peer_share(1)), &refks.client_handshake_secret().open())?;
-    check("server_hs secret", &xor32(&server_hs, &peer_share(2)), &refks.server_handshake_secret().open())?;
-    let rk = refks.client_handshake_keys().map_err(|e| anyhow!("ref client keys: {e}"))?;
-    check("client hs key", &xor32(&client_hs_key, &peer_share(3)), &xor32(&rk.key_a, &rk.key_b))?;
-    let rsf = refks.server_finished(&sha256(CV)).map_err(|e| anyhow!("ref server finished: {e}"))?;
-    check("server Finished MAC", &xor32(&server_finished, &peer_share(4)), &rsf)?;
-    refks.derive_application(CH_SFIN).map_err(|e| anyhow!("ref derive_application: {e}"))?;
-    check("client_ap secret", &xor32(&client_ap, &peer_share(5)), &refks.client_application_secret().open())?;
-    check("server_ap secret", &xor32(&server_ap, &peer_share(6)), &refks.server_application_secret().open())?;
+    let mut refks =
+        KeySchedule::derive_handshake(EngineKind::Semihonest, &expected_ecdhe, &[0u8; 32], CH_SH)
+            .map_err(|e| anyhow!("reference schedule: {e}"))?;
+    check(
+        "client_hs secret",
+        &xor32(&client_hs, &peer_share(1)),
+        &refks.client_handshake_secret().open(),
+    )?;
+    check(
+        "server_hs secret",
+        &xor32(&server_hs, &peer_share(2)),
+        &refks.server_handshake_secret().open(),
+    )?;
+    let rk = refks
+        .client_handshake_keys()
+        .map_err(|e| anyhow!("ref client keys: {e}"))?;
+    check(
+        "client hs key",
+        &xor32(&client_hs_key, &peer_share(3)),
+        &xor32(&rk.key_a, &rk.key_b),
+    )?;
+    let rsf = refks
+        .server_finished(&sha256(CV))
+        .map_err(|e| anyhow!("ref server finished: {e}"))?;
+    check(
+        "server Finished MAC",
+        &xor32(&server_finished, &peer_share(4)),
+        &rsf,
+    )?;
+    refks
+        .derive_application(CH_SFIN)
+        .map_err(|e| anyhow!("ref derive_application: {e}"))?;
+    check(
+        "client_ap secret",
+        &xor32(&client_ap, &peer_share(5)),
+        &refks.client_application_secret().open(),
+    )?;
+    check(
+        "server_ap secret",
+        &xor32(&server_ap, &peer_share(6)),
+        &refks.server_application_secret().open(),
+    )?;
 
     if verbose {
         println!("  ✓ ECDHE x(Z) + every key-schedule node matches the reference — handshake key agreement correct");
         println!("\n✓ full networked 2PC-TLS handshake key agreement complete and self-verified over the wire.");
     }
-    Ok(SessionReport { ectf: ectf_elapsed, garble: sched_elapsed })
+    Ok(SessionReport {
+        ectf: ectf_elapsed,
+        garble: sched_elapsed,
+    })
 }
 
 fn xor32(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
@@ -466,7 +540,11 @@ fn check(what: &str, got: &[u8; 32], want: &[u8; 32]) -> anyhow::Result<()> {
 /// `GET /`, and reconstruct the response from their plaintext shares.
 fn committee_handshake(role: Role, ch: &mut dyn Channel, dest: &str) -> anyhow::Result<()> {
     let party = party_of(role);
-    let host = dest.rsplit_once(':').map(|(h, _)| h).unwrap_or(dest).to_string();
+    let host = dest
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(dest)
+        .to_string();
     let scalar = random_scalar();
 
     let mut server = if role == Role::A {
@@ -507,10 +585,19 @@ fn committee_handshake(role: Role, ch: &mut dyn Channel, dest: &str) -> anyhow::
     } else {
         vec![0u8; req.len()]
     };
-    committee_send_app(&mut party_ch, &mut sess, server.as_mut().map(|c| c as &mut dyn Channel), &pt_share)
-        .map_err(|e| anyhow!("send request: {e}"))?;
-    let my_share = committee_recv_app(&mut party_ch, &mut sess, server.as_mut().map(|c| c as &mut dyn Channel))
-        .map_err(|e| anyhow!("recv response: {e}"))?;
+    committee_send_app(
+        &mut party_ch,
+        &mut sess,
+        server.as_mut().map(|c| c as &mut dyn Channel),
+        &pt_share,
+    )
+    .map_err(|e| anyhow!("send request: {e}"))?;
+    let my_share = committee_recv_app(
+        &mut party_ch,
+        &mut sess,
+        server.as_mut().map(|c| c as &mut dyn Channel),
+    )
+    .map_err(|e| anyhow!("recv response: {e}"))?;
 
     // Reconstruct (demo reveal — in production the onion client does this): exchange shares,
     // XOR, strip padding + the trailing content_type.
@@ -529,6 +616,8 @@ fn committee_handshake(role: Role, ch: &mut dyn Channel, dest: &str) -> anyhow::
 /// Exchange + XOR a plaintext share with the peer member (demo reconstruction of a public value).
 fn combine_shares(ch: &mut dyn Channel, mine: &[u8]) -> anyhow::Result<Vec<u8>> {
     ch.send(mine).map_err(|e| anyhow!("send share: {e}"))?;
-    let peer = ch.recv_exact(mine.len()).map_err(|e| anyhow!("recv share: {e}"))?;
+    let peer = ch
+        .recv_exact(mine.len())
+        .map_err(|e| anyhow!("recv share: {e}"))?;
     Ok(mine.iter().zip(&peer).map(|(a, b)| a ^ b).collect())
 }

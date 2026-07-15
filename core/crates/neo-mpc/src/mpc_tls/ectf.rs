@@ -242,7 +242,9 @@ fn mta_fp_sender(ch: &mut dyn Channel, a: &F, f: &Field) -> Result<F> {
 /// share `Σ(chosen) = Σtᵢ + a·b`.
 fn mta_fp_receiver(ch: &mut dyn Channel, b: &F, f: &Field) -> Result<F> {
     let b_be = to_be(b);
-    let bits: Vec<bool> = (0..256).map(|i| (b_be[31 - i / 8] >> (i % 8)) & 1 == 1).collect();
+    let bits: Vec<bool> = (0..256)
+        .map(|i| (b_be[31 - i / 8] >> (i % 8)) & 1 == 1)
+        .collect();
     let lo_recv = kos::cot_receiver(ch, &bits)?;
     let hi_recv = kos::cot_receiver(ch, &bits)?;
     let mut v = f.zero();
@@ -278,7 +280,11 @@ fn open_field(ch: &mut dyn Channel, share: &F, f: &Field) -> Result<F> {
 
 /// **Networked ECtF — party A** (holds point-share `P1 = (x1, y1)`). Runs the same
 /// protocol as [`ectf`] over `ch`, returning A's additive share of `x(P1+P2)`.
-pub fn ectf_a(ch: &mut dyn Channel, p1: (&[u8; 32], &[u8; 32]), prime: &[u8; 32]) -> Result<[u8; 32]> {
+pub fn ectf_a(
+    ch: &mut dyn Channel,
+    p1: (&[u8; 32], &[u8; 32]),
+    prime: &[u8; 32],
+) -> Result<[u8; 32]> {
     let f = Field::new(prime);
     let x1 = f.load_be(p1.0);
     let y1 = f.load_be(p1.1);
@@ -290,7 +296,9 @@ pub fn ectf_a(ch: &mut dyn Channel, p1: (&[u8; 32], &[u8; 32]), prime: &[u8; 32]
     let ar_a = mul_shared_a(ch, &a_sh_a, &ra, &f)?;
     let d = open_field(ch, &ar_a, &f)?;
     if d.retrieve() == U256::ZERO {
-        return Err(Error::Crypto("ECtF-net: degenerate masked inversion (d = 0)".into()));
+        return Err(Error::Crypto(
+            "ECtF-net: degenerate masked inversion (d = 0)".into(),
+        ));
     }
     let dinv = d.invert().0;
     let br_a = mul_shared_a(ch, &b_sh_a, &ra, &f)?;
@@ -299,7 +307,11 @@ pub fn ectf_a(ch: &mut dyn Channel, p1: (&[u8; 32], &[u8; 32]), prime: &[u8; 32]
 }
 
 /// **Networked ECtF — party B** (holds point-share `P2 = (x2, y2)`).
-pub fn ectf_b(ch: &mut dyn Channel, p2: (&[u8; 32], &[u8; 32]), prime: &[u8; 32]) -> Result<[u8; 32]> {
+pub fn ectf_b(
+    ch: &mut dyn Channel,
+    p2: (&[u8; 32], &[u8; 32]),
+    prime: &[u8; 32],
+) -> Result<[u8; 32]> {
     let f = Field::new(prime);
     let x2 = f.load_be(p2.0);
     let y2 = f.load_be(p2.1);
@@ -311,7 +323,9 @@ pub fn ectf_b(ch: &mut dyn Channel, p2: (&[u8; 32], &[u8; 32]), prime: &[u8; 32]
     let ar_b = mul_shared_b(ch, &a_sh_b, &rb, &f)?;
     let d = open_field(ch, &ar_b, &f)?;
     if d.retrieve() == U256::ZERO {
-        return Err(Error::Crypto("ECtF-net: degenerate masked inversion (d = 0)".into()));
+        return Err(Error::Crypto(
+            "ECtF-net: degenerate masked inversion (d = 0)".into(),
+        ));
     }
     let dinv = d.invert().0;
     let br_b = mul_shared_b(ch, &b_sh_b, &rb, &f)?;
@@ -410,7 +424,11 @@ mod tests {
         let s2 = b.join().unwrap();
 
         let recon = (BigUint::from_bytes_be(&s1) + BigUint::from_bytes_be(&s2)) % &p;
-        assert_eq!(bu_to_be32(&recon), sx, "networked ECtF reconstructs P-256 x(2G+5G)");
+        assert_eq!(
+            bu_to_be32(&recon),
+            sx,
+            "networked ECtF reconstructs P-256 x(2G+5G)"
+        );
     }
 
     #[test]

@@ -414,14 +414,14 @@ fn poly_finalize_net(
             let mut mask = vec![false; 128];
             random_bits(&mut mask)?;
             g[520..648].copy_from_slice(&mask);
-            garbler_run(ch, &circuit, &ev, &g)?;
+            garbler_run(ch, circuit, &ev, &g)?;
             Ok(mask) // A's tag share = maskA
         }
         Party::B => {
             let mut e = vec![false; n_inputs];
             e[132..264].copy_from_slice(acc_share); // accB
             e[392..520].copy_from_slice(s_bits); // sB
-            evaluator_run(ch, &circuit, &ev, &e) // = tag ⊕ maskA
+            evaluator_run(ch, circuit, &ev, &e) // = tag ⊕ maskA
         }
     }
 }
@@ -439,13 +439,7 @@ fn poly_chunk_circuit(n: usize) -> Arc<Circuit> {
         return Arc::clone(c);
     }
     let built = Arc::new(build_poly_chunk_circuit(n));
-    Arc::clone(
-        cache
-            .lock()
-            .expect("poly cache")
-            .entry(n)
-            .or_insert(built),
-    )
+    Arc::clone(cache.lock().expect("poly cache").entry(n).or_insert(built))
 }
 
 fn build_poly_chunk_circuit(n: usize) -> Circuit {

@@ -340,7 +340,11 @@ pub async fn run_committee_2pc(
     dest: String,
     request: Option<String>,
 ) -> Result<()> {
-    let host = dest.rsplit_once(':').map(|(h, _)| h).unwrap_or(&dest).to_string();
+    let host = dest
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(&dest)
+        .to_string();
     let request = request.unwrap_or_else(|| {
         format!("GET / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: neo-committee2pc\r\nConnection: close\r\n\r\n")
     });

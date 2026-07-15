@@ -237,7 +237,7 @@ mod tests {
             .map(|i| i.wrapping_mul(2_654_435_761) & 1 == 1)
             .collect();
         let t = std::time::Instant::now();
-        let out = run_net(&circuit, ev, bits.clone());
+        let out = run_net(circuit, ev, bits.clone());
         eprintln!(
             "networked garbled SHA-256 ({} ANDs) over TCP: {:?}",
             circuit.and_gates(),

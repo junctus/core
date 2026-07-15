@@ -95,7 +95,10 @@ async fn resolve_safe_dest(dest: &str, policy: &ExitPolicy) -> Result<SocketAddr
         // (`::ffff:127.0.0.1`, `::ffff:169.254.169.254`) can't slip past — mirrors
         // `neo_core::net::is_safe_dial_target`.
         let ip = match addr.ip() {
-            IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+            IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map(IpAddr::V4)
+                .unwrap_or(IpAddr::V6(v6)),
             other => other,
         };
         let internal = if ip.is_loopback() {
@@ -171,8 +174,9 @@ impl Committee2pcPayload {
     /// `MAGIC ‖ lead(1) ‖ token(16) ‖ lead_id(32) ‖ lead_addr_len(u16) ‖ lead_addr ‖
     /// dest_len(u16) ‖ dest ‖ request_share`.
     pub fn encode(&self) -> Vec<u8> {
-        let mut out =
-            Vec::with_capacity(22 + self.lead_addr.len() + self.dest.len() + self.request_share.len());
+        let mut out = Vec::with_capacity(
+            22 + self.lead_addr.len() + self.dest.len() + self.request_share.len(),
+        );
         out.push(COMMITTEE_2PC_MAGIC);
         out.push(self.lead as u8);
         out.extend_from_slice(&self.token);
@@ -212,7 +216,14 @@ impl Committee2pcPayload {
         let lead_addr = take_str(&mut cur)?;
         let dest = take_str(&mut cur)?;
         let request_share = cur.to_vec();
-        Ok(Some(Self { lead, token, lead_id, lead_addr, dest, request_share }))
+        Ok(Some(Self {
+            lead,
+            token,
+            lead_id,
+            lead_addr,
+            dest,
+            request_share,
+        }))
     }
 }
 
@@ -328,17 +339,12 @@ pub async fn run_member(
     // Read: wire → open → 2PC.
     let sess_r = session.clone();
     let read_task = tokio::spawn(async move {
-        loop {
-            match read_frame(&mut rd).await {
-                Ok(frame) => {
-                    let opened = sess_r.lock().expect("session poisoned").open(&frame);
-                    match opened {
-                        Ok(pt) => {
-                            if from_pump_tx.send(pt).is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
+        while let Ok(frame) = read_frame(&mut rd).await {
+            let opened = sess_r.lock().expect("session poisoned").open(&frame);
+            match opened {
+                Ok(pt) => {
+                    if from_pump_tx.send(pt).is_err() {
+                        break;
                     }
                 }
                 Err(_) => break,
@@ -363,7 +369,11 @@ pub async fn run_member(
     });
 
     let out = tokio::task::spawn_blocking(move || {
-        let mut ch = SessionChannel { to_pump: to_pump_tx, from_pump: from_pump_rx, rx: Vec::new() };
+        let mut ch = SessionChannel {
+            to_pump: to_pump_tx,
+            from_pump: from_pump_rx,
+            rx: Vec::new(),
+        };
         member_2pc_blocking(role, &mut ch, &dest, dial_addr, &request_share)
     })
     .await
@@ -423,8 +433,13 @@ pub async fn run_member_flow(
         match tokio::time::timeout(LINK_TIMEOUT, rx).await {
             Ok(Ok((stream, session))) => (Party::A, stream, session),
             _ => {
-                rendezvous().lock().expect("rendezvous poisoned").remove(&payload.token);
-                return Err(Error::Config("committee2pc: follower link timed out".into()));
+                rendezvous()
+                    .lock()
+                    .expect("rendezvous poisoned")
+                    .remove(&payload.token);
+                return Err(Error::Config(
+                    "committee2pc: follower link timed out".into(),
+                ));
             }
         }
     } else {
@@ -436,7 +451,15 @@ pub async fn run_member_flow(
         write_frame(&mut stream, &result.session.seal(&payload.token)?).await?;
         (Party::B, stream, result.session)
     };
-    run_member(role, stream, session, payload.dest, dial_addr, payload.request_share).await
+    run_member(
+        role,
+        stream,
+        session,
+        payload.dest,
+        dial_addr,
+        payload.request_share,
+    )
+    .await
 }
 
 /// The relay's `LINK_FRAME` dispatch: a follower has opened an authenticated link for the 2PC.
@@ -453,11 +476,17 @@ pub async fn handle_link(mut stream: TcpStream, mut session: Session) -> Result<
 
     let deadline = tokio::time::Instant::now() + LINK_TIMEOUT;
     let tx = loop {
-        if let Some(tx) = rendezvous().lock().expect("rendezvous poisoned").remove(&token) {
+        if let Some(tx) = rendezvous()
+            .lock()
+            .expect("rendezvous poisoned")
+            .remove(&token)
+        {
             break tx;
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(Error::Config("committee2pc: no lead awaiting this link token".into()));
+            return Err(Error::Config(
+                "committee2pc: no lead awaiting this link token".into(),
+            ));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
@@ -510,10 +539,16 @@ pub async fn committee_2pc_fetch(
     let share_b: Vec<u8> = request.iter().zip(&share_a).map(|(r, a)| r ^ a).collect();
 
     // One circuit per member over its own disjoint path; the member is the endpoint.
-    let lead_circuit: Vec<Hop> =
-        lead_path.iter().cloned().chain(std::iter::once(lead.clone())).collect();
-    let follower_circuit: Vec<Hop> =
-        follower_path.iter().cloned().chain(std::iter::once(follower.clone())).collect();
+    let lead_circuit: Vec<Hop> = lead_path
+        .iter()
+        .cloned()
+        .chain(std::iter::once(lead.clone()))
+        .collect();
+    let follower_circuit: Vec<Hop> = follower_path
+        .iter()
+        .cloned()
+        .chain(std::iter::once(follower.clone()))
+        .collect();
 
     let lead_payload = Committee2pcPayload {
         lead: true,
@@ -548,7 +583,9 @@ pub async fn committee_2pc_fetch(
     let (resp_a, resp_b) = tokio::join!(lead_fut, follower_fut);
     let (resp_a, resp_b) = (resp_a?, resp_b?);
     if resp_a.len() != resp_b.len() {
-        return Err(Error::Crypto("committee2pc: response shares differ in length".into()));
+        return Err(Error::Crypto(
+            "committee2pc: response shares differ in length".into(),
+        ));
     }
     let mut inner: Vec<u8> = resp_a.iter().zip(&resp_b).map(|(x, y)| x ^ y).collect();
     while inner.last() == Some(&0) {
@@ -593,7 +630,10 @@ mod tests {
         client.write_all(b"ping").await.unwrap();
         let mut buf = [0u8; 4];
         client.read_exact(&mut buf).await.unwrap();
-        assert_eq!(&buf, b"ping", "blocking Channel over a bridged tokio stream round-trips");
+        assert_eq!(
+            &buf, b"ping",
+            "blocking Channel over a bridged tokio stream round-trips"
+        );
         server.await.unwrap();
     }
 
@@ -608,7 +648,9 @@ mod tests {
             request_share: b"a-random-request-share".to_vec(),
         };
         let enc = p.encode();
-        let got = Committee2pcPayload::decode(&enc).unwrap().expect("is committee2pc");
+        let got = Committee2pcPayload::decode(&enc)
+            .unwrap()
+            .expect("is committee2pc");
         assert!(!got.lead);
         assert_eq!(got.token, p.token);
         assert_eq!(got.lead_addr, p.lead_addr);
@@ -616,7 +658,9 @@ mod tests {
         assert_eq!(got.dest, p.dest);
         assert_eq!(got.request_share, p.request_share);
         // A normal text exit target (e.g. "host:port" / "mux") is NOT a committee2pc payload.
-        assert!(Committee2pcPayload::decode(b"example.com:443").unwrap().is_none());
+        assert!(Committee2pcPayload::decode(b"example.com:443")
+            .unwrap()
+            .is_none());
         assert!(Committee2pcPayload::decode(b"mux").unwrap().is_none());
         // Truncated committee2pc payloads error, not panic.
         assert!(Committee2pcPayload::decode(&enc[..10]).is_err());
@@ -654,17 +698,33 @@ mod tests {
 
         // A member appearing in the other member's path → refused.
         assert!(
-            committee_2pc_fetch(&id, &[hop(3)], std::slice::from_ref(&lead), &lead, &follower, "example.com:443", b"x")
-                .await
-                .is_err(),
+            committee_2pc_fetch(
+                &id,
+                &[hop(3)],
+                std::slice::from_ref(&lead),
+                &lead,
+                &follower,
+                "example.com:443",
+                b"x"
+            )
+            .await
+            .is_err(),
             "a member appearing in the other's path must be refused"
         );
 
         // lead == follower → refused (the member's id is in both circuits).
         assert!(
-            committee_2pc_fetch(&id, &[hop(3)], &[hop(4)], &lead, &lead, "example.com:443", b"x")
-                .await
-                .is_err(),
+            committee_2pc_fetch(
+                &id,
+                &[hop(3)],
+                &[hop(4)],
+                &lead,
+                &lead,
+                "example.com:443",
+                b"x"
+            )
+            .await
+            .is_err(),
             "lead == follower must be refused"
         );
     }
@@ -674,7 +734,10 @@ mod tests {
         // The lead's SSRF / open-proxy guard: internal destinations are refused so a
         // client can't turn the exit relay into a proxy into loopback / RFC1918 / the
         // cloud-metadata service (IP literals resolve locally, so this is network-free).
-        let prod = ExitPolicy { allow_loopback: false, offer_exit: true };
+        let prod = ExitPolicy {
+            allow_loopback: false,
+            offer_exit: true,
+        };
         for t in [
             "127.0.0.1:443",               // loopback
             "10.0.0.5:443",                // RFC1918
@@ -690,14 +753,23 @@ mod tests {
             );
         }
         // The reduced-harm port policy applies even to a public IP.
-        assert!(resolve_safe_dest("1.1.1.1:25", &prod).await.is_err(), "SMTP refused");
-        assert!(resolve_safe_dest("1.1.1.1:22", &prod).await.is_err(), "SSH refused");
+        assert!(
+            resolve_safe_dest("1.1.1.1:25", &prod).await.is_err(),
+            "SMTP refused"
+        );
+        assert!(
+            resolve_safe_dest("1.1.1.1:22", &prod).await.is_err(),
+            "SSH refused"
+        );
         // A missing/garbage port errors rather than panics.
         assert!(resolve_safe_dest("1.1.1.1", &prod).await.is_err());
         // A public target on an allowed port resolves to a concrete address to dial.
         assert!(resolve_safe_dest("1.1.1.1:443", &prod).await.is_ok());
         // Loopback is permitted only when explicitly opted in (local dev/test).
-        let dev = ExitPolicy { allow_loopback: true, offer_exit: true };
+        let dev = ExitPolicy {
+            allow_loopback: true,
+            offer_exit: true,
+        };
         assert!(resolve_safe_dest("127.0.0.1:443", &dev).await.is_ok());
         assert!(
             resolve_safe_dest("10.0.0.5:443", &dev).await.is_err(),

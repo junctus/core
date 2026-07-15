@@ -76,12 +76,12 @@ fn pick_committee(relays: &[&PeerRecord]) -> Result<Committee, NeoTunnelError> {
         idx.swap(i, j);
     }
 
-    let lead_pos = idx
-        .iter()
-        .position(|&i| relays[i].exit)
-        .ok_or_else(|| NeoTunnelError::Discovery {
-            detail: "no exit-capable relay to lead the committee".to_string(),
-        })?;
+    let lead_pos =
+        idx.iter()
+            .position(|&i| relays[i].exit)
+            .ok_or_else(|| NeoTunnelError::Discovery {
+                detail: "no exit-capable relay to lead the committee".to_string(),
+            })?;
     let lead_i = idx.remove(lead_pos);
     let follower_i = idx.remove(0);
     // A separate path hop for each member, so the two circuits are node-disjoint — no
@@ -259,9 +259,18 @@ mod tests {
         let c = pick_committee(&ok_refs).expect("valid committee");
         assert_eq!(c.lead_path.len(), 1);
         assert_eq!(c.follower_path.len(), 1);
-        let ids = [c.lead.id, c.follower.id, c.lead_path[0].id, c.follower_path[0].id];
+        let ids = [
+            c.lead.id,
+            c.follower.id,
+            c.lead_path[0].id,
+            c.follower_path[0].id,
+        ];
         let distinct: std::collections::HashSet<_> = ids.iter().collect();
-        assert_eq!(distinct.len(), 4, "lead, follower, and both path hops must be distinct");
+        assert_eq!(
+            distinct.len(),
+            4,
+            "lead, follower, and both path hops must be distinct"
+        );
         let lead_is_exit = ok.iter().any(|r| r.id == c.lead.id && r.exit);
         assert!(lead_is_exit, "the lead must be an exit-capable relay");
     }

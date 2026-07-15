@@ -110,26 +110,33 @@ pub fn run(
 /// client. Never reconstructs the plaintext.
 fn member(role: Party, party_addr: String, client_addr: String) -> anyhow::Result<()> {
     let lead = role == Party::A;
-    let tag = if lead { "lead (member A)" } else { "follower (member B)" };
+    let tag = if lead {
+        "lead (member A)"
+    } else {
+        "follower (member B)"
+    };
 
     // Member↔member party channel: the lead binds and the follower dials it, so the 2PC
     // channel exists before any client is served.
     let party_sock = if lead {
         println!("neo committee2pc — {tag}. Binding party channel {party_addr}, waiting for the follower…");
-        let l = TcpListener::bind(&party_addr).with_context(|| format!("bind party {party_addr}"))?;
+        let l =
+            TcpListener::bind(&party_addr).with_context(|| format!("bind party {party_addr}"))?;
         let (s, peer) = l.accept().context("accept follower")?;
         println!("  follower connected from {peer}");
         s
     } else {
         println!("neo committee2pc — {tag}. Connecting to the lead's party channel {party_addr}…");
-        let s = TcpStream::connect(&party_addr).with_context(|| format!("connect party {party_addr}"))?;
+        let s = TcpStream::connect(&party_addr)
+            .with_context(|| format!("connect party {party_addr}"))?;
         println!("  connected to lead");
         s
     };
 
     // Accept one client.
     println!("  binding client endpoint {client_addr}, waiting for a client…");
-    let cl = TcpListener::bind(&client_addr).with_context(|| format!("bind client {client_addr}"))?;
+    let cl =
+        TcpListener::bind(&client_addr).with_context(|| format!("bind client {client_addr}"))?;
     // Do not print the client's source address: co-locating it with `dest` (below) on one
     // member's stdout would materialise a client↔destination correlation. The member sees
     // the socket regardless (direct-connect demo), but it must not be logged next to dest.
@@ -139,7 +146,10 @@ fn member(role: Party, party_addr: String, client_addr: String) -> anyhow::Resul
     // The client tells us the destination + this member's request share.
     let dest = String::from_utf8(recv_frame(&mut client)?).context("dest not utf-8")?;
     let request_share = recv_frame(&mut client)?;
-    println!("  serving committee 2PC-TLS to {dest} ({} req-share bytes)", request_share.len());
+    println!(
+        "  serving committee 2PC-TLS to {dest} ({} req-share bytes)",
+        request_share.len()
+    );
 
     // The lead dials the destination; the follower has no server socket.
     let mut server = if lead {
@@ -165,7 +175,10 @@ fn member(role: Party, party_addr: String, client_addr: String) -> anyhow::Resul
         &LeafKeyVerifier,
     )
     .map_err(|e| anyhow!("committee handshake: {e}"))?;
-    println!("  ✓ joint TLS 1.3 handshake to {dest} in {:?} — no member holds the session key", t.elapsed());
+    println!(
+        "  ✓ joint TLS 1.3 handshake to {dest} in {:?} — no member holds the session key",
+        t.elapsed()
+    );
 
     // Seal this member's request share under 2PC; the lead writes the record to the server.
     committee_send_app(
@@ -186,7 +199,10 @@ fn member(role: Party, party_addr: String, client_addr: String) -> anyhow::Resul
 
     // Hand our share to the client (never combined here).
     send_frame(&mut client, &resp_share)?;
-    println!("  ✓ returned {}-byte response share to the client (plaintext never reconstructed here)", resp_share.len());
+    println!(
+        "  ✓ returned {}-byte response share to the client (plaintext never reconstructed here)",
+        resp_share.len()
+    );
     Ok(())
 }
 
@@ -210,21 +226,30 @@ fn client(
     let share_b: Vec<u8> = req.iter().zip(&share_a).map(|(r, a)| r ^ a).collect();
 
     println!("neo committee2pc — client. Committee 2PC-TLS fetch of {dest} via lead {lead_addr} + follower {follower_addr}");
-    let mut a = TcpStream::connect(&lead_addr).with_context(|| format!("connect lead {lead_addr}"))?;
-    let mut b = TcpStream::connect(&follower_addr).with_context(|| format!("connect follower {follower_addr}"))?;
+    let mut a =
+        TcpStream::connect(&lead_addr).with_context(|| format!("connect lead {lead_addr}"))?;
+    let mut b = TcpStream::connect(&follower_addr)
+        .with_context(|| format!("connect follower {follower_addr}"))?;
 
     // Each member: (destination, its request share).
     send_frame(&mut a, dest.as_bytes())?;
     send_frame(&mut a, &share_a)?;
     send_frame(&mut b, dest.as_bytes())?;
     send_frame(&mut b, &share_b)?;
-    println!("  sent XOR-shared request ({} bytes) to both members", req.len());
+    println!(
+        "  sent XOR-shared request ({} bytes) to both members",
+        req.len()
+    );
 
     // Collect the two response shares and XOR → plaintext.
     let resp_a = recv_frame(&mut a)?;
     let resp_b = recv_frame(&mut b)?;
     if resp_a.len() != resp_b.len() {
-        bail!("committee2pc: response shares differ in length ({} vs {})", resp_a.len(), resp_b.len());
+        bail!(
+            "committee2pc: response shares differ in length ({} vs {})",
+            resp_a.len(),
+            resp_b.len()
+        );
     }
     let mut inner: Vec<u8> = resp_a.iter().zip(&resp_b).map(|(x, y)| x ^ y).collect();
     // Strip TLS 1.3 inner padding + the trailing content_type byte.
@@ -235,7 +260,10 @@ fn client(
 
     let text = String::from_utf8_lossy(&inner);
     let status = text.lines().next().unwrap_or("(no status line)");
-    println!("  ✓ reconstructed {}-byte response from the two members' shares", inner.len());
+    println!(
+        "  ✓ reconstructed {}-byte response from the two members' shares",
+        inner.len()
+    );
     println!("  server responded: {status}");
     println!("\n✓ committee 2PC-TLS fetch complete — neither member saw the request body or the response.");
     Ok(())

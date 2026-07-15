@@ -274,7 +274,12 @@ impl KosReceiverSetup {
         }
         ch.send(&e_bytes)?; // [send2]
 
-        Ok(Self { seed0, seed1, batch: 0, row_offset: 0 })
+        Ok(Self {
+            seed0,
+            seed1,
+            batch: 0,
+            row_offset: 0,
+        })
     }
 
     /// One extension batch over the persistent base OTs: transfers `choices.len()` OTs,
@@ -306,13 +311,25 @@ impl KosReceiverSetup {
         r.extend(random_bits(K + SIGMA)?);
 
         // t0/t1 columns for THIS batch (domain-separated by `batch`).
-        let t0: Vec<Vec<u8>> = self.seed0.iter().map(|s| prg_batch(s, batch, col_bytes)).collect();
-        let t1: Vec<Vec<u8>> = self.seed1.iter().map(|s| prg_batch(s, batch, col_bytes)).collect();
+        let t0: Vec<Vec<u8>> = self
+            .seed0
+            .iter()
+            .map(|s| prg_batch(s, batch, col_bytes))
+            .collect();
+        let t1: Vec<Vec<u8>> = self
+            .seed1
+            .iter()
+            .map(|s| prg_batch(s, batch, col_bytes))
+            .collect();
 
         // uⱼ = t0ⱼ ⊕ t1ⱼ ⊕ r; send all columns.
         let r_bytes = bits_to_bytes(&r);
         let u: Vec<Vec<u8>> = (0..K)
-            .map(|j| (0..col_bytes).map(|b| t0[j][b] ^ t1[j][b] ^ r_bytes[b]).collect())
+            .map(|j| {
+                (0..col_bytes)
+                    .map(|b| t0[j][b] ^ t1[j][b] ^ r_bytes[b])
+                    .collect()
+            })
             .collect();
         let mut u_flat = Vec::with_capacity(K * col_bytes);
         for col in &u {
@@ -437,7 +454,14 @@ impl KosSenderSetup {
         }
         let s_bytes = bits_to_bytes16(&s);
         let s_field = u128::from_be_bytes(s_bytes);
-        Ok(Self { s, s_bytes, s_field, qseed, batch: 0, row_offset: 0 })
+        Ok(Self {
+            s,
+            s_bytes,
+            s_field,
+            qseed,
+            batch: 0,
+            row_offset: 0,
+        })
     }
 
     /// One extension batch over the persistent base OTs: masks `messages.len()` OT pairs and,
@@ -462,7 +486,9 @@ impl KosSenderSetup {
         let q: Vec<Vec<u8>> = (0..K)
             .map(|j| {
                 let base = prg_batch(&self.qseed[j], batch, col_bytes);
-                (0..col_bytes).map(|b| base[b] ^ if self.s[j] { u[j][b] } else { 0 }).collect()
+                (0..col_bytes)
+                    .map(|b| base[b] ^ if self.s[j] { u[j][b] } else { 0 })
+                    .collect()
             })
             .collect();
 
@@ -687,7 +713,7 @@ mod tests {
                 // Flip one row across K/2 columns of `u` — a 64-bit selective-failure attempt.
                 let cheat = move |u: &mut [u8]| {
                     for j in 0..K / 2 {
-                        u[j * col_bytes + 3 / 8] ^= 1 << (3 % 8);
+                        u[j * col_bytes] ^= 1 << 3;
                     }
                 };
                 recv_results.push(setup.extend_receiver_core(&mut ch, choices, cheat));
@@ -717,7 +743,11 @@ mod tests {
             send.unwrap_or_else(|e| panic!("batch {k} sender aborted: {e:?}"));
             let out = recv.expect("receiver");
             for i in 0..choices.len() {
-                let want = if choices[i] { messages[i].1 } else { messages[i].0 };
+                let want = if choices[i] {
+                    messages[i].1
+                } else {
+                    messages[i].0
+                };
                 assert_eq!(out[i], want, "batch {k} OT {i}");
             }
         }
@@ -730,13 +760,20 @@ mod tests {
         // in both. (The wire pads differ batch-to-batch — prg_batch — but that is internal.)
         let choices: Vec<bool> = (0..80).map(|i| i % 4 == 1).collect();
         let messages: Vec<_> = (0..80).map(|i| msg(i as u8)).collect();
-        let batches = vec![(choices.clone(), messages.clone()), (choices.clone(), messages.clone())];
+        let batches = vec![
+            (choices.clone(), messages.clone()),
+            (choices.clone(), messages.clone()),
+        ];
         let results = run_amortized_batches(batches, None);
         for (k, (send, recv)) in results.into_iter().enumerate() {
             send.unwrap_or_else(|e| panic!("batch {k} sender aborted: {e:?}"));
             let out = recv.expect("receiver");
             for i in 0..choices.len() {
-                let want = if choices[i] { messages[i].1 } else { messages[i].0 };
+                let want = if choices[i] {
+                    messages[i].1
+                } else {
+                    messages[i].0
+                };
                 assert_eq!(out[i], want, "batch {k} OT {i}");
             }
         }
@@ -766,8 +803,16 @@ mod tests {
         // batches must produce independent streams (else amortized batches would share pads).
         let seed = [7u8; 16];
         assert_eq!(prg(&seed, 48), prg_batch(&seed, 0, 48), "batch 0 == prg");
-        assert_ne!(prg_batch(&seed, 0, 48), prg_batch(&seed, 1, 48), "batches differ");
-        assert_ne!(prg_batch(&seed, 1, 48), prg_batch(&seed, 2, 48), "batches differ");
+        assert_ne!(
+            prg_batch(&seed, 0, 48),
+            prg_batch(&seed, 1, 48),
+            "batches differ"
+        );
+        assert_ne!(
+            prg_batch(&seed, 1, 48),
+            prg_batch(&seed, 2, 48),
+            "batches differ"
+        );
     }
 
     #[test]
@@ -797,7 +842,11 @@ mod tests {
             );
             let out = recv.expect("receiver");
             for i in 0..m {
-                let want = if choices[i] { messages[i].1 } else { messages[i].0 };
+                let want = if choices[i] {
+                    messages[i].1
+                } else {
+                    messages[i].0
+                };
                 assert_eq!(out[i], want, "iter {iter} m={m} OT {i}");
             }
         }

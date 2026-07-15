@@ -170,9 +170,7 @@ pub(crate) async fn fetch_relays(
                                     return Ok(relays);
                                 }
                             }
-                            Err(e) => {
-                                last = format!("{mirror}: snapshot failed verification: {e}")
-                            }
+                            Err(e) => last = format!("{mirror}: snapshot failed verification: {e}"),
                         }
                     }
                     Err(e) => last = format!("{mirror}: malformed snapshot: {e}"),

@@ -691,7 +691,7 @@ mod tests {
             .map(|_| deal_triple(rand_bit().unwrap(), rand_bit().unwrap(), &d))
             .collect();
 
-        let out = eval_garbled(&circuit, &inputs, &triples, &d).unwrap();
+        let out = eval_garbled(circuit, &inputs, &triples, &d).unwrap();
         assert_eq!(
             out,
             circuit.eval(&bits),
@@ -702,7 +702,7 @@ mod tests {
         let mut bad = inputs.clone();
         bad[0].e.dg[0] ^= 1;
         assert!(
-            eval_garbled(&circuit, &bad, &triples, &d).is_err(),
+            eval_garbled(circuit, &bad, &triples, &d).is_err(),
             "a tampered wire must abort the real-circuit evaluation"
         );
     }

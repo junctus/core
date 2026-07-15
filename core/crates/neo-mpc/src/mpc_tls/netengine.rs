@@ -60,7 +60,8 @@ pub fn masked_eval(
 ) -> Result<Vec<bool>> {
     if circuit.input_bits != 768 || my_share.len() != 256 {
         return Err(Error::Crypto(
-            "netengine: expected a 768-wire [shareA|shareB|maskA] gadget with a 256-bit share".into(),
+            "netengine: expected a 768-wire [shareA|shareB|maskA] gadget with a 256-bit share"
+                .into(),
         ));
     }
     let ev: HashSet<usize> = (256..512).collect(); // shareB is the evaluator's

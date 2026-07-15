@@ -173,7 +173,9 @@ pub fn hmac_sha256_shared_net(
     let circuit = hmac_circuit(msg);
     let mut share = vec![false; 256];
     write_be_words(&mut share, key_share);
-    Ok(bytes_from_be_words(&masked_eval(ch, party, &circuit, &share)?))
+    Ok(bytes_from_be_words(&masked_eval(
+        ch, party, &circuit, &share,
+    )?))
 }
 
 /// Networked [`hkdf_extract_shared`]: `HKDF-Extract(public salt, shared IKM)` over `ch`.
@@ -187,7 +189,9 @@ pub fn hkdf_extract_shared_net(
     let circuit = hmac_pub_key_circuit(salt);
     let mut share = vec![false; 256];
     write_be_words(&mut share, ikm_share);
-    Ok(bytes_from_be_words(&masked_eval(ch, party, &circuit, &share)?))
+    Ok(bytes_from_be_words(&masked_eval(
+        ch, party, &circuit, &share,
+    )?))
 }
 
 /// Networked [`hkdf_expand_label_shared`]: `HKDF-Expand-Label(shared secret, public label,
@@ -243,14 +247,18 @@ pub fn prepare_key_net(
     write_be_words(&mut share, key_share);
 
     // ipad_state = compress(H0, K⊕ipad), then OPEN it (safe: one-way image of K).
-    let ipad_share = bytes_from_be_words(&masked_eval(ch, party, &key_state_circuit(0x36), &share)?);
+    let ipad_share =
+        bytes_from_be_words(&masked_eval(ch, party, &key_state_circuit(0x36), &share)?);
     let ipad_state = open_shared(ch, &ipad_share)?;
 
     // opad_state = compress(H0, K⊕opad), kept SHARED.
     let opad_state_share =
         bytes_from_be_words(&masked_eval(ch, party, &key_state_circuit(0x5c), &share)?);
 
-    Ok(PreparedKey { ipad_state, opad_state_share })
+    Ok(PreparedKey {
+        ipad_state,
+        opad_state_share,
+    })
 }
 
 /// `HMAC-SHA256(K, msg)` for a [`PreparedKey`] and a **public** `msg`: the inner hash
@@ -358,7 +366,11 @@ fn hmac_circuit(msg: &[u8]) -> Circuit {
 fn key_state_circuit(pad: u8) -> Circuit {
     let mut b = Builder::new(768);
     let key: Vec<Vec<usize>> = (0..8)
-        .map(|w| (0..32).map(|j| b.xor(w * 32 + j, 256 + w * 32 + j)).collect())
+        .map(|w| {
+            (0..32)
+                .map(|j| b.xor(w * 32 + j, 256 + w * 32 + j))
+                .collect()
+        })
         .collect();
     let h0: Vec<Vec<usize>> = H0.iter().map(|&h| b.word_const(h)).collect();
     let pad_block = key_pad_block(&mut b, &key, pad);
@@ -379,13 +391,18 @@ fn key_state_circuit(pad: u8) -> Circuit {
 fn outer_from_opad_circuit(inner: &[u8; 32]) -> Circuit {
     let mut b = Builder::new(768);
     let state: Vec<Vec<usize>> = (0..8)
-        .map(|w| (0..32).map(|j| b.xor(w * 32 + j, 256 + w * 32 + j)).collect())
+        .map(|w| {
+            (0..32)
+                .map(|j| b.xor(w * 32 + j, 256 + w * 32 + j))
+                .collect()
+        })
         .collect();
     // Final block = inner digest (public) ‖ 0x80 ‖ 0-pad ‖ bit length (64+32)*8 = 768.
     let mut inner_block = [0u8; 64];
     inner_block[..32].copy_from_slice(inner);
-    let mut final_block: Vec<Vec<usize>> =
-        (0..8).map(|w| b.word_const(be_word(&inner_block, w))).collect();
+    let mut final_block: Vec<Vec<usize>> = (0..8)
+        .map(|w| b.word_const(be_word(&inner_block, w)))
+        .collect();
     final_block.push(b.word_const(0x8000_0000));
     for _ in 9..15 {
         final_block.push(b.word_const(0));
@@ -414,14 +431,22 @@ fn hmac_pub_key_circuit(key: &[u8; 32]) -> Circuit {
     let opad_state = hmac_key_state(key, 0x5c);
     let state_words = |s: &[u8; 32], b: &mut Builder| -> Vec<Vec<usize>> {
         (0..8)
-            .map(|w| b.word_const(u32::from_be_bytes(s[w * 4..w * 4 + 4].try_into().expect("4"))))
+            .map(|w| {
+                b.word_const(u32::from_be_bytes(
+                    s[w * 4..w * 4 + 4].try_into().expect("4"),
+                ))
+            })
             .collect()
     };
 
     let mut b = Builder::new(768);
     // msg = msgA ⊕ msgB, 8 big-endian 32-bit words (one SHA-256 block of shared data).
     let msg: Vec<Vec<usize>> = (0..8)
-        .map(|w| (0..32).map(|j| b.xor(w * 32 + j, 256 + w * 32 + j)).collect())
+        .map(|w| {
+            (0..32)
+                .map(|j| b.xor(w * 32 + j, 256 + w * 32 + j))
+                .collect()
+        })
         .collect();
 
     // Inner: compress(ipad_state, msg ‖ pad) — ipad_state precomputed (public key).
@@ -651,7 +676,8 @@ mod tests {
         use std::net::{TcpListener, TcpStream};
         use std::thread;
 
-        let secret_a: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(5).wrapping_add(2));
+        let secret_a: [u8; 32] =
+            core::array::from_fn(|i| (i as u8).wrapping_mul(5).wrapping_add(2));
         let secret_b: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(9) ^ 0x3c);
         let secret = combine(&secret_a, &secret_b);
         let cases: Vec<(Vec<u8>, Vec<u8>, u16)> = vec![
@@ -670,7 +696,9 @@ mod tests {
             let pk = prepare_key_net(&mut ch, Party::A, &secret_a).unwrap();
             cases_a
                 .iter()
-                .map(|(l, c, n)| expand_label_prepared_net(&mut ch, Party::A, &pk, l, c, *n).unwrap())
+                .map(|(l, c, n)| {
+                    expand_label_prepared_net(&mut ch, Party::A, &pk, l, c, *n).unwrap()
+                })
                 .collect::<Vec<_>>()
         });
         let mut ch = TcpChannel::from_stream(TcpStream::connect(addr).unwrap());

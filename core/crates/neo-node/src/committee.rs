@@ -180,8 +180,12 @@ impl CommitteeChunk {
         share: &KeyShare,
         chunk_index: u32,
     ) -> Result<()> {
-        self.sealed_partials
-            .push(seal_partial(return_secret, share, &self.ciphertext, chunk_index)?);
+        self.sealed_partials.push(seal_partial(
+            return_secret,
+            share,
+            &self.ciphertext,
+            chunk_index,
+        )?);
         Ok(())
     }
 }
@@ -1073,10 +1077,17 @@ mod tests {
         let ct1 = threshold::encrypt(&c, b"chunk-one!").unwrap();
         let s0 = seal_partial(&secret(7), &shares[0], &ct0, 0).unwrap();
         let s1 = seal_partial(&secret(7), &shares[0], &ct1, 1).unwrap();
-        let p0 = threshold::partial_decrypt(&shares[0], &ct0).unwrap().to_bytes();
-        let p1 = threshold::partial_decrypt(&shares[0], &ct1).unwrap().to_bytes();
-        let sealed_xor: Vec<u8> =
-            s0[..PARTIAL_LEN].iter().zip(&s1[..PARTIAL_LEN]).map(|(a, b)| a ^ b).collect();
+        let p0 = threshold::partial_decrypt(&shares[0], &ct0)
+            .unwrap()
+            .to_bytes();
+        let p1 = threshold::partial_decrypt(&shares[0], &ct1)
+            .unwrap()
+            .to_bytes();
+        let sealed_xor: Vec<u8> = s0[..PARTIAL_LEN]
+            .iter()
+            .zip(&s1[..PARTIAL_LEN])
+            .map(|(a, b)| a ^ b)
+            .collect();
         let partial_xor: Vec<u8> = p0.iter().zip(p1.iter()).map(|(a, b)| a ^ b).collect();
         assert_ne!(
             sealed_xor, partial_xor,

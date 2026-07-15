@@ -259,7 +259,11 @@ impl Garbler {
 
     /// The output decoding (colour of each output wire's zero-label).
     pub fn decoding(&self, circuit: &Circuit) -> Vec<bool> {
-        circuit.outputs.iter().map(|&o| color(&self.zero[o])).collect()
+        circuit
+            .outputs
+            .iter()
+            .map(|&o| color(&self.zero[o]))
+            .collect()
     }
 }
 
@@ -409,7 +413,11 @@ mod tests {
             let x: Label = core::array::from_fn(|i| seed.wrapping_mul(31).wrapping_add(i as u8));
             assert_eq!(inv_sigma(&sigma(&x)), x, "σ⁻¹∘σ = id");
             // σ(x) ⊕ x is a permutation ⇒ injective on this sample (no collisions with x).
-            assert_ne!(sigma(&x), x, "σ has no fixed points on nonzero input mixing");
+            assert_ne!(
+                sigma(&x),
+                x,
+                "σ has no fixed points on nonzero input mixing"
+            );
         }
     }
 
@@ -420,7 +428,8 @@ mod tests {
         // full-suite circuit tests only prove garbler≡evaluator, not that the construction is
         // the intended one.
         for tweak in [0u64, 1, 2, 42, 0xdead_beef, u64::MAX] {
-            let x: Label = core::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(tweak as u8));
+            let x: Label =
+                core::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(tweak as u8));
             let got = tccr_hash(&tccr_cipher(tweak), &x);
 
             let s = sigma(&x);
@@ -439,10 +448,22 @@ mod tests {
     #[test]
     fn tccr_hash_is_deterministic_and_tweak_sensitive() {
         let x: Label = *b"a-128-bit-label!";
-        assert_eq!(tccr_hash(&tccr_cipher(5), &x), tccr_hash(&tccr_cipher(5), &x), "deterministic");
-        assert_ne!(tccr_hash(&tccr_cipher(5), &x), tccr_hash(&tccr_cipher(6), &x), "tweak-sensitive");
+        assert_eq!(
+            tccr_hash(&tccr_cipher(5), &x),
+            tccr_hash(&tccr_cipher(5), &x),
+            "deterministic"
+        );
+        assert_ne!(
+            tccr_hash(&tccr_cipher(5), &x),
+            tccr_hash(&tccr_cipher(6), &x),
+            "tweak-sensitive"
+        );
         let y: Label = *b"b-128-bit-label!";
-        assert_ne!(tccr_hash(&tccr_cipher(5), &x), tccr_hash(&tccr_cipher(5), &y), "input-sensitive");
+        assert_ne!(
+            tccr_hash(&tccr_cipher(5), &x),
+            tccr_hash(&tccr_cipher(5), &y),
+            "input-sensitive"
+        );
     }
 
     fn gate_circuit(kind: u8) -> Circuit {

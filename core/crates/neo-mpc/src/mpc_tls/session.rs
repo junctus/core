@@ -140,7 +140,7 @@ pub fn share_keystream_engine(
     inputs[640..1152].copy_from_slice(&mask_bits);
 
     let evaluator_wires: HashSet<usize> = (256..512).collect(); // keyB
-    let out_bits = eval_circuit(engine, &circuit, &evaluator_wires, &inputs)?; // = KS ⊕ maskA
+    let out_bits = eval_circuit(engine, circuit, &evaluator_wires, &inputs)?; // = KS ⊕ maskA
 
     Ok(KeystreamShares {
         share_a: chacha20_output_bytes(&mask_bits), // maskA
@@ -320,13 +320,13 @@ pub fn share_keystream_net(
                 write_word_bits(&mut g[544 + k * 32..544 + k * 32 + 32], w);
             }
             g[640..1152].copy_from_slice(&mask_bits);
-            garbler_run(ch, &circuit, &ev, &g)?;
+            garbler_run(ch, circuit, &ev, &g)?;
             Ok(chacha20_output_bytes(&mask_bits)) // share_a = maskA
         }
         Party::B => {
             let mut e = vec![false; 1152];
             write_key_bits(&mut e[256..512], key_share);
-            let out = evaluator_run(ch, &circuit, &ev, &e)?; // KS ⊕ maskA
+            let out = evaluator_run(ch, circuit, &ev, &e)?; // KS ⊕ maskA
             Ok(chacha20_output_bytes(&out))
         }
     }
@@ -421,7 +421,8 @@ pub fn open_aead_net(
     let blocks = poly_message_blocks(aad, ciphertext);
     let tag_share = poly1305::tag_shared_multi_net(ch, party, &poly_share, &blocks)?;
     let computed = open_shared_bytes(ch, &tag_share)?;
-    let tag_ok = computed.len() == 16 && computed.iter().zip(tag).fold(0u8, |d, (a, b)| d | (a ^ b)) == 0;
+    let tag_ok =
+        computed.len() == 16 && computed.iter().zip(tag).fold(0u8, |d, (a, b)| d | (a ^ b)) == 0;
 
     // Decrypt: pt = C ⊕ KS. Party A carries the public ciphertext in its share, B carries 0,
     // so pt_a ⊕ pt_b = C ⊕ ks_a ⊕ ks_b = C ⊕ KS.
@@ -623,7 +624,9 @@ mod tests {
         let nonce = [0x24u8; 12];
         let aad = b"neo-2pc-tls record header".as_slice();
         // Multi-block, non-64-aligned plaintext.
-        let plaintext: Vec<u8> = (0..100u8).map(|i| i.wrapping_mul(3).wrapping_add(1)).collect();
+        let plaintext: Vec<u8> = (0..100u8)
+            .map(|i| i.wrapping_mul(3).wrapping_add(1))
+            .collect();
         let pt_a: Vec<u8> = plaintext.iter().map(|&b| b ^ 0xa5).collect();
         let pt_b: Vec<u8> = plaintext.iter().zip(&pt_a).map(|(p, a)| p ^ a).collect();
 
@@ -645,10 +648,24 @@ mod tests {
         // Stock reference.
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
         let sealed = cipher
-            .encrypt(Nonce::from_slice(&nonce), Payload { msg: &plaintext, aad })
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &plaintext,
+                    aad,
+                },
+            )
             .unwrap();
-        assert_eq!(&ct[..], &sealed[..sealed.len() - 16], "networked ciphertext == stock");
-        assert_eq!(&tag[..], &sealed[sealed.len() - 16..], "networked tag == stock");
+        assert_eq!(
+            &ct[..],
+            &sealed[..sealed.len() - 16],
+            "networked ciphertext == stock"
+        );
+        assert_eq!(
+            &tag[..],
+            &sealed[sealed.len() - 16..],
+            "networked tag == stock"
+        );
 
         // --- networked open ---
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -660,11 +677,15 @@ mod tests {
             open_aead_net(&mut ch, Party::A, &ka, &na, &aad_a, &ct_a2, &tag2).unwrap()
         });
         let mut ch = TcpChannel::from_stream(TcpStream::connect(addr).unwrap());
-        let (pts_b, ok_b) = open_aead_net(&mut ch, Party::B, &key_b, &nonce, aad, &ct, &tag).unwrap();
+        let (pts_b, ok_b) =
+            open_aead_net(&mut ch, Party::B, &key_b, &nonce, aad, &ct, &tag).unwrap();
         let (pts_a, ok_a) = a.join().unwrap();
         assert!(ok_a && ok_b, "tag verified on both parties");
         let recovered: Vec<u8> = pts_a.iter().zip(&pts_b).map(|(a, b)| a ^ b).collect();
-        assert_eq!(recovered, plaintext, "networked open recovers the plaintext from shares");
+        assert_eq!(
+            recovered, plaintext,
+            "networked open recovers the plaintext from shares"
+        );
 
         // A tampered tag must fail verification.
         let mut bad = tag;
@@ -714,7 +735,8 @@ mod tests {
             seal_tls13_record_net(&mut ch, Party::A, &ka, &ivx, seq, ctype, &pta).unwrap()
         });
         let mut ch = TcpChannel::from_stream(TcpStream::connect(addr).unwrap());
-        let record = seal_tls13_record_net(&mut ch, Party::B, &key_b, &iv, seq, ctype, &pt_b).unwrap();
+        let record =
+            seal_tls13_record_net(&mut ch, Party::B, &key_b, &iv, seq, ctype, &pt_b).unwrap();
         let record_a = a.join().unwrap();
         assert_eq!(record, record_a, "both parties emit the same wire record");
 
@@ -723,7 +745,13 @@ mod tests {
         let header = &record[..5];
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
         let inner = cipher
-            .decrypt(Nonce::from_slice(&nonce), Payload { msg: &record[5..], aad: header })
+            .decrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &record[5..],
+                    aad: header,
+                },
+            )
             .expect("stock decrypts the networked record");
         assert_eq!(&inner[..content.len()], &content[..], "content");
         assert_eq!(inner[content.len()], ctype, "content_type");
@@ -738,12 +766,21 @@ mod tests {
             open_tls13_record_net(&mut ch, Party::A, &ka, &ivx, seq, &recx).unwrap()
         });
         let mut ch = TcpChannel::from_stream(TcpStream::connect(addr).unwrap());
-        let (inner_b, ok_b) = open_tls13_record_net(&mut ch, Party::B, &key_b, &iv, seq, &record).unwrap();
+        let (inner_b, ok_b) =
+            open_tls13_record_net(&mut ch, Party::B, &key_b, &iv, seq, &record).unwrap();
         let (inner_a, ok_a) = a.join().unwrap();
         assert!(ok_a && ok_b, "tag verified");
         let recovered: Vec<u8> = inner_a.iter().zip(&inner_b).map(|(a, b)| a ^ b).collect();
-        assert_eq!(&recovered[..content.len()], &content[..], "networked open recovers content");
-        assert_eq!(recovered[content.len()], ctype, "networked open recovers content_type");
+        assert_eq!(
+            &recovered[..content.len()],
+            &content[..],
+            "networked open recovers content"
+        );
+        assert_eq!(
+            recovered[content.len()],
+            ctype,
+            "networked open recovers content_type"
+        );
     }
 
     #[test]

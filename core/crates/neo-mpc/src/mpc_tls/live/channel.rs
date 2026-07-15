@@ -88,7 +88,11 @@ pub struct AmortizingChannel<'a> {
 
 impl<'a> AmortizingChannel<'a> {
     pub fn new(inner: &'a mut dyn Channel) -> Self {
-        Self { inner, sender: None, receiver: None }
+        Self {
+            inner,
+            sender: None,
+            receiver: None,
+        }
     }
 }
 
