@@ -1379,6 +1379,32 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "live-tls-webpki")]
+    #[ignore] // ~15s release: full handshake up to the (rejected) cert check
+    fn webpki_rejects_cert_not_chaining_to_the_trusted_root() {
+        // Enforcement proof: trust a *different* self-signed cert as the only anchor; the server
+        // presents its own, which does not chain to that anchor, so webpki must REJECT it —
+        // where the leaf-only `LeafKeyVerifier` (no chain-building) would have accepted it.
+        use super::super::verify::WebpkiVerifier;
+        let (addr, _server_cert) = spawn_rustls_echo_server_cert();
+        let other = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let verifier =
+            WebpkiVerifier::with_roots(&[other.cert.der().to_vec()]).expect("build verifier");
+        let mut ch = TcpChannel::connect(addr).unwrap();
+        let err =
+            match client_handshake_verified(&mut ch, "localhost", EngineKind::Semihonest, &verifier)
+            {
+                Ok(_) => panic!("a cert that does not chain to the trusted anchor must be rejected"),
+                Err(e) => e,
+            };
+        let msg = format!("{err}").to_lowercase();
+        assert!(
+            msg.contains("cert") || msg.contains("chain"),
+            "expected a certificate-validation failure, got: {err}"
+        );
+    }
+
+    #[test]
     fn committee_handshake_against_rustls_and_echo() {
         // The committee-model end-to-end proof: TWO exit-committee members, each holding only
         // its own ECDHE scalar share, jointly complete a real TLS 1.3 handshake against a
