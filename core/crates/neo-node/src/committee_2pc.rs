@@ -16,12 +16,16 @@
 //! selection) wraps it.
 
 use std::net::TcpStream as StdTcpStream;
+use std::sync::{Arc, Mutex};
 
 use neo_core::{Error, Result};
+use neo_crypto::Session;
 use p256::elliptic_curve::rand_core::OsRng;
 use p256::{NonZeroScalar, Scalar};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 
+use crate::run::{read_frame, write_frame};
 use neo_mpc::mpc_tls::live::channel::{AmortizingChannel, Channel, TcpChannel};
 use neo_mpc::mpc_tls::live::handshake::{
     committee_handshake_net, committee_recv_app, committee_send_app,
@@ -62,8 +66,9 @@ pub struct Committee2pcPayload {
     /// Rendezvous token — identical in both members' payloads, so the follower's link matches
     /// the lead's pending flow.
     pub token: [u8; 16],
-    /// The partner member's node id (to resolve its address and dial the coordination link).
-    pub partner: [u8; 32],
+    /// The **lead's** relay address `host:port` — the follower dials it (with [`LINK_FRAME`] +
+    /// `token`) to establish the member↔member 2PC link. Empty in the lead's own payload.
+    pub lead_addr: String,
     /// The clearnet destination `host:port` (both members need it; the lead dials it).
     pub dest: String,
     /// This member's XOR-share of the request.
@@ -71,13 +76,16 @@ pub struct Committee2pcPayload {
 }
 
 impl Committee2pcPayload {
-    /// `MAGIC ‖ lead(1) ‖ token(16) ‖ partner(32) ‖ dest_len(u16) ‖ dest ‖ request_share`.
+    /// `MAGIC ‖ lead(1) ‖ token(16) ‖ lead_addr_len(u16) ‖ lead_addr ‖ dest_len(u16) ‖ dest ‖
+    /// request_share`.
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(52 + self.dest.len() + self.request_share.len());
+        let mut out =
+            Vec::with_capacity(22 + self.lead_addr.len() + self.dest.len() + self.request_share.len());
         out.push(COMMITTEE_2PC_MAGIC);
         out.push(self.lead as u8);
         out.extend_from_slice(&self.token);
-        out.extend_from_slice(&self.partner);
+        out.extend_from_slice(&(self.lead_addr.len() as u16).to_be_bytes());
+        out.extend_from_slice(self.lead_addr.as_bytes());
         out.extend_from_slice(&(self.dest.len() as u16).to_be_bytes());
         out.extend_from_slice(self.dest.as_bytes());
         out.extend_from_slice(&self.request_share);
@@ -91,23 +99,26 @@ impl Committee2pcPayload {
         if bytes.first() != Some(&COMMITTEE_2PC_MAGIC) {
             return Ok(None);
         }
-        let need = |n: usize| -> Result<()> {
-            if bytes.len() < n {
-                Err(Error::Decode("committee2pc: truncated payload".into()))
-            } else {
-                Ok(())
+        let mut cur = &bytes[1..];
+        let take = |cur: &mut &[u8], n: usize| -> Result<Vec<u8>> {
+            if cur.len() < n {
+                return Err(Error::Decode("committee2pc: truncated payload".into()));
             }
+            let (h, t) = cur.split_at(n);
+            *cur = t;
+            Ok(h.to_vec())
         };
-        need(52)?;
-        let lead = bytes[1] != 0;
-        let token: [u8; 16] = bytes[2..18].try_into().expect("16");
-        let partner: [u8; 32] = bytes[18..50].try_into().expect("32");
-        let dest_len = u16::from_be_bytes([bytes[50], bytes[51]]) as usize;
-        need(52 + dest_len)?;
-        let dest = String::from_utf8(bytes[52..52 + dest_len].to_vec())
-            .map_err(|_| Error::Decode("committee2pc: dest not utf-8".into()))?;
-        let request_share = bytes[52 + dest_len..].to_vec();
-        Ok(Some(Self { lead, token, partner, dest, request_share }))
+        let take_str = |cur: &mut &[u8]| -> Result<String> {
+            let len = u16::from_be_bytes(take(cur, 2)?.try_into().expect("2")) as usize;
+            String::from_utf8(take(cur, len)?)
+                .map_err(|_| Error::Decode("committee2pc: non-utf8 field".into()))
+        };
+        let lead = take(&mut cur, 1)?[0] != 0;
+        let token: [u8; 16] = take(&mut cur, 16)?.try_into().expect("16");
+        let lead_addr = take_str(&mut cur)?;
+        let dest = take_str(&mut cur)?;
+        let request_share = cur.to_vec();
+        Ok(Some(Self { lead, token, lead_addr, dest, request_share }))
     }
 }
 
@@ -120,13 +131,13 @@ impl Committee2pcPayload {
 /// **Blocking** — invoked under `spawn_blocking` by [`run_member`].
 fn member_2pc_blocking(
     role: Party,
-    party_std: StdTcpStream,
+    party_link: &mut dyn Channel,
     dest: &str,
     request_share: &[u8],
 ) -> Result<Vec<u8>> {
-    // Wrap the member link so the whole session shares one KOS base-OT setup.
-    let mut inner = TcpChannel::from_stream(party_std);
-    let mut party = AmortizingChannel::new(&mut inner);
+    // Wrap the (encrypted-session-bridged) member link so the whole session shares one KOS
+    // base-OT setup.
+    let mut party = AmortizingChannel::new(party_link);
 
     // The lead dials the destination; the follower has no server socket.
     let mut server = if role == Party::A {
@@ -164,24 +175,103 @@ fn member_2pc_blocking(
     .map_err(|e| Error::Crypto(format!("committee2pc recv: {e}")))
 }
 
-/// **Async bridge.** Run this member's 2PC-TLS session over the tokio member↔member link
-/// `party`, returning this member's XOR-share of the response. Converts `party` to a blocking
-/// socket and drives the sync 2PC on a blocking thread (the engine is `std::net`, blocking).
+/// A blocking neo-mpc [`Channel`] bridged over an authenticated neo [`Session`]: the sync 2PC
+/// engine `send`/`recv`s here; the async pump tasks in [`run_member`] seal/open each message
+/// and do the socket I/O. Crossing is via `tokio::sync::mpsc` (unbounded → no backpressure
+/// deadlock; each handshake's traffic is finite). `blocking_send`/`blocking_recv` are safe from
+/// the `spawn_blocking` thread.
+struct SessionChannel {
+    to_pump: mpsc::UnboundedSender<Vec<u8>>,
+    from_pump: mpsc::UnboundedReceiver<Vec<u8>>,
+    rx: Vec<u8>,
+}
+
+impl Channel for SessionChannel {
+    fn send(&mut self, buf: &[u8]) -> Result<()> {
+        self.to_pump
+            .send(buf.to_vec())
+            .map_err(|_| Error::Crypto("committee2pc: session pump closed (send)".into()))
+    }
+    fn recv(&mut self, buf: &mut [u8]) -> Result<usize> {
+        if self.rx.is_empty() {
+            match self.from_pump.blocking_recv() {
+                Some(bytes) => self.rx = bytes,
+                None => return Ok(0), // pump closed (EOF)
+            }
+        }
+        let n = buf.len().min(self.rx.len());
+        buf[..n].copy_from_slice(&self.rx[..n]);
+        self.rx.drain(..n);
+        Ok(n)
+    }
+}
+
+/// **Async/session bridge.** Run this member's 2PC-TLS session over the authenticated member↔
+/// member neo [`Session`] on `stream`, returning this member's XOR-share of the response. Two
+/// async pump tasks carry the 2PC over the encrypted session (read: `read_frame`→`open`→2PC;
+/// write: 2PC→`seal`→`write_frame`), sharing the `Session` via a `Mutex` locked only for the
+/// fast sync seal/open (I/O outside the lock → no cross-blocking). The sync 2PC engine runs on
+/// a `spawn_blocking` thread over a [`SessionChannel`]. The 2PC stays confidential + integrity-
+/// protected against the network (never raw on the wire).
 pub async fn run_member(
     role: Party,
-    party: TcpStream,
+    stream: TcpStream,
+    session: Session,
     dest: String,
     request_share: Vec<u8>,
 ) -> Result<Vec<u8>> {
-    let std_stream = party
-        .into_std()
-        .map_err(|e| Error::Config(format!("committee2pc: into_std: {e}")))?;
-    std_stream
-        .set_nonblocking(false)
-        .map_err(|e| Error::Config(format!("committee2pc: set blocking: {e}")))?;
-    tokio::task::spawn_blocking(move || member_2pc_blocking(role, std_stream, &dest, &request_share))
-        .await
-        .map_err(|e| Error::Config(format!("committee2pc: blocking task join: {e}")))?
+    let (mut rd, mut wr) = stream.into_split();
+    let session = Arc::new(Mutex::new(session));
+    let (to_pump_tx, mut to_pump_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (from_pump_tx, from_pump_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+    // Read: wire → open → 2PC.
+    let sess_r = session.clone();
+    let read_task = tokio::spawn(async move {
+        loop {
+            match read_frame(&mut rd).await {
+                Ok(frame) => {
+                    let opened = sess_r.lock().expect("session poisoned").open(&frame);
+                    match opened {
+                        Ok(pt) => {
+                            if from_pump_tx.send(pt).is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Write: 2PC → seal → wire.
+    let sess_w = session.clone();
+    let write_task = tokio::spawn(async move {
+        while let Some(pt) = to_pump_rx.recv().await {
+            let sealed = sess_w.lock().expect("session poisoned").seal(&pt);
+            match sealed {
+                Ok(s) => {
+                    if write_frame(&mut wr, &s).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let out = tokio::task::spawn_blocking(move || {
+        let mut ch = SessionChannel { to_pump: to_pump_tx, from_pump: from_pump_rx, rx: Vec::new() };
+        member_2pc_blocking(role, &mut ch, &dest, &request_share)
+    })
+    .await
+    .map_err(|e| Error::Config(format!("committee2pc: blocking task join: {e}")))?;
+
+    read_task.abort();
+    write_task.abort();
+    out
 }
 
 #[cfg(test)]
@@ -226,17 +316,17 @@ mod tests {
     #[test]
     fn payload_round_trips_and_magic_gates() {
         let p = Committee2pcPayload {
-            lead: true,
+            lead: false,
             token: [7u8; 16],
-            partner: [9u8; 32],
+            lead_addr: "10.0.0.1:443".into(),
             dest: "example.com:443".into(),
             request_share: b"a-random-request-share".to_vec(),
         };
         let enc = p.encode();
         let got = Committee2pcPayload::decode(&enc).unwrap().expect("is committee2pc");
-        assert!(got.lead);
+        assert!(!got.lead);
         assert_eq!(got.token, p.token);
-        assert_eq!(got.partner, p.partner);
+        assert_eq!(got.lead_addr, p.lead_addr);
         assert_eq!(got.dest, p.dest);
         assert_eq!(got.request_share, p.request_share);
         // A normal text exit target (e.g. "host:port" / "mux") is NOT a committee2pc payload.
