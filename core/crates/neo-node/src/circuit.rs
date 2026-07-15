@@ -290,6 +290,17 @@ pub async fn open_circuit(
     circuit: &[Hop],
     target: &str,
 ) -> Result<(CircuitSink, CircuitStream)> {
+    open_circuit_payload(identity, circuit, target.as_bytes()).await
+}
+
+/// Like [`open_circuit`] but the exit-only payload is arbitrary **bytes** (not a UTF-8
+/// target) — used by the committee-2PC client, whose exit payload is a binary
+/// `Committee2pcPayload`.
+pub async fn open_circuit_payload(
+    identity: &NodeIdentity,
+    circuit: &[Hop],
+    payload: &[u8],
+) -> Result<(CircuitSink, CircuitStream)> {
     if circuit.is_empty() {
         return Err(Error::Config("a circuit needs at least one hop".into()));
     }
@@ -300,9 +311,9 @@ pub async fn open_circuit(
             public: h.sphinx,
         })
         .collect();
-    // The setup packet routes to the exit and carries the target in its exit-only
-    // payload; create_packet_keyed hands us the per-hop secrets.
-    let (packet, secrets) = create_packet_keyed(&hops, target.as_bytes())?;
+    // The setup packet routes to the exit and carries the payload in its exit-only
+    // slot; create_packet_keyed hands us the per-hop secrets.
+    let (packet, secrets) = create_packet_keyed(&hops, payload)?;
 
     let (stream, result) = connect_verified(&circuit[0].addr, identity, &circuit[0].id).await?;
     let (mut sealer, opener) = result.session.split();

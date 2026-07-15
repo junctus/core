@@ -27,6 +27,8 @@ use p256::{NonZeroScalar, Scalar};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::circuit::open_circuit_payload;
+use crate::forward::Hop;
 use crate::run::{connect_verified, read_frame, write_frame};
 use neo_mpc::mpc_tls::live::channel::{AmortizingChannel, Channel, TcpChannel};
 use neo_mpc::mpc_tls::live::handshake::{
@@ -352,6 +354,77 @@ pub async fn handle_link(mut stream: TcpStream, mut session: Session) -> Result<
     };
     let _ = tx.send((stream, session));
     Ok(())
+}
+
+// ── Client ──
+
+/// Client: fetch `dest` through a **self-formed 2-member committee** (`lead` + `follower`,
+/// picked from the attested pool), anonymized via `path` (relays disjoint from the members —
+/// so no member ever sees the client). The request is XOR-shared across the two members (so
+/// neither sees it); one onion circuit is built to each member as its endpoint carrying that
+/// member's share; the response is reconstructed by XORing the two members' returned shares
+/// (with TLS inner padding + content-type stripped). No member ever holds the session key or
+/// plaintext.
+pub async fn committee_2pc_fetch(
+    identity: &NodeIdentity,
+    path: &[Hop],
+    lead: &Hop,
+    follower: &Hop,
+    dest: &str,
+    request: &[u8],
+) -> Result<Vec<u8>> {
+    let mut token = [0u8; 16];
+    getrandom::getrandom(&mut token).map_err(|e| Error::Rng(e.to_string()))?;
+    let mut share_a = vec![0u8; request.len()];
+    getrandom::getrandom(&mut share_a).map_err(|e| Error::Rng(e.to_string()))?;
+    let share_b: Vec<u8> = request.iter().zip(&share_a).map(|(r, a)| r ^ a).collect();
+
+    // One circuit per member; the member is the endpoint, path hops are the disjoint prefix.
+    let lead_circuit: Vec<Hop> = path.iter().cloned().chain(std::iter::once(lead.clone())).collect();
+    let follower_circuit: Vec<Hop> =
+        path.iter().cloned().chain(std::iter::once(follower.clone())).collect();
+
+    let lead_payload = Committee2pcPayload {
+        lead: true,
+        token,
+        lead_addr: String::new(),
+        lead_id: [0u8; 32],
+        dest: dest.to_string(),
+        request_share: share_a,
+    }
+    .encode();
+    let follower_payload = Committee2pcPayload {
+        lead: false,
+        token,
+        lead_addr: lead.addr.clone(),
+        lead_id: *lead.id.as_bytes(),
+        dest: dest.to_string(),
+        request_share: share_b,
+    }
+    .encode();
+
+    // Send both circuits concurrently; each member returns exactly one share cell.
+    let lead_fut = async {
+        let (_sink, mut stream) =
+            open_circuit_payload(identity, &lead_circuit, &lead_payload).await?;
+        stream.recv().await
+    };
+    let follower_fut = async {
+        let (_sink, mut stream) =
+            open_circuit_payload(identity, &follower_circuit, &follower_payload).await?;
+        stream.recv().await
+    };
+    let (resp_a, resp_b) = tokio::join!(lead_fut, follower_fut);
+    let (resp_a, resp_b) = (resp_a?, resp_b?);
+    if resp_a.len() != resp_b.len() {
+        return Err(Error::Crypto("committee2pc: response shares differ in length".into()));
+    }
+    let mut inner: Vec<u8> = resp_a.iter().zip(&resp_b).map(|(x, y)| x ^ y).collect();
+    while inner.last() == Some(&0) {
+        inner.pop(); // TLS 1.3 inner padding
+    }
+    inner.pop(); // content_type
+    Ok(inner)
 }
 
 #[cfg(test)]
