@@ -38,6 +38,8 @@ pub enum Served {
     Circuit,
     /// A committee-exit circuit hop, now handled.
     Committee,
+    /// A committee-2PC member↔member coordination link, now handed to the waiting lead.
+    CommitteeLink,
 }
 
 /// Read the connection-mode byte and dispatch to the message, circuit, or
@@ -80,6 +82,12 @@ pub async fn serve_connection<R: NextHop>(
             )
             .await?;
             Ok(Served::Committee)
+        }
+        [crate::committee_2pc::LINK_FRAME] => {
+            // A committee-2PC follower opening the authenticated member↔member 2PC link; hand
+            // the (stream, session) to the lead's waiting endpoint via the rendezvous.
+            crate::committee_2pc::handle_link(stream, session).await?;
+            Ok(Served::CommitteeLink)
         }
         other => Err(Error::Decode(format!(
             "unknown connection mode {other:?} (expected a single mode byte)"

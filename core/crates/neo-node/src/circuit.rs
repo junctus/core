@@ -376,6 +376,20 @@ pub async fn serve_circuit<R: NextHop>(
             .await
         }
         Processed::Deliver { payload } => {
+            // Committee-2PC endpoint: this node was selected into a self-forming exit committee
+            // for this flow. Run the joint 2PC over an authenticated link to the partner member
+            // (the lead egresses to the destination; the follower never sees plaintext) and
+            // return this member's XOR-share of the response via the circuit return path.
+            if let Some(cp) = crate::committee_2pc::Committee2pcPayload::decode(&payload)? {
+                if cp.lead && !policy.offer_exit {
+                    return Err(Error::Config(
+                        "committee2pc: lead node does not offer clearnet exit".into(),
+                    ));
+                }
+                let share = crate::committee_2pc::run_member_flow(cp, identity).await?;
+                let mut sink = ExitFrameSink::new(pw, pw_sealer, secret);
+                return sink.send_payload(&share).await;
+            }
             // Only a node that opted into exit may splice to the clearnet; a plain
             // relay that finds itself the terminal hop refuses rather than proxy.
             if !policy.offer_exit {
