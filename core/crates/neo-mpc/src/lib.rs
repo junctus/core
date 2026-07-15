@@ -42,6 +42,10 @@
 //! remains research.
 
 #![forbid(unsafe_code)]
+// The 2PC primitives are inherently tuple-heavy (OT message pairs, share/MAC/label
+// bundles, per-batch (choices, messages) vectors); `type_complexity` fires on these
+// stylistic signatures without improving them. Silence it crate-wide.
+#![allow(clippy::type_complexity)]
 
 pub mod attestation;
 pub mod dkg;

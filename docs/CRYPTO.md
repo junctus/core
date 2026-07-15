@@ -123,7 +123,17 @@ A **3-message, key-confirmed** PQ-hybrid AKE (`neo-crypto::handshake`):
   **not crypto-primitive work**: the **external audit** (the hard gate) + the formal proofs; routing the
   *live-TLS record/key-schedule* gadgets through this networked engine (they use the bundled in-process online
   today — a performance question, since the interactive online is one round-trip per AND, so a full handshake
-  wants the **constant-round** networked online). For **AES-GCM**, a correct **AES-128 circuit** (`mpc_tls::aes`,
+  wants the **constant-round** networked online).
+  > **Deployed-path scope (honest boundary).** The **committee 2PC-TLS exit that actually runs on relays**
+  > (`neo-node::committee_2pc`) drives the **networked *semi-honest* engine** — semi-honest garbling
+  > (`garble_net`/`netengine`) over an unauthenticated Gilboa ECtF MtA. Its **confidentiality** split is real
+  > (neither member assembles the session key or plaintext; the destination cert is chain-verified by both
+  > members), but it does **not yet** deliver **malicious-2PC security**: an actively-cheating member is not
+  > guaranteed to be caught on the live path. The malicious authenticated-garbling engine
+  > (`EngineKind::Malicious`) and the networked authenticated preprocessing (`netprep`/`kos`/`spdz`) are built
+  > and tested, but the live committee handshake is **not yet routed through them** — so "malicious-secure"
+  > describes the *toolkit and the in-process/preprocessing paths*, not (yet) the deployed committee exit,
+  > which should be treated as a **semi-honest** split-trust exit until that wiring lands. For **AES-GCM**, a correct **AES-128 circuit** (`mpc_tls::aes`,
   GF(2⁸)-inverse S-box, validated vs FIPS-197 + the stock `aes` crate) + a **2PC AES-CTR keystream**
   (`share_aes_keystream`) are built; GHASH (a GF(2¹²⁸) MAC like the Poly1305 tag) is the remaining assembly.
   **x25519** (a Montgomery-curve ECtF) is a separate primitive. Plus the malicious ECtF-triple generation

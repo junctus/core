@@ -37,8 +37,12 @@ pub const MAX_WITNESSES: usize = 64;
 /// clock. This is the forward-looking guard that makes the anti-rollback
 /// high-water mark in [`SignedSnapshot::verify_fresh`] safe: a far-future
 /// `created_at` can't be accepted and then permanently freeze out later
-/// legitimate snapshots. The client persists the high-water mark (`snapshot.hwm`)
-/// and passes it to `verify_fresh` on both the full and delta fetch paths.
+/// legitimate snapshots. The client snapshot-fetch path
+/// (`neo_ffi::tunnel_stack::fetch_relays`) tracks a process-lifetime high-water
+/// mark and passes it to `verify_fresh`, advancing it on every accept, so a mirror
+/// cannot roll a running client back to an older signed snapshot. Persisting the
+/// mark across a full client restart is a follow-on that needs a caller-supplied
+/// store (the shell seeds the process value at startup).
 const MAX_FUTURE_SKEW: u64 = 300;
 
 /// The relay set at a moment in time, as observed by the signing witnesses.

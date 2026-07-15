@@ -11,7 +11,7 @@
 //! drives it the same way; only `connect` differs (mirrors + witnesses instead
 //! of a peer address).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -124,9 +124,19 @@ fn rand_index(n: usize) -> Option<usize> {
     Some((u64::from_le_bytes(bytes) % n as u64) as usize)
 }
 
+/// Anti-rollback high-water mark: the newest snapshot `created_at` this process has
+/// accepted. Passed to [`SignedSnapshot::verify_fresh`] and advanced on every accept, so
+/// a mirror (or on-path CDN) cannot freeze this client on an older, still-signed snapshot
+/// by serving it back — the exact freeze the witness signature alone does not prevent.
+/// This is process-lifetime (it protects across every refetch in a running session);
+/// surviving a full client restart additionally needs a caller-supplied persistent store,
+/// which the shell can layer on top by seeding this value at startup.
+static SNAPSHOT_HWM: AtomicU64 = AtomicU64::new(0);
+
 /// Fetch `/snapshot` from each mirror in turn; return the relays from the first
-/// snapshot that verifies against the trusted witnesses at the given threshold.
-async fn fetch_relays(
+/// snapshot that verifies against the trusted witnesses at the given threshold **and**
+/// is no older than the last snapshot this process accepted (anti-rollback).
+pub(crate) async fn fetch_relays(
     mirrors: &[String],
     witnesses: &[[u8; 32]],
     threshold: usize,
@@ -145,18 +155,24 @@ async fn fetch_relays(
         match client.get(&url).send().await {
             Ok(resp) => match resp.bytes().await {
                 Ok(bytes) => match SignedSnapshot::from_bytes(&bytes) {
-                    Ok(snapshot) => match snapshot.verify(witnesses, threshold, now) {
-                        Ok(()) => {
-                            let relays: Vec<PeerRecord> =
-                                snapshot.relays(now).into_iter().cloned().collect();
-                            if relays.is_empty() {
-                                last = format!("{mirror}: snapshot has no usable relays");
-                            } else {
-                                return Ok(relays);
+                    Ok(snapshot) => {
+                        let hwm = SNAPSHOT_HWM.load(Ordering::Relaxed);
+                        match snapshot.verify_fresh(witnesses, threshold, now, hwm) {
+                            Ok(created_at) => {
+                                let relays: Vec<PeerRecord> =
+                                    snapshot.relays(now).into_iter().cloned().collect();
+                                if relays.is_empty() {
+                                    last = format!("{mirror}: snapshot has no usable relays");
+                                } else {
+                                    // Accepted: advance the high-water mark so a later
+                                    // mirror can't roll us back to an older snapshot.
+                                    SNAPSHOT_HWM.fetch_max(created_at, Ordering::Relaxed);
+                                    return Ok(relays);
+                                }
                             }
+                            Err(e) => last = format!("{mirror}: snapshot failed verification: {e}"),
                         }
-                        Err(e) => last = format!("{mirror}: snapshot failed verification: {e}"),
-                    },
+                    }
                     Err(e) => last = format!("{mirror}: malformed snapshot: {e}"),
                 },
                 Err(e) => last = format!("{mirror}: reading body: {e}"),

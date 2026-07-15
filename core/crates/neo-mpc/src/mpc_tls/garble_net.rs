@@ -29,24 +29,17 @@
 
 use std::collections::HashSet;
 
-use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use neo_core::{Error, Result};
 
 use super::circuit::Circuit;
 use super::garble::{decode, evaluate, AndTable, Garbler, Label};
+use super::kos;
 use super::live::channel::Channel;
-use super::ot;
 
-fn point_bytes(p: &RistrettoPoint) -> [u8; 32] {
-    p.compress().to_bytes()
-}
-
-fn read_point(buf: &[u8]) -> Result<RistrettoPoint> {
-    CompressedRistretto::from_slice(buf)
-        .map_err(|_| Error::Crypto("garble-net: bad point length".into()))?
-        .decompress()
-        .ok_or_else(|| Error::Crypto("garble-net: invalid Ristretto point".into()))
-}
+/// AND tables streamed per `ch.send`/`recv` on flight 1 — 32 KiB of scratch, so neither
+/// party ever buffers the whole (message-sized) table set. The wire bytes are identical to
+/// one big send (the channel is an unframed byte stream).
+const TABLES_PER_CHUNK: usize = 1024;
 
 fn label16(buf: &[u8]) -> Label {
     buf.try_into().expect("16-byte label")
@@ -75,46 +68,48 @@ pub fn garbler_run(
         return Err(Error::Crypto("garble-net: wrong input width".into()));
     }
     let g = Garbler::garble(circuit)?;
-    let gc = g.garbled(circuit);
+    let decoding = g.decoding(circuit);
     let evs = ev_sorted(ev_wires);
 
-    // Flight 1: tables ‖ decoding ‖ garbler-labels ‖ OT setups.
-    let mut f1 = Vec::new();
-    for (tg, te) in &gc.tables {
-        f1.extend_from_slice(tg);
-        f1.extend_from_slice(te);
+    // Flight 1 = tables ‖ decoding ‖ garbler-labels ‖ OT setups. The bytes on the wire are
+    // unchanged (send is `write_all`, no framing), but the tables are **streamed** in fixed
+    // chunks rather than materialised into one buffer — so the garbler never holds a second
+    // full copy of the (message-sized) tables. See [`garbled`](super::garble::Garbler) is
+    // no longer cloned.
+    let mut buf = Vec::with_capacity(TABLES_PER_CHUNK * 32);
+    for chunk in g.tables().chunks(TABLES_PER_CHUNK) {
+        buf.clear();
+        for (tg, te) in chunk {
+            buf.extend_from_slice(tg);
+            buf.extend_from_slice(te);
+        }
+        ch.send(&buf)?;
     }
-    let mut dec = vec![0u8; gc.decoding.len().div_ceil(8)];
-    for (i, &b) in gc.decoding.iter().enumerate() {
+    // Tail (decoding ‖ garbler-labels ‖ OT setups), one send — built in the same order.
+    let mut tail = Vec::new();
+    let mut dec = vec![0u8; decoding.len().div_ceil(8)];
+    for (i, &b) in decoding.iter().enumerate() {
         if b {
             dec[i / 8] |= 1 << (i % 8);
         }
     }
-    f1.extend_from_slice(&dec);
+    tail.extend_from_slice(&dec);
     for (w, &bit) in inputs.iter().enumerate() {
         if !ev_wires.contains(&w) {
-            f1.extend_from_slice(&g.input_label(w, bit));
+            tail.extend_from_slice(&g.input_label(w, bit));
         }
     }
-    let mut setups = Vec::with_capacity(evs.len());
-    for _ in &evs {
-        let s = ot::sender_setup()?;
-        f1.extend_from_slice(&point_bytes(&s.s));
-        setups.push(s);
-    }
-    ch.send(&f1)?; // [flight 1]
+    ch.send(&tail)?; // [flight 1: tables ‖ decoding ‖ garbler-labels]
 
-    // Flight 2 (recv): the OT receiver points. Flight 3 (send): the OT ciphertexts.
-    let r_raw = ch.recv_exact(evs.len() * 32)?; // [flight 2]
-    let mut f3 = Vec::with_capacity(evs.len() * 32);
-    for (i, &w) in evs.iter().enumerate() {
-        let r = read_point(&r_raw[i * 32..i * 32 + 32])?;
-        let (m0, m1) = g.ot_pair(w);
-        let (e0, e1) = ot::sender_send(&setups[i], &r, &m0, &m1);
-        f3.extend_from_slice(&e0);
-        f3.extend_from_slice(&e1);
-    }
-    ch.send(&f3)?; // [flight 3]
+    // Transfer the evaluator's input labels via ONE **KOS OT-extension** (a constant ~128
+    // base OTs + cheap symmetric extension for all wires) instead of a Chou–Orlandi base OT
+    // per wire — the dominant cost once garbling is fast. `ot_pair(w) = (W₀, W₀⊕Δ)` are the
+    // wire's two labels; the evaluator learns only the one for its bit.
+    let messages: Vec<(Label, Label)> = evs.iter().map(|&w| g.ot_pair(w)).collect();
+    // `cot_sender` reuses the session's persistent base OTs when `ch` is an
+    // `AmortizingChannel` (paying the 128 base OTs once for the whole handshake — shared with
+    // ectf's MtAs), else runs a one-shot COT.
+    kos::cot_sender(ch, &messages)?;
     Ok(())
 }
 
@@ -136,23 +131,29 @@ pub fn evaluator_run(
     let n_out = circuit.outputs.len();
     let n_g = circuit.input_bits - evs.len();
 
-    // Flight 1 (recv): sizes are all derivable from the (public) circuit + ev_wires.
-    let tbl = n_and * 32;
+    // Flight 1 (recv): sizes are all derivable from the (public) circuit + ev_wires. Tables
+    // arrive streamed in ≤32 KiB chunks straight into the pre-sized `Vec<AndTable>` (no
+    // whole-flight buffer), then a single tail recv for decoding ‖ labels ‖ OT points.
     let dec_bytes = n_out.div_ceil(8);
     let lbl = n_g * 16;
-    let f1 = ch.recv_exact(tbl + dec_bytes + lbl + evs.len() * 32)?; // [flight 1]
+
+    let mut tables: Vec<AndTable> = Vec::with_capacity(n_and);
+    let mut remaining = n_and;
+    while remaining > 0 {
+        let take = remaining.min(TABLES_PER_CHUNK);
+        let chunk = ch.recv_exact(take * 32)?;
+        for i in 0..take {
+            let b = i * 32;
+            tables.push((label16(&chunk[b..b + 16]), label16(&chunk[b + 16..b + 32])));
+        }
+        remaining -= take;
+    }
+
+    let tail = ch.recv_exact(dec_bytes + lbl)?;
     let mut off = 0;
 
-    let tables: Vec<AndTable> = (0..n_and)
-        .map(|i| {
-            let b = off + i * 32;
-            (label16(&f1[b..b + 16]), label16(&f1[b + 16..b + 32]))
-        })
-        .collect();
-    off += tbl;
-
     let decoding: Vec<bool> = (0..n_out)
-        .map(|i| (f1[off + i / 8] >> (i % 8)) & 1 == 1)
+        .map(|i| (tail[off + i / 8] >> (i % 8)) & 1 == 1)
         .collect();
     off += dec_bytes;
 
@@ -160,32 +161,17 @@ pub fn evaluator_run(
     let mut gi = 0;
     for (w, label) in labels.iter_mut().enumerate() {
         if !ev_wires.contains(&w) {
-            *label = label16(&f1[off + gi * 16..off + gi * 16 + 16]);
+            *label = label16(&tail[off + gi * 16..off + gi * 16 + 16]);
             gi += 1;
         }
     }
-    off += lbl;
 
-    let s_points: Vec<RistrettoPoint> = (0..evs.len())
-        .map(|i| read_point(&f1[off + i * 32..off + i * 32 + 32]))
-        .collect::<Result<_>>()?;
-
-    // Flight 2 (send): OT receiver responses; keep the receiver state for finishing.
-    let mut r_out = Vec::with_capacity(evs.len() * 32);
-    let mut choices = Vec::with_capacity(evs.len());
-    for (i, &w) in evs.iter().enumerate() {
-        let rc = ot::receiver_choose(&s_points[i], inputs[w])?;
-        r_out.extend_from_slice(&point_bytes(&rc.r));
-        choices.push((rc, s_points[i]));
-    }
-    ch.send(&r_out)?; // [flight 2]
-
-    // Flight 3 (recv): OT ciphertexts → the evaluator's input labels.
-    let e_raw = ch.recv_exact(evs.len() * 32)?; // [flight 3]
-    for (i, &w) in evs.iter().enumerate() {
-        let e0 = label16(&e_raw[i * 32..i * 32 + 16]);
-        let e1 = label16(&e_raw[i * 32 + 16..i * 32 + 32]);
-        labels[w] = ot::receiver_finish(&choices[i].0, &choices[i].1, &e0, &e1);
+    // Fetch the evaluator's own input labels via KOS OT-extension (constant base OTs +
+    // symmetric extension), replacing a base OT per wire.
+    let evchoices: Vec<bool> = evs.iter().map(|&w| inputs[w]).collect();
+    let ev_labels = kos::cot_receiver(ch, &evchoices)?;
+    for (&w, label) in evs.iter().zip(ev_labels) {
+        labels[w] = label;
     }
 
     // Local, non-interactive evaluation + decode.
@@ -251,7 +237,7 @@ mod tests {
             .map(|i| i.wrapping_mul(2_654_435_761) & 1 == 1)
             .collect();
         let t = std::time::Instant::now();
-        let out = run_net(&circuit, ev, bits.clone());
+        let out = run_net(circuit, ev, bits.clone());
         eprintln!(
             "networked garbled SHA-256 ({} ANDs) over TCP: {:?}",
             circuit.and_gates(),

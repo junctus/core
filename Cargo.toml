@@ -61,6 +61,8 @@ curve25519-dalek = "4"
 # addition; num-bigint provides the F_p arithmetic for the conversion protocol.
 p256 = { version = "0.13", default-features = false, features = ["arithmetic", "ecdsa"] }
 num-bigint = "0.4"
+# Data-parallel garbling/evaluation of large boolean circuits across CPU cores.
+rayon = "1"
 # Constant-time bignum (RustCrypto) — the ECtF field arithmetic runs over its
 # constant-time modular type instead of the variable-time num-bigint.
 crypto-bigint = "0.5"

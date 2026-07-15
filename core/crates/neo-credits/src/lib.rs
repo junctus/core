@@ -105,13 +105,15 @@ impl Issuer {
     /// Issuance is *identified* (the issuer sees `relay` and can rate-limit it) but
     /// the serial stays blinded, so spend remains unlinkable to the earning relay.
     pub fn issue(&mut self, relay: &NodeId, blinded: &BlindCredit) -> Result<IssuedCredit> {
+        // Validate the blinded element *before* consuming an earned credit, so a
+        // malformed request is rejected without burning the relay's balance.
+        let element = BlindedElement::<Ristretto255>::deserialize(&blinded.0)
+            .map_err(|e| Error::Decode(format!("blinded element: {e}")))?;
         if !self.ledger.redeem_earned(relay) {
             return Err(Error::Crypto(
                 "relay has no earned credit to issue against".into(),
             ));
         }
-        let element = BlindedElement::<Ristretto255>::deserialize(&blinded.0)
-            .map_err(|e| Error::Decode(format!("blinded element: {e}")))?;
         let evaluated = self
             .current
             .blind_evaluate(&mut rand::rngs::OsRng, &element);

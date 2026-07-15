@@ -11,9 +11,11 @@ use clap::{Parser, Subcommand};
 use neo_core::NodeIdentity;
 use tokio::net::TcpListener;
 
+mod committee2pc;
 mod defaults;
 mod discovery;
 mod doh;
+mod mpc2pc;
 mod roles;
 
 #[derive(Parser)]
@@ -77,6 +79,12 @@ enum Command {
         /// Bridge a TUN device through the tunnel (needs `--features tun` and root).
         #[arg(long)]
         tun: bool,
+        /// Expose the **experimental, specialized** 2PC-TLS co-processor endpoint on this
+        /// address (e.g. `0.0.0.0:9700`) — off by default. This is an oblivious-exit / TLS-
+        /// oracle building block, *not* the browsing path, and is far too slow for
+        /// interactive use. Open the port; peers reach it with `neo mpc2pc --connect <addr>`.
+        #[arg(long = "mpc2pc-listen")]
+        mpc2pc_listen: Option<String>,
     },
     /// Run a discovery seed: verify, health-check, and attest relays; serve
     /// signed snapshots over HTTP. Relays no user traffic. Put TLS in front.
@@ -153,6 +161,28 @@ enum Command {
         #[arg(long)]
         threshold: Option<usize>,
     },
+    /// **Committee 2PC-TLS onion fetch** (experimental, audit-gated): fetch a destination
+    /// through a self-formed 2-member exit committee, anonymized via a disjoint relay path.
+    /// Discovers the attested pool, XOR-shares the request across the two members, and
+    /// reconstructs the response from their shares — no committee member sees the client or the
+    /// plaintext. Needs ≥3 relays (2 committee + ≥1 path).
+    Committee2pcOnion {
+        /// Destination `host:port`.
+        #[arg(long)]
+        dest: String,
+        /// Request bytes (default: `GET /`).
+        #[arg(long)]
+        request: Option<String>,
+        /// Override discovery mirror base URLs (repeatable).
+        #[arg(long = "mirror")]
+        mirrors: Vec<String>,
+        /// Override trusted witness keys, hex (repeatable).
+        #[arg(long = "witness")]
+        witnesses: Vec<String>,
+        /// Required distinct witness signatures.
+        #[arg(long)]
+        threshold: Option<usize>,
+    },
     /// Operator: sign a bootstrap record (current mirrors + witnesses) with a
     /// bootstrap key and print the DNS TXT value to publish for DoH rendezvous.
     BootstrapRecord {
@@ -182,6 +212,61 @@ enum Command {
     Committee {
         #[command(subcommand)]
         action: CommitteeAction,
+    },
+    /// Networked two-party 2PC-TLS crypto (M45/M47), live between two nodes. Runs a
+    /// **constant-round** networked 2PC of real TLS operations with a peer — the ECtF
+    /// **ECDHE** conversion (split-scalar, neither party holds the secret) and the
+    /// **SHA-256 key-schedule circuit** garbled+evaluated over the wire — proving the
+    /// 2PC-TLS crypto runs live over the network. One side `--listen`, the other `--connect`.
+    Mpc2pc {
+        /// Party A / garbler: bind and wait for the peer (e.g. `0.0.0.0:9700`).
+        #[arg(long, conflicts_with = "connect")]
+        listen: Option<String>,
+        /// Party B / evaluator: connect to the peer at this `host:port`.
+        #[arg(long, conflicts_with = "listen")]
+        connect: Option<String>,
+        /// Run the **full** networked handshake key-agreement driver (ECDHE conversion +
+        /// the entire TLS 1.3 key schedule over the channel), self-verified against the
+        /// in-process reference, instead of the lighter ECtF + single-circuit demo.
+        #[arg(long)]
+        full: bool,
+        /// **Committee 2PC-TLS**: the two nodes act as exit-committee members and jointly
+        /// complete a real TLS 1.3 handshake to this `host:port` destination (the `--listen`
+        /// side is the lead that dials the destination; the `--connect` side is the
+        /// follower). Both must pass the same value. Fetches `GET /` and reconstructs the
+        /// response from the two members' shares.
+        #[arg(long)]
+        handshake: Option<String>,
+    },
+
+    /// **Client-reconstruct committee 2PC-TLS exit** (experimental, audit-gated): two
+    /// members jointly run TLS 1.3 to a destination so **neither sees the session key or
+    /// plaintext**; the client XOR-shares its request across the members and reconstructs the
+    /// response from their two shares. Run three processes: `--role lead --party <bind> \
+    /// --client-listen <bind>`, `--role follower --party <lead-addr> --client-listen <bind>`,
+    /// and `--role client --lead <A-client> --follower <B-client> --dest <host:port>`.
+    Committee2pc {
+        /// `lead` (member A, dials the destination), `follower` (member B), or `client`.
+        #[arg(long)]
+        role: String,
+        /// Member↔member party channel: lead **binds** it; follower **connects** to it.
+        #[arg(long)]
+        party: Option<String>,
+        /// Member: the address to accept the client on.
+        #[arg(long)]
+        client_listen: Option<String>,
+        /// Client: the lead member's client address.
+        #[arg(long)]
+        lead: Option<String>,
+        /// Client: the follower member's client address.
+        #[arg(long)]
+        follower: Option<String>,
+        /// Client: the destination `host:port`.
+        #[arg(long)]
+        dest: Option<String>,
+        /// Client: the request bytes (default: `GET /`).
+        #[arg(long)]
+        request: Option<String>,
     },
 }
 
@@ -289,7 +374,21 @@ async fn main() -> anyhow::Result<()> {
             threshold,
             identity,
             tun,
+            mpc2pc_listen,
         } => {
+            // The 2PC-TLS co-processor is an **opt-in, specialized** endpoint (oracle /
+            // oblivious-exit use-cases — see the README; it is not the browsing path and is
+            // far too slow for interactive use). Any node (relay or not) exposes it only when
+            // `--mpc2pc-listen <addr>` is given.
+            if let Some(addr) = mpc2pc_listen {
+                std::thread::spawn(move || {
+                    // The standing relay endpoint serves the lighter demo session (low
+                    // bandwidth); the full key-agreement driver is an on-demand `--full` run.
+                    if let Err(e) = mpc2pc::serve(&addr, false, false) {
+                        tracing::error!("mpc2pc listener exited: {e}");
+                    }
+                });
+            }
             run_command(RunArgs {
                 relay,
                 announce_addr,
@@ -346,6 +445,17 @@ async fn main() -> anyhow::Result<()> {
             let identity = NodeIdentity::generate()?;
             roles::run_send(identity, cfg, message, hops).await?
         }
+        Command::Committee2pcOnion {
+            dest,
+            request,
+            mirrors,
+            witnesses,
+            threshold,
+        } => {
+            let cfg = defaults::DiscoveryConfig::resolve(&mirrors, &witnesses, threshold)?;
+            let identity = NodeIdentity::generate()?;
+            roles::run_committee_2pc(identity, cfg, dest, request).await?
+        }
         Command::BootstrapRecord {
             identity,
             mirrors,
@@ -391,6 +501,21 @@ async fn main() -> anyhow::Result<()> {
                 roles::run_committee_send(descriptor, &destination, &message, cfg).await?
             }
         },
+        Command::Mpc2pc {
+            listen,
+            connect,
+            full,
+            handshake,
+        } => mpc2pc::run(listen, connect, full, handshake)?,
+        Command::Committee2pc {
+            role,
+            party,
+            client_listen,
+            lead,
+            follower,
+            dest,
+            request,
+        } => committee2pc::run(&role, party, client_listen, lead, follower, dest, request)?,
     }
     Ok(())
 }

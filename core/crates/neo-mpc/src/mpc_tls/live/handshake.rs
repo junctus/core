@@ -39,13 +39,21 @@
 //!   party model — see [`super`]'s boundary.
 
 use neo_core::{Error, Result};
+use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::{ProjectivePoint, PublicKey, Scalar};
 
 use super::super::engine::EngineKind;
+use super::super::netengine::Party;
+use super::super::session::{open_tls13_record_net, seal_tls13_record_net};
 use super::super::sha256::sha256;
 use super::channel::{read_tls_record, Channel};
 use super::ecdhe::ClientKeyShare;
+use super::netschedule::{derive_ecdhe_share_net, KeyScheduleNet};
 use super::record::Direction;
-use super::schedule::KeySchedule;
+use super::schedule::{hkdf_expand_label, hmac_sha256, KeySchedule};
+use super::verify::ServerCertVerifier;
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 
 const HS_CLIENT_HELLO: u8 = 0x01;
 const HS_SERVER_HELLO: u8 = 0x02;
@@ -748,6 +756,473 @@ pub fn recv_application(ch: &mut dyn Channel, sess: &mut AppSession) -> Result<V
     ))
 }
 
+// ===================================================================================
+// Committee 2PC-TLS handshake driver (networked, two exit-committee members)
+// ===================================================================================
+//
+// The two committee members jointly play one TLS 1.3 client against a real server, each
+// holding only its own ECDHE scalar share + a share of every traffic secret — so no single
+// member ever holds the session key or sees the plaintext. Party A (the lead) holds the
+// server connection and relays the *public* wire bytes to party B over the member↔member
+// `party` channel; both run every 2PC gadget (ECDHE, key schedule, record layer) over it.
+// The client stays a normal onion client and reconstructs plaintext from the members' shares.
+// Semi-honest; interop-verified against a stock rustls server (see the tests).
+
+/// A completed committee 2PC-TLS session: this member's shares of the application-traffic
+/// keys, the opened public IVs, and per-direction record sequence numbers.
+pub struct CommitteeSession {
+    role: Party,
+    cw_key: [u8; 32], // client_write app-traffic key share
+    cw_iv: [u8; 12],
+    cw_seq: u64,
+    sr_key: [u8; 32], // server_read app-traffic key share
+    sr_iv: [u8; 12],
+    sr_seq: u64,
+}
+
+/// Lead→follower relay of a public blob over the party channel (u32 length prefix).
+fn relay_send(party: &mut dyn Channel, bytes: &[u8]) -> Result<()> {
+    let mut m = (bytes.len() as u32).to_be_bytes().to_vec();
+    m.extend_from_slice(bytes);
+    party.send(&m)
+}
+fn relay_recv(party: &mut dyn Channel) -> Result<Vec<u8>> {
+    let len = u32::from_be_bytes(party.recv_exact(4)?.try_into().expect("4 bytes")) as usize;
+    if len > MAX_FLIGHT_BYTES {
+        return Err(Error::Crypto("committee: oversized relay".into()));
+    }
+    // A relayed message always carries at least a 1-byte handshake-type tag; every caller
+    // indexes `m[0]`. Reject a zero-length frame here so a dishonest lead can't crash the
+    // follower's 2PC thread by relaying a `len == 0` frame (the message is attacker-chosen).
+    if len == 0 {
+        return Err(Error::Crypto("committee: empty relay frame".into()));
+    }
+    party.recv_exact(len)
+}
+
+/// Open a value both members hold as XOR-shares (a public handshake value): send mine, recv
+/// the peer's, XOR. Symmetric — both members call it.
+fn combine_public(party: &mut dyn Channel, mine: &[u8]) -> Result<Vec<u8>> {
+    party.send(mine)?;
+    let peer = party.recv_exact(mine.len())?;
+    Ok(mine.iter().zip(&peer).map(|(a, b)| a ^ b).collect())
+}
+
+/// Open the 12-byte record IV from the two members' 32-byte IV shares (public — an IV is a
+/// PRF output, safe with the key still shared).
+fn open_iv(party: &mut dyn Channel, iv_share: &[u8; 32]) -> Result<[u8; 12]> {
+    let iv = combine_public(party, &iv_share[..12])?;
+    Ok(iv.try_into().expect("12-byte iv"))
+}
+
+// ---- cleartext handshake crypto (HS-open fast path) --------------------------------------
+//
+// Once the handshake-traffic secrets are opened (KeyScheduleNet::open_handshake_secrets), the
+// server flight (all PUBLIC/authenticated) is decrypted, the Finished MACs computed, and the
+// client Finished sealed **in the clear** with the vetted stock ChaCha20-Poly1305 + HKDF —
+// removing the certificate-flight 2PC (the dominant cost). Only the application epoch stays
+// 2PC. The application keys are never opened, so no member ever holds application plaintext.
+
+/// The TLS 1.3 per-record nonce: `static_iv XOR seq` (RFC 8446 §5.3).
+fn tls13_nonce(iv: &[u8; 12], seq: u64) -> [u8; 12] {
+    let mut n = *iv;
+    for (b, s) in n[4..].iter_mut().zip(seq.to_be_bytes()) {
+        *b ^= s;
+    }
+    n
+}
+
+/// Cleartext `(key, iv)` from a handshake-traffic secret (RFC 8446 §7.3).
+fn cleartext_traffic_keys(secret: &[u8; 32]) -> ([u8; 32], [u8; 12]) {
+    let key: [u8; 32] = hkdf_expand_label(secret, b"key", b"", 32)
+        .try_into()
+        .expect("32");
+    let iv: [u8; 12] = hkdf_expand_label(secret, b"iv", b"", 12)
+        .try_into()
+        .expect("12");
+    (key, iv)
+}
+
+/// Cleartext Finished MAC = `HMAC(HKDF-Expand-Label(secret,"finished","",32), transcript_hash)`.
+fn cleartext_finished(secret: &[u8; 32], transcript_hash: &[u8; 32]) -> [u8; 32] {
+    let fk: [u8; 32] = hkdf_expand_label(secret, b"finished", b"", 32)
+        .try_into()
+        .expect("32");
+    hmac_sha256(&fk, transcript_hash)
+}
+
+/// Cleartext TLS 1.3 record open (stock AEAD): decrypt `record_body` (ciphertext ‖ tag),
+/// strip padding + the trailing content type. Returns `(content_type, plaintext)`.
+fn cleartext_open_record(
+    key: &[u8; 32],
+    iv: &[u8; 12],
+    seq: u64,
+    record_body: &[u8],
+) -> Result<(u8, Vec<u8>)> {
+    let length = (record_body.len()) as u16;
+    let header = [0x17, 0x03, 0x03, (length >> 8) as u8, length as u8];
+    let nonce = tls13_nonce(iv, seq);
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    let mut inner = cipher
+        .decrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: record_body,
+                aad: &header,
+            },
+        )
+        .map_err(|_| Error::Crypto("tls: server record failed to decrypt/authenticate".into()))?;
+    while inner.last() == Some(&0) {
+        inner.pop();
+    }
+    let ct = inner
+        .pop()
+        .ok_or_else(|| Error::Crypto("tls: empty TLSInnerPlaintext".into()))?;
+    Ok((ct, inner))
+}
+
+/// Cleartext TLS 1.3 record seal (stock AEAD): returns the wire record
+/// `0x17 ‖ 0x0303 ‖ length ‖ ciphertext ‖ tag`.
+fn cleartext_seal_record(
+    key: &[u8; 32],
+    iv: &[u8; 12],
+    seq: u64,
+    content_type: u8,
+    content: &[u8],
+) -> Result<Vec<u8>> {
+    let mut inner = content.to_vec();
+    inner.push(content_type);
+    let length = (inner.len() + 16) as u16;
+    let header = [0x17, 0x03, 0x03, (length >> 8) as u8, length as u8];
+    let nonce = tls13_nonce(iv, seq);
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    let sealed = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: &inner,
+                aad: &header,
+            },
+        )
+        .map_err(|_| Error::Crypto("tls: client record seal failed".into()))?;
+    let mut record = header.to_vec();
+    record.extend_from_slice(&sealed);
+    Ok(record)
+}
+
+/// SEC1 uncompressed encoding of a P-256 point (65 bytes).
+fn point_sec1(p: &ProjectivePoint) -> [u8; 65] {
+    <[u8; 65]>::try_from(p.to_affine().to_encoded_point(false).as_bytes()).expect("65-byte SEC1")
+}
+
+/// Read the plaintext ServerHello from the server (skipping bounded leading CCS records).
+fn read_plaintext_server_hello(server: &mut dyn Channel) -> Result<Vec<u8>> {
+    let mut ccs = 0usize;
+    for _ in 0..MAX_CCS_RECORDS + 1 {
+        let (ctype, rec) = read_tls_record(server)?;
+        match ctype {
+            REC_CHANGE_CIPHER_SPEC => {
+                ccs += 1;
+                if ccs > MAX_CCS_RECORDS {
+                    return Err(Error::Crypto("tls: too many change_cipher_spec".into()));
+                }
+            }
+            REC_HANDSHAKE => {
+                let (msg, _) = try_take_handshake(&rec)
+                    .ok_or_else(|| Error::Crypto("tls: truncated ServerHello".into()))?;
+                return Ok(msg);
+            }
+            REC_ALERT => return Err(Error::Crypto("tls: alert before ServerHello".into())),
+            other => return Err(Error::Crypto(format!("tls: unexpected record {other}"))),
+        }
+    }
+    Err(Error::Crypto("tls: no ServerHello after CCS".into()))
+}
+
+/// **The committee 2PC-TLS handshake driver.** See the module section header. `server` is
+/// `Some` for the lead (party A) and `None` for the follower (party B). `scalar` is this
+/// member's ephemeral ECDHE scalar share.
+pub fn committee_handshake_net(
+    party: &mut dyn Channel,
+    role: Party,
+    mut server: Option<&mut dyn Channel>,
+    server_name: &str,
+    scalar: &Scalar,
+    verifier: &dyn ServerCertVerifier,
+) -> Result<CommitteeSession> {
+    let lead = role == Party::A;
+    if lead != server.is_some() {
+        return Err(Error::Crypto(
+            "committee: party A must hold the server connection; B must not".into(),
+        ));
+    }
+
+    // 1. Public client_random + session_id — A draws, relays to B.
+    let (client_random, session_id): ([u8; 32], [u8; 32]) = if lead {
+        let mut cr = [0u8; 32];
+        let mut sid = [0u8; 32];
+        getrandom::getrandom(&mut cr).map_err(|e| Error::Rng(e.to_string()))?;
+        getrandom::getrandom(&mut sid).map_err(|e| Error::Rng(e.to_string()))?;
+        let mut m = cr.to_vec();
+        m.extend_from_slice(&sid);
+        relay_send(party, &m)?;
+        (cr, sid)
+    } else {
+        let m = relay_recv(party)?;
+        if m.len() != 64 {
+            return Err(Error::Crypto("committee: bad random relay".into()));
+        }
+        (m[..32].try_into().unwrap(), m[32..].try_into().unwrap())
+    };
+
+    // 2. Joint key share X = (x_A + x_B)·G — exchange per-member points.
+    let my_point = ProjectivePoint::GENERATOR * *scalar;
+    party.send(&point_sec1(&my_point))?;
+    let peer_bytes = party.recv_exact(65)?;
+    let peer_point = PublicKey::from_sec1_bytes(&peer_bytes)
+        .map_err(|_| Error::Crypto("committee: bad peer key-share point".into()))?
+        .to_projective();
+    let x_share = point_sec1(&(my_point + peer_point));
+
+    // 3. ClientHello (both build the identical message; A sends it).
+    let ch_msg = build_client_hello(&x_share, &client_random, &session_id, server_name);
+    if let Some(s) = server.as_deref_mut() {
+        send_plaintext_handshake(s, &ch_msg)?;
+    }
+    let mut transcript = ch_msg.clone();
+
+    // 4. ServerHello: A reads (skips CCS) + relays; both parse.
+    let sh_msg = if lead {
+        let msg = read_plaintext_server_hello(server.as_deref_mut().expect("lead has server"))?;
+        relay_send(party, &msg)?;
+        msg
+    } else {
+        relay_recv(party)?
+    };
+    if sh_msg.first() != Some(&HS_SERVER_HELLO) {
+        return Err(Error::Crypto("committee: expected ServerHello".into()));
+    }
+    transcript.extend_from_slice(&sh_msg);
+    let sh = parse_server_hello(&sh_msg[4..])?;
+    if sh.selected_version != 0x0304 || sh.cipher_suite != CIPHER_CHACHA20_POLY1305_SHA256 {
+        return Err(Error::Crypto(
+            "committee: server did not select TLS 1.3 + ChaCha20-Poly1305".into(),
+        ));
+    }
+
+    // 5. ECDHE (2PC) + Handshake Secret + the two HS-traffic secrets (2PC), then **OPEN** them
+    //    to cleartext. `handshake_secret` stays SHARED — its application-branch children
+    //    (master → app keys) are derived under 2PC in step 10; only its *public* siblings
+    //    client_hs/server_hs are revealed, so the flight decrypt + Finished can run in the
+    //    clear (removing the certificate-flight 2PC) while no member ever sees application data.
+    let ecdhe = derive_ecdhe_share_net(party, role, scalar, &sh.server_key_share)?;
+    let mut ks = KeyScheduleNet::derive_handshake(party, role, &ecdhe, &transcript)?;
+    let (client_hs, server_hs) = ks.open_handshake_secrets(party)?;
+    let (shk, shiv) = cleartext_traffic_keys(&server_hs);
+
+    // 6. Server flight: A reads encrypted records + relays; both open (2PC) + reassemble.
+    let mut flight: Vec<Vec<u8>> = Vec::new();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut ccs = 0usize;
+    let mut seq = 0u64;
+    'flight: for _ in 0..MAX_SERVER_RECORDS {
+        // Relay one raw record (content_type ‖ body) lead→follower.
+        let (ctype, body) = if lead {
+            let (ct, b) = read_tls_record(server.as_deref_mut().expect("lead has server"))?;
+            let mut m = vec![ct];
+            m.extend_from_slice(&b);
+            relay_send(party, &m)?;
+            (ct, b)
+        } else {
+            let m = relay_recv(party)?;
+            (m[0], m[1..].to_vec())
+        };
+        match ctype {
+            REC_CHANGE_CIPHER_SPEC => {
+                ccs += 1;
+                if ccs > MAX_CCS_RECORDS {
+                    return Err(Error::Crypto("tls: too many change_cipher_spec".into()));
+                }
+                continue;
+            }
+            REC_APPLICATION_DATA => {
+                // The server flight is public/authenticated — decrypt it IN THE CLEAR with the
+                // opened server-HS key (stock ChaCha20-Poly1305). No 2PC.
+                let (inner_ct, inner) = cleartext_open_record(&shk, &shiv, seq, &body)?;
+                seq += 1;
+                if inner_ct != REC_HANDSHAKE {
+                    return Err(Error::Crypto("tls: expected handshake in flight".into()));
+                }
+                buf.extend_from_slice(&inner);
+                if buf.len() + flight.iter().map(Vec::len).sum::<usize>() > MAX_FLIGHT_BYTES {
+                    return Err(Error::Crypto("tls: server flight too large".into()));
+                }
+            }
+            REC_ALERT => return Err(Error::Crypto("tls: alert in server flight".into())),
+            other => return Err(Error::Crypto(format!("tls: unexpected record {other}"))),
+        }
+        while let Some((msg, consumed)) = try_take_handshake(&buf) {
+            let is_finished = msg[0] == HS_FINISHED;
+            flight.push(msg);
+            buf.drain(0..consumed);
+            if is_finished {
+                break 'flight;
+            }
+        }
+    }
+    if flight.last().map(|m| m[0]) != Some(HS_FINISHED) {
+        return Err(Error::Crypto("tls: server flight never completed".into()));
+    }
+
+    // 7. Process flight messages, capturing transcript-hash checkpoints.
+    let mut chain: Option<Vec<Vec<u8>>> = None;
+    let mut tbcv: Option<[u8; 32]> = None;
+    let mut tbsf: Option<[u8; 32]> = None;
+    for msg in &flight {
+        match msg[0] {
+            HS_ENCRYPTED_EXTENSIONS => transcript.extend_from_slice(msg),
+            HS_CERTIFICATE => {
+                chain = Some(parse_cert_chain(&msg[4..])?);
+                transcript.extend_from_slice(msg);
+            }
+            HS_CERTIFICATE_VERIFY => {
+                tbcv = Some(sha256(&transcript));
+                transcript.extend_from_slice(msg);
+            }
+            HS_FINISHED => {
+                tbsf = Some(sha256(&transcript));
+                transcript.extend_from_slice(msg);
+            }
+            other => {
+                return Err(Error::Crypto(format!(
+                    "committee: unexpected flight msg {other}"
+                )))
+            }
+        }
+    }
+
+    // 8. Authenticate: CertificateVerify + server Finished — both members verify locally
+    //    (cleartext) against the opened server-HS secret. No 2PC.
+    verify_server_certificate_verify(&flight, chain.as_deref(), tbcv, server_name, verifier)?;
+    let sfin_hash = tbsf.ok_or_else(|| Error::Crypto("committee: no server Finished".into()))?;
+    let server_fin = flight
+        .iter()
+        .find(|m| m[0] == HS_FINISHED)
+        .ok_or_else(|| Error::Crypto("committee: missing server Finished".into()))?;
+    let expected = cleartext_finished(&server_hs, &sfin_hash);
+    if server_fin[4..] != expected[..] {
+        return Err(Error::Crypto(
+            "committee: server Finished MAC mismatch — handshake not authenticated (abort)".into(),
+        ));
+    }
+
+    // 9. Client Finished — computed + sealed in the clear under the opened client-HS secret.
+    let cfin_hash = sha256(&transcript);
+    let cfin = cleartext_finished(&client_hs, &cfin_hash);
+    let cfin_msg = handshake_message(HS_FINISHED, &cfin);
+    let (chk, chiv) = cleartext_traffic_keys(&client_hs);
+    let fin_record = cleartext_seal_record(&chk, &chiv, 0, REC_HANDSHAKE, &cfin_msg)?;
+    if let Some(s) = server {
+        s.send(&fin_record)?;
+    }
+
+    // 10. Application epoch over CH..server Finished (transcript before client Finished).
+    ks.derive_application(party, &transcript)?;
+    let (cw_key, cw_iv_share) = ks.client_application_keys_share(party)?;
+    let (sr_key, sr_iv_share) = ks.server_application_keys_share(party)?;
+    let cw_iv = open_iv(party, &cw_iv_share)?;
+    let sr_iv = open_iv(party, &sr_iv_share)?;
+
+    Ok(CommitteeSession {
+        role,
+        cw_key,
+        cw_iv,
+        cw_seq: 0,
+        sr_key,
+        sr_iv,
+        sr_seq: 0,
+    })
+}
+
+/// Send application data through the committee session. `pt_share` is this member's share of
+/// the plaintext (for a public request, the lead carries the bytes and the follower zeros).
+/// The lead writes the sealed record to `server`.
+pub fn committee_send_app(
+    party: &mut dyn Channel,
+    session: &mut CommitteeSession,
+    server: Option<&mut dyn Channel>,
+    pt_share: &[u8],
+) -> Result<()> {
+    let record = seal_tls13_record_net(
+        party,
+        session.role,
+        &session.cw_key,
+        &session.cw_iv,
+        session.cw_seq,
+        REC_APPLICATION_DATA,
+        pt_share,
+    )?;
+    session.cw_seq += 1;
+    if let Some(s) = server {
+        s.send(&record)?;
+    }
+    Ok(())
+}
+
+/// Receive one application record. The lead reads it from `server` and relays it; both open
+/// under 2PC. Returns this member's XOR-share of the plaintext (skipping any leading CCS).
+pub fn committee_recv_app(
+    party: &mut dyn Channel,
+    session: &mut CommitteeSession,
+    mut server: Option<&mut dyn Channel>,
+) -> Result<Vec<u8>> {
+    let lead = session.role == Party::A;
+    for _ in 0..MAX_SERVER_RECORDS {
+        let (ctype, body) = if lead {
+            let (ct, b) = read_tls_record(server.as_deref_mut().expect("lead has server"))?;
+            let mut m = vec![ct];
+            m.extend_from_slice(&b);
+            relay_send(party, &m)?;
+            (ct, b)
+        } else {
+            let m = relay_recv(party)?;
+            (m[0], m[1..].to_vec())
+        };
+        match ctype {
+            REC_CHANGE_CIPHER_SPEC => continue,
+            REC_APPLICATION_DATA => {
+                let mut record = vec![0x17, 0x03, 0x03, (body.len() >> 8) as u8, body.len() as u8];
+                record.extend_from_slice(&body);
+                let (inner_share, ok) = open_tls13_record_net(
+                    party,
+                    session.role,
+                    &session.sr_key,
+                    &session.sr_iv,
+                    session.sr_seq,
+                    &record,
+                )?;
+                if !ok {
+                    return Err(Error::Crypto(
+                        "committee: app record tag verify failed".into(),
+                    ));
+                }
+                session.sr_seq += 1;
+                // Return this member's full inner-plaintext share (content ‖ content_type ‖
+                // padding). The committee must NOT combine it — the client XORs the two
+                // members' shares and strips the trailing content_type itself.
+                return Ok(inner_share);
+            }
+            REC_ALERT => return Err(Error::Crypto("committee: server alert".into())),
+            other => {
+                return Err(Error::Crypto(format!(
+                    "committee: unexpected record {other}"
+                )))
+            }
+        }
+    }
+    Err(Error::Crypto("committee: no application record".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::channel::{Loopback, TcpChannel};
@@ -913,6 +1388,190 @@ mod tests {
         let payload = b"webpki-verified ping";
         send_application(&mut ch, &mut session, payload).unwrap();
         assert_eq!(recv_application(&mut ch, &mut session).unwrap(), payload);
+    }
+
+    #[test]
+    #[cfg(feature = "live-tls-webpki")]
+    #[ignore] // ~15s release: full handshake + webpki chain-building via pre-parsed anchors
+    fn live_handshake_with_webpki_trust_anchors() {
+        // As above but through `with_trust_anchors` — the constructor a relay uses to pass the
+        // `webpki-roots` Mozilla bundle: parse the self-signed cert into an owned trust anchor
+        // and trust it directly (rather than as a DER via `with_roots`).
+        use super::super::verify::WebpkiVerifier;
+        use rustls::pki_types::CertificateDer;
+        let (addr, root) = spawn_rustls_echo_server_cert();
+        let der = CertificateDer::from(root.as_slice());
+        let anchor = webpki::anchor_from_trusted_cert(&der).unwrap().to_owned();
+        let verifier = WebpkiVerifier::with_trust_anchors(vec![anchor]);
+        let mut ch = TcpChannel::connect(addr).unwrap();
+        let mut session =
+            client_handshake_verified(&mut ch, "localhost", EngineKind::Semihonest, &verifier)
+                .expect("2PC TLS 1.3 handshake with webpki trust-anchor validation");
+        let payload = b"webpki-anchor ping";
+        send_application(&mut ch, &mut session, payload).unwrap();
+        assert_eq!(recv_application(&mut ch, &mut session).unwrap(), payload);
+    }
+
+    #[test]
+    #[cfg(feature = "live-tls-webpki")]
+    #[ignore] // ~15s release: full handshake up to the (rejected) cert check
+    fn webpki_rejects_cert_not_chaining_to_the_trusted_root() {
+        // Enforcement proof: trust a *different* self-signed cert as the only anchor; the server
+        // presents its own, which does not chain to that anchor, so webpki must REJECT it —
+        // where the leaf-only `LeafKeyVerifier` (no chain-building) would have accepted it.
+        use super::super::verify::WebpkiVerifier;
+        let (addr, _server_cert) = spawn_rustls_echo_server_cert();
+        let other = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let verifier =
+            WebpkiVerifier::with_roots(&[other.cert.der().to_vec()]).expect("build verifier");
+        let mut ch = TcpChannel::connect(addr).unwrap();
+        let err = match client_handshake_verified(
+            &mut ch,
+            "localhost",
+            EngineKind::Semihonest,
+            &verifier,
+        ) {
+            Ok(_) => panic!("a cert that does not chain to the trusted anchor must be rejected"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}").to_lowercase();
+        assert!(
+            msg.contains("cert") || msg.contains("chain"),
+            "expected a certificate-validation failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn committee_handshake_against_rustls_and_echo() {
+        // The committee-model end-to-end proof: TWO exit-committee members, each holding only
+        // its own ECDHE scalar share, jointly complete a real TLS 1.3 handshake against a
+        // stock rustls server over a member↔member socket, then send + receive an application
+        // record — neither member ever holding the session key or the plaintext. rustls
+        // accepting the joint ClientHello, its flight decrypting under the 2PC server key, its
+        // Finished verifying against the 2PC MAC, and its decrypting the 2PC client Finished +
+        // app record (then echoing) is the independent oracle. The "client" reconstructs the
+        // echo by XOR-ing the two members' plaintext shares.
+        use super::super::verify::LeafKeyVerifier;
+        use p256::Scalar;
+        use std::net::TcpStream;
+
+        let server_addr = spawn_rustls_echo_server();
+        let plistener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let paddr = plistener.local_addr().unwrap();
+        let payload = b"committee 2pc-tls ping".to_vec();
+
+        // Party B (follower): no server connection; carries zeros for the public request.
+        let pl = payload.len();
+        let b = thread::spawn(move || {
+            let mut party = TcpChannel::from_stream(TcpStream::connect(paddr).unwrap());
+            let x2 = Scalar::from(0x0f0f_a5a5_1234_5678u64);
+            let mut sess = committee_handshake_net(
+                &mut party,
+                Party::B,
+                None,
+                "localhost",
+                &x2,
+                &LeafKeyVerifier,
+            )
+            .expect("party B handshake");
+            committee_send_app(&mut party, &mut sess, None, &vec![0u8; pl]).unwrap();
+            committee_recv_app(&mut party, &mut sess, None).unwrap()
+        });
+
+        // Party A (lead): holds the connection to rustls.
+        let (psock, _) = plistener.accept().unwrap();
+        let mut party = TcpChannel::from_stream(psock);
+        let mut server = TcpChannel::from_stream(TcpStream::connect(server_addr).unwrap());
+        let x1 = Scalar::from(0x1234_5678_9abc_def0u64);
+        let mut sess = committee_handshake_net(
+            &mut party,
+            Party::A,
+            Some(&mut server),
+            "localhost",
+            &x1,
+            &LeafKeyVerifier,
+        )
+        .expect("party A handshake");
+        committee_send_app(&mut party, &mut sess, Some(&mut server), &payload).unwrap();
+        let share_a = committee_recv_app(&mut party, &mut sess, Some(&mut server)).unwrap();
+        let share_b = b.join().unwrap();
+
+        // "Client" reconstruction: XOR the members' inner-plaintext shares, strip padding +
+        // the trailing content_type.
+        let mut inner: Vec<u8> = share_a.iter().zip(&share_b).map(|(a, b)| a ^ b).collect();
+        while inner.last() == Some(&0) {
+            inner.pop();
+        }
+        let ct = inner.pop();
+        assert_eq!(ct, Some(REC_APPLICATION_DATA), "inner content_type");
+        assert_eq!(
+            inner, payload,
+            "rustls echoed the committee 2PC-TLS application record"
+        );
+    }
+
+    #[test]
+    fn committee_handshake_amortized_base_ots_still_interops() {
+        // Identical to `committee_handshake_against_rustls_and_echo`, but each member wraps its
+        // member↔member socket in `AmortizingChannel`, so the whole session's garbled gadgets
+        // (key schedule + the app record) share ONE KOS base-OT setup per role — 128 base OTs
+        // once, not per gadget. rustls accepting the result is the oracle that the amortized
+        // COT path yields byte-identical correct 2PC output: amortization changes cost, not the
+        // protocol. Also exercises the per-batch PRG separation + global H tweak over a real
+        // multi-gadget session (not just the isolated `kos` batch tests).
+        use super::super::channel::AmortizingChannel;
+        use super::super::verify::LeafKeyVerifier;
+        use p256::Scalar;
+        use std::net::TcpStream;
+
+        let server_addr = spawn_rustls_echo_server();
+        let plistener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let paddr = plistener.local_addr().unwrap();
+        let payload = b"amortized committee 2pc-tls ping".to_vec();
+        let pl = payload.len();
+
+        let b = thread::spawn(move || {
+            let mut raw = TcpChannel::from_stream(TcpStream::connect(paddr).unwrap());
+            let mut party = AmortizingChannel::new(&mut raw);
+            let x2 = Scalar::from(0x0f0f_a5a5_1234_5678u64);
+            let mut sess = committee_handshake_net(
+                &mut party,
+                Party::B,
+                None,
+                "localhost",
+                &x2,
+                &LeafKeyVerifier,
+            )
+            .expect("party B handshake");
+            committee_send_app(&mut party, &mut sess, None, &vec![0u8; pl]).unwrap();
+            committee_recv_app(&mut party, &mut sess, None).unwrap()
+        });
+
+        let (psock, _) = plistener.accept().unwrap();
+        let mut raw = TcpChannel::from_stream(psock);
+        let mut party = AmortizingChannel::new(&mut raw);
+        let mut server = TcpChannel::from_stream(TcpStream::connect(server_addr).unwrap());
+        let x1 = Scalar::from(0x1234_5678_9abc_def0u64);
+        let mut sess = committee_handshake_net(
+            &mut party,
+            Party::A,
+            Some(&mut server),
+            "localhost",
+            &x1,
+            &LeafKeyVerifier,
+        )
+        .expect("party A handshake");
+        committee_send_app(&mut party, &mut sess, Some(&mut server), &payload).unwrap();
+        let share_a = committee_recv_app(&mut party, &mut sess, Some(&mut server)).unwrap();
+        let share_b = b.join().unwrap();
+
+        let mut inner: Vec<u8> = share_a.iter().zip(&share_b).map(|(a, b)| a ^ b).collect();
+        while inner.last() == Some(&0) {
+            inner.pop();
+        }
+        let ct = inner.pop();
+        assert_eq!(ct, Some(REC_APPLICATION_DATA), "inner content_type");
+        assert_eq!(inner, payload, "amortized committee 2PC-TLS echo matches");
     }
 
     #[test]

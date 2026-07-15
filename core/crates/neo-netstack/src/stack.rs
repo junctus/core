@@ -32,6 +32,28 @@ use tokio::sync::mpsc;
 /// exchanges are brief, so a short idle window keeps the table small.
 const UDP_IDLE: Duration = Duration::from_secs(30);
 
+/// Cap on concurrent intercepted TCP flows. Each flow holds two `SOCK_BUF`-sized
+/// smoltcp buffers (~128 KiB), so an unbounded flow count is a client-local DoS.
+/// Matches `neo_node::mux::MAX_STREAMS`. At the cap we refuse new SYNs (letting
+/// the client retransmit / back off) rather than allocating.
+const MAX_FLOWS: usize = 1024;
+
+/// Cap on the UDP NAT table. Entries only leave on the `UDP_IDLE` window, so a
+/// burst of distinct 4-tuples (e.g. spoofed DNS) can grow it unbounded within
+/// that window. At the cap we evict the least-recently-seen entry.
+const MAX_UDP_FLOWS: usize = 1024;
+
+/// Cap on bytes buffered per flow awaiting the client's TCP window (`pending_write`).
+/// The circuit can produce faster than the client drains; without a bound a single
+/// stalled flow could buffer unbounded memory. Two `SOCK_BUF` worth is generous
+/// headroom over the socket's own send buffer while staying bounded.
+const MAX_PENDING_WRITE: usize = 2 * SOCK_BUF;
+
+/// Reap a flow that never completed its handshake (never `announced`) after this
+/// long. Without it a flood of SYNs whose handshakes never finish would pin
+/// flow slots until their smoltcp sockets independently reach `Closed`.
+const HALF_OPEN_IDLE: Duration = Duration::from_secs(30);
+
 use crate::device::{ChannelDevice, MTU};
 
 /// The gateway's own on-link address; the TUN's local address (`10.9.0.2`) sits
@@ -199,6 +221,20 @@ impl UdpCtx<'_> {
         let (SocketAddr::V4(client), SocketAddr::V4(target)) = (src, dst) else {
             return;
         };
+        // Bound the NAT table: if this is a new 4-tuple and we're at the cap,
+        // evict the least-recently-seen entry to make room (dropping it closes
+        // that flow's incoming_tx, ending its circuit handler). A new, live flow
+        // shouldn't be starved by stale entries idling out their `UDP_IDLE` window.
+        if !self.nat.contains_key(&(src, dst)) && self.nat.len() >= MAX_UDP_FLOWS {
+            if let Some(oldest) = self
+                .nat
+                .iter()
+                .min_by_key(|(_, nat)| nat.last_seen)
+                .map(|(key, _)| *key)
+            {
+                self.nat.remove(&oldest);
+            }
+        }
         // `self.cmd_tx`/`conn_tx` are shared refs (Copy); copy them out so the
         // or_insert_with closure doesn't borrow `self` while `nat` is borrowed.
         let cmd_tx = self.cmd_tx;
@@ -332,6 +368,9 @@ struct Flow {
     announced: bool,
     pending_write: Vec<u8>,
     closing: bool,
+    /// When the flow's listener was created — used to reap half-open flows whose
+    /// handshake never completes (`announced` stays false past `HALF_OPEN_IDLE`).
+    created: Instant,
 }
 
 fn now() -> Instant {
@@ -462,7 +501,9 @@ fn apply_cmd(
             if let Some((src, dst, syn)) = parse_tcp(&packet) {
                 // A new flow's opening SYN: pre-create a listener bound to the
                 // destination so smoltcp answers it (any_ip lets it accept any dst).
-                if syn && !by_tuple.contains_key(&(src, dst)) {
+                // Refuse once at the flow cap — drop the SYN so the client backs
+                // off rather than allocating another ~128 KiB of buffers.
+                if syn && !by_tuple.contains_key(&(src, dst)) && flows.len() < MAX_FLOWS {
                     let mut socket = tcp::Socket::new(
                         tcp::SocketBuffer::new(vec![0u8; SOCK_BUF]),
                         tcp::SocketBuffer::new(vec![0u8; SOCK_BUF]),
@@ -484,6 +525,7 @@ fn apply_cmd(
                                 announced: false,
                                 pending_write: Vec::new(),
                                 closing: false,
+                                created: now(),
                             },
                         );
                     }
@@ -493,7 +535,13 @@ fn apply_cmd(
         }
         Cmd::Write(handle, data) => {
             if let Some(flow) = flows.get_mut(&handle) {
-                flow.pending_write.extend_from_slice(&data);
+                // Bound the per-flow buffer: if the client isn't draining, don't
+                // let the circuit pile up unbounded memory. Accept only what fits;
+                // the dropped tail is retransmitted by the peer's TCP (the client's
+                // window stays closed until it catches up).
+                let room = MAX_PENDING_WRITE.saturating_sub(flow.pending_write.len());
+                let take = data.len().min(room);
+                flow.pending_write.extend_from_slice(&data[..take]);
             }
         }
         Cmd::Close(handle) => {
@@ -575,16 +623,22 @@ fn ferry_in(
     }
 }
 
-/// Remove flows whose sockets have fully closed, freeing their handles.
+/// Remove flows whose sockets have fully closed, freeing their handles. Also
+/// reaps half-open flows (handshake never completed) after `HALF_OPEN_IDLE`, so
+/// a SYN flood whose handshakes stall can't pin flow slots indefinitely.
 fn reap(
     sockets: &mut SocketSet,
     flows: &mut HashMap<SocketHandle, Flow>,
     by_tuple: &mut HashMap<(SocketAddr, SocketAddr), SocketHandle>,
 ) {
+    let cutoff = now();
+    let half_open_idle = HALF_OPEN_IDLE.as_millis() as u64;
     let mut dead = Vec::new();
-    for (handle, _flow) in flows.iter() {
+    for (handle, flow) in flows.iter() {
         let socket = sockets.get::<tcp::Socket>(*handle);
-        if socket.state() == tcp::State::Closed {
+        let half_open_expired =
+            !flow.announced && (cutoff - flow.created).total_millis() >= half_open_idle;
+        if socket.state() == tcp::State::Closed || half_open_expired {
             dead.push(*handle);
         }
     }
@@ -803,5 +857,97 @@ mod tests {
             "reply destination is the client"
         );
         assert_eq!(payload, b"dns-answer", "the reply datagram round-trips");
+    }
+
+    /// The UDP NAT table is bounded: past `MAX_UDP_FLOWS`, a new 4-tuple evicts
+    /// the least-recently-seen entry rather than growing without limit.
+    #[test]
+    fn udp_nat_table_is_bounded() {
+        let (cmd_tx, _cmd_rx) = std_mpsc::channel::<Cmd>();
+        let (conn_tx, _conn_rx) = mpsc::unbounded_channel::<UdpFlow>();
+        let mut nat: HashMap<(SocketAddr, SocketAddr), UdpNat> = HashMap::new();
+        let mut udp = UdpCtx {
+            nat: &mut nat,
+            conn_tx: &conn_tx,
+            cmd_tx: &cmd_tx,
+        };
+
+        let target: SocketAddr = "93.184.216.34:53".parse().unwrap();
+        // The first client fills the table; remember it to prove it's evicted.
+        let first: SocketAddr = "10.9.0.2:10000".parse().unwrap();
+        udp.inbound(first, target, b"q".to_vec());
+        for port in 10_001..(10_000 + MAX_UDP_FLOWS as u16) {
+            let client = SocketAddr::new("10.9.0.2".parse().unwrap(), port);
+            udp.inbound(client, target, b"q".to_vec());
+        }
+        assert_eq!(udp.nat.len(), MAX_UDP_FLOWS, "table filled to the cap");
+
+        // One more distinct client evicts the oldest (the first) but stays at cap.
+        let overflow = SocketAddr::new("10.9.0.2".parse().unwrap(), 20_000);
+        udp.inbound(overflow, target, b"q".to_vec());
+        assert_eq!(udp.nat.len(), MAX_UDP_FLOWS, "still bounded at the cap");
+        assert!(
+            !udp.nat.contains_key(&(first, target)),
+            "the least-recently-seen entry was evicted"
+        );
+        assert!(
+            udp.nat.contains_key(&(overflow, target)),
+            "the new flow was admitted"
+        );
+    }
+
+    /// A flow's `pending_write` can't grow past `MAX_PENDING_WRITE`, even if the
+    /// circuit keeps writing while the client never drains.
+    #[test]
+    fn pending_write_is_bounded() {
+        let mut sockets = SocketSet::new(Vec::new());
+        let socket = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0u8; SOCK_BUF]),
+            tcp::SocketBuffer::new(vec![0u8; SOCK_BUF]),
+        );
+        let handle = sockets.add(socket);
+
+        let (incoming_tx, _rx) = mpsc::unbounded_channel();
+        let mut flows: HashMap<SocketHandle, Flow> = HashMap::new();
+        flows.insert(
+            handle,
+            Flow {
+                dst: "1.2.3.4:80".parse().unwrap(),
+                incoming_tx,
+                to_announce: None,
+                announced: true,
+                pending_write: Vec::new(),
+                closing: false,
+                created: now(),
+            },
+        );
+        let mut by_tuple: HashMap<(SocketAddr, SocketAddr), SocketHandle> = HashMap::new();
+        let mut device = ChannelDevice::new(MTU);
+        let (cmd_tx, _cmd_rx) = std_mpsc::channel::<Cmd>();
+        let (conn_tx, _conn_rx) = mpsc::unbounded_channel::<UdpFlow>();
+        let mut nat = HashMap::new();
+        let mut udp = UdpCtx {
+            nat: &mut nat,
+            conn_tx: &conn_tx,
+            cmd_tx: &cmd_tx,
+        };
+
+        // Write far more than the cap in several commands; the buffer must not
+        // exceed MAX_PENDING_WRITE regardless of how much is offered.
+        for _ in 0..8 {
+            apply_cmd(
+                Cmd::Write(handle, vec![0u8; SOCK_BUF]),
+                &mut sockets,
+                &mut flows,
+                &mut by_tuple,
+                &mut device,
+                &mut udp,
+            );
+        }
+        assert_eq!(
+            flows[&handle].pending_write.len(),
+            MAX_PENDING_WRITE,
+            "pending_write is clamped to the cap"
+        );
     }
 }

@@ -6,15 +6,65 @@
 //!
 //! Free-XOR: a global secret offset `Δ` (with `lsb(Δ)=1`) ties each wire's two
 //! labels as `W₁ = W₀ ⊕ Δ`, so XOR and NOT gates need no ciphertext. Only AND
-//! gates cost two ciphertexts (`TG`, `TE`). The hash is BLAKE3 keyed by a
-//! per-gate tweak (a correlation-robust hash in the random-oracle model).
+//! gates cost two ciphertexts (`TG`, `TE`). The per-gate hash is the fixed-key-AES
+//! MMO-σ tweakable correlation-robust hash of Guo et al. (CRYPTO 2020) — see
+//! [`tccr_hash`] (~9× faster per gate than the BLAKE3 hash it replaced).
 
 use std::collections::HashSet;
 
 use neo_core::{Error, Result};
+use rayon::prelude::*;
 
 use super::circuit::{Circuit, Gate};
 use super::ot;
+
+/// A topological **leveling** of a circuit for data-parallel garbling/evaluation. Gates at
+/// the same depth read only strictly-earlier wires (inputs have smaller indices than any
+/// gate output, and each wire is written once), so a whole level is independent and can be
+/// processed in parallel. `and_gid[gi]` is the AND-gate ordinal (its garbled-table index and
+/// AES tweak seed) precomputed in gate order — so the tweak/table order is identical to
+/// the sequential version regardless of parallel completion order.
+struct Plan {
+    levels: Vec<Vec<usize>>,
+    and_gid: Vec<u64>,
+    n_and: usize,
+}
+
+fn plan(circuit: &Circuit) -> Plan {
+    let mut wire_level = vec![0u32; circuit.num_wires]; // inputs = level 0
+    let mut gate_level = vec![0u32; circuit.gates.len()];
+    let mut and_gid = vec![0u64; circuit.gates.len()];
+    let mut gid = 0u64;
+    let mut maxl = 0u32;
+    for (gi, gate) in circuit.gates.iter().enumerate() {
+        let (o, lvl) = match *gate {
+            Gate::Xor(a, b, o) => (o, 1 + wire_level[a].max(wire_level[b])),
+            Gate::Inv(a, o) => (o, 1 + wire_level[a]),
+            Gate::And(a, b, o) => {
+                and_gid[gi] = gid;
+                gid += 1;
+                (o, 1 + wire_level[a].max(wire_level[b]))
+            }
+        };
+        debug_assert!(o >= circuit.input_bits, "gate must not write an input wire");
+        wire_level[o] = lvl;
+        gate_level[gi] = lvl;
+        maxl = maxl.max(lvl);
+    }
+    let mut levels = vec![Vec::new(); maxl as usize + 1];
+    for (gi, &l) in gate_level.iter().enumerate() {
+        levels[l as usize].push(gi);
+    }
+    Plan {
+        levels,
+        and_gid,
+        n_and: gid as usize,
+    }
+}
+
+/// Minimum gates per rayon task — batches tiny levels so per-task overhead can't dominate
+/// the many shallow levels of deep-but-narrow circuits (carry chains).
+const PAR_MIN_LEN: usize = 256;
 
 /// A wire label (128-bit).
 pub type Label = [u8; 16];
@@ -44,14 +94,60 @@ fn cond_xor(base: &Label, cond: bool, x: &Label) -> Label {
     }
 }
 
-/// Correlation-robust hash `H(label, tweak)` → 128 bits.
-fn h(label: &Label, tweak: u64) -> Label {
-    let mut hh = blake3::Hasher::new_derive_key("neo-mpc-garble-v1");
-    hh.update(&tweak.to_le_bytes());
-    hh.update(label);
+// ── Tweakable correlation-robust hash (Guo–Katz–Wang–Weng–Yu, CRYPTO 2020, "Better
+//    Concrete Security for Half-Gates Garbling", eprint 2019/1168) ──
+//
+// The per-gate hash is the MMO-σ construction as instantiated by EMP-toolkit's `MITCCRH`:
+//
+//     H(x, tweak) = σ(x) ⊕ AES_{K(tweak)}(σ(x)),   K(tweak) = S ⊕ tweak
+//
+// with σ the linear orthomorphism `σ(hi,lo) = (hi⊕lo, hi)` (EMP `sigma(a) =
+// swap_halves(a) ⊕ (a & 0xFF..F<<64)`), a fixed public 128-bit seed `S`, and the per-gate
+// tweak folded into the AES key (each gate/half-gate gets a distinct key). This is a proven
+// tweakable-correlation-robust hash; it replaces the earlier BLAKE3 random-oracle hash,
+// which was ~9× slower per gate. At 128-bit wire labels the fixed-key multi-instance bound
+// (~2^128 / (total gates garbled)) is far beyond any feasible attack, so `S` is a public
+// constant (no per-garbling seed to transmit — the construction stays a drop-in for the
+// key-schedule/record circuits, byte-agreement between garbler and evaluator guaranteed by
+// both using the same `S`).
+//
+// AES is the RustCrypto `aes` crate: AES-NI on x86_64 (the relays), ARMv8 crypto on
+// aarch64 — hardware-accelerated key schedule + encryption on both, chosen at runtime.
+use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
+use aes::Aes128;
+
+/// Fixed public seed `S` for the tweakable CR hash key `K(tweak) = S ⊕ tweak`.
+const TCCR_SEED: [u8; 16] = *b"neo-mpc-garbl-v2";
+
+/// Guo'20 linear orthomorphism σ: split the 128-bit block into two 64-bit halves
+/// `lo = bytes[0..8]`, `hi = bytes[8..16]` (little-endian) and map `(hi,lo) → (hi⊕lo, hi)`.
+/// Both σ and σ⊕id are permutations (the orthomorphism property the CR proof needs).
+fn sigma(x: &Label) -> Label {
+    let lo = u64::from_le_bytes(x[0..8].try_into().unwrap());
+    let hi = u64::from_le_bytes(x[8..16].try_into().unwrap());
     let mut o = [0u8; 16];
-    o.copy_from_slice(&hh.finalize().as_bytes()[..16]);
+    o[0..8].copy_from_slice(&hi.to_le_bytes()); // new lo = hi
+    o[8..16].copy_from_slice(&(hi ^ lo).to_le_bytes()); // new hi = hi ⊕ lo
     o
+}
+
+/// Schedule the fixed-key AES for one `tweak` (the key is `S ⊕ tweak`, tweak in the low 8
+/// bytes). Distinct tweaks → distinct keys, so every gate/half-gate hashes under its own
+/// key. Reuse the returned cipher for all labels sharing a tweak (both labels of a wire).
+fn tccr_cipher(tweak: u64) -> Aes128 {
+    let mut key = TCCR_SEED;
+    for (k, t) in key.iter_mut().zip(tweak.to_le_bytes()) {
+        *k ^= t;
+    }
+    Aes128::new(GenericArray::from_slice(&key))
+}
+
+/// `H(x) = σ(x) ⊕ AES_K(σ(x))` under a pre-scheduled `cipher` (Davies–Meyer over σ).
+fn tccr_hash(cipher: &Aes128, label: &Label) -> Label {
+    let s = sigma(label);
+    let mut b = GenericArray::from(s);
+    cipher.encrypt_block(&mut b);
+    core::array::from_fn(|i| b[i] ^ s[i])
 }
 
 fn rand_label() -> Result<Label> {
@@ -90,17 +186,32 @@ impl Garbler {
             *z = rand_label()?;
         }
 
-        let mut tables = Vec::with_capacity(circuit.and_gates());
-        let mut gid = 0u64;
-        for gate in &circuit.gates {
-            match *gate {
-                Gate::Xor(a, b, o) => zero[o] = xor(&zero[a], &zero[b]),
-                Gate::Inv(a, o) => zero[o] = xor(&zero[a], &delta), // fold flip into the zero-label
-                Gate::And(a, b, o) => {
-                    let (wc0, table) = garble_and(&zero[a], &zero[b], &delta, gid);
-                    zero[o] = wc0;
-                    tables.push(table);
-                    gid += 1;
+        // Garble level-by-level: gates within a level read only earlier-level (final) wire
+        // labels, so the (AES-heavy) per-gate work runs in parallel; a trivial sequential
+        // scatter then writes each unique output wire and `tables[gid]`. Byte-identical to a
+        // sequential garble — the RNG prologue above is untouched, the gate body is pure, and
+        // `and_gid` fixes the table/tweak order.
+        let p = plan(circuit);
+        let mut tables = vec![([0u8; 16], [0u8; 16]); p.n_and];
+        let mut scratch: Vec<(usize, Label, Option<(u64, AndTable)>)> = Vec::new();
+        for level in &p.levels {
+            level
+                .par_iter()
+                .with_min_len(PAR_MIN_LEN)
+                .map(|&gi| match circuit.gates[gi] {
+                    Gate::Xor(a, b, o) => (o, xor(&zero[a], &zero[b]), None),
+                    Gate::Inv(a, o) => (o, xor(&zero[a], &delta), None),
+                    Gate::And(a, b, o) => {
+                        let gid = p.and_gid[gi];
+                        let (wc0, table) = garble_and(&zero[a], &zero[b], &delta, gid);
+                        (o, wc0, Some((gid, table)))
+                    }
+                })
+                .collect_into_vec(&mut scratch); // reuses the allocation across levels
+            for (o, label, and) in scratch.drain(..) {
+                zero[o] = label;
+                if let Some((gid, table)) = and {
+                    tables[gid as usize] = table;
                 }
             }
         }
@@ -136,12 +247,23 @@ impl Garbler {
     pub fn garbled(&self, circuit: &Circuit) -> GarbledCircuit {
         GarbledCircuit {
             tables: self.tables.clone(),
-            decoding: circuit
-                .outputs
-                .iter()
-                .map(|&o| color(&self.zero[o]))
-                .collect(),
+            decoding: self.decoding(circuit),
         }
+    }
+
+    /// Borrow the AND tables in gid order (avoids the [`garbled`](Self::garbled) clone —
+    /// the networked garbler streams these directly).
+    pub fn tables(&self) -> &[AndTable] {
+        &self.tables
+    }
+
+    /// The output decoding (colour of each output wire's zero-label).
+    pub fn decoding(&self, circuit: &Circuit) -> Vec<bool> {
+        circuit
+            .outputs
+            .iter()
+            .map(|&o| color(&self.zero[o]))
+            .collect()
     }
 }
 
@@ -150,18 +272,22 @@ fn garble_and(wa0: &Label, wb0: &Label, delta: &Label, gid: u64) -> (Label, AndT
     let pb = color(wb0);
     let wa1 = xor(wa0, delta);
     let wb1 = xor(wb0, delta);
-    let jg = 2 * gid;
-    let je = 2 * gid + 1;
+    // One AES key schedule per half-gate tweak, reused for both labels of the wire.
+    let cg = tccr_cipher(2 * gid);
+    let ce = tccr_cipher(2 * gid + 1);
 
+    // Hash each input zero-label once (reused by the table + the output label).
+    let hwa0 = tccr_hash(&cg, wa0);
+    let hwb0 = tccr_hash(&ce, wb0);
     // Generator half-gate.
     let tg = xor(
-        &xor(&h(wa0, jg), &h(&wa1, jg)),
+        &xor(&hwa0, &tccr_hash(&cg, &wa1)),
         &if pb { *delta } else { [0u8; 16] },
     );
-    let wg0 = cond_xor(&h(wa0, jg), pa, &tg);
+    let wg0 = cond_xor(&hwa0, pa, &tg);
     // Evaluator half-gate.
-    let te = xor(&xor(&h(wb0, je), &h(&wb1, je)), wa0);
-    let we0 = cond_xor(&h(wb0, je), pb, &xor(&te, wa0));
+    let te = xor(&xor(&hwb0, &tccr_hash(&ce, &wb1)), wa0);
+    let we0 = cond_xor(&hwb0, pb, &xor(&te, wa0));
 
     (xor(&wg0, &we0), (tg, te))
 }
@@ -171,16 +297,25 @@ fn garble_and(wa0: &Label, wb0: &Label, delta: &Label, gid: u64) -> (Label, AndT
 pub fn evaluate(circuit: &Circuit, tables: &[AndTable], input_labels: &[Label]) -> Vec<Label> {
     let mut w = vec![[0u8; 16]; circuit.num_wires];
     w[..circuit.input_bits].copy_from_slice(input_labels);
-    let mut gid = 0usize;
-    for gate in &circuit.gates {
-        match *gate {
-            Gate::Xor(a, b, o) => w[o] = xor(&w[a], &w[b]),
-            Gate::Inv(a, o) => w[o] = w[a], // flip is absorbed by the decoding colour
-            Gate::And(a, b, o) => {
-                let (tg, te) = tables[gid];
-                w[o] = eval_and(&w[a], &w[b], &tg, &te, gid as u64);
-                gid += 1;
-            }
+    // Level-parallel, mirroring `garble`: each level's gates read only earlier-level wires.
+    let p = plan(circuit);
+    let mut scratch: Vec<(usize, Label)> = Vec::new();
+    for level in &p.levels {
+        level
+            .par_iter()
+            .with_min_len(PAR_MIN_LEN)
+            .map(|&gi| match circuit.gates[gi] {
+                Gate::Xor(a, b, o) => (o, xor(&w[a], &w[b])),
+                Gate::Inv(a, o) => (o, w[a]), // flip absorbed by the decoding colour
+                Gate::And(a, b, o) => {
+                    let gid = p.and_gid[gi];
+                    let (tg, te) = tables[gid as usize];
+                    (o, eval_and(&w[a], &w[b], &tg, &te, gid))
+                }
+            })
+            .collect_into_vec(&mut scratch);
+        for (o, label) in scratch.drain(..) {
+            w[o] = label;
         }
     }
     circuit.outputs.iter().map(|&o| w[o]).collect()
@@ -189,10 +324,8 @@ pub fn evaluate(circuit: &Circuit, tables: &[AndTable], input_labels: &[Label]) 
 fn eval_and(wa: &Label, wb: &Label, tg: &Label, te: &Label, gid: u64) -> Label {
     let sa = color(wa);
     let sb = color(wb);
-    let jg = 2 * gid;
-    let je = 2 * gid + 1;
-    let wg = cond_xor(&h(wa, jg), sa, tg);
-    let we = cond_xor(&h(wb, je), sb, &xor(te, wa));
+    let wg = cond_xor(&tccr_hash(&tccr_cipher(2 * gid), wa), sa, tg);
+    let we = cond_xor(&tccr_hash(&tccr_cipher(2 * gid + 1), wb), sb, &xor(te, wa));
     xor(&wg, &we)
 }
 
@@ -262,6 +395,75 @@ mod tests {
             }
         }
         decode(&evaluate(circuit, &gc.tables, &labels), &gc.decoding)
+    }
+
+    #[test]
+    fn sigma_is_an_orthomorphism() {
+        // σ(hi,lo) = (hi⊕lo, hi) must be invertible (σ⁻¹(Hi,Lo) = (Lo, Hi⊕Lo)) and σ⊕id must
+        // also be a permutation — the orthomorphism property the MMO-σ CR proof needs.
+        let inv_sigma = |x: &Label| -> Label {
+            let lo = u64::from_le_bytes(x[0..8].try_into().unwrap());
+            let hi = u64::from_le_bytes(x[8..16].try_into().unwrap());
+            let mut o = [0u8; 16];
+            o[0..8].copy_from_slice(&(hi ^ lo).to_le_bytes()); // orig lo = Hi⊕Lo
+            o[8..16].copy_from_slice(&lo.to_le_bytes()); // orig hi = Lo
+            o
+        };
+        for seed in 0u8..64 {
+            let x: Label = core::array::from_fn(|i| seed.wrapping_mul(31).wrapping_add(i as u8));
+            assert_eq!(inv_sigma(&sigma(&x)), x, "σ⁻¹∘σ = id");
+            // σ(x) ⊕ x is a permutation ⇒ injective on this sample (no collisions with x).
+            assert_ne!(
+                sigma(&x),
+                x,
+                "σ has no fixed points on nonzero input mixing"
+            );
+        }
+    }
+
+    #[test]
+    fn tccr_hash_matches_the_davies_meyer_identity() {
+        // H(x,tweak) must equal σ(x) ⊕ AES_{S⊕tweak}(σ(x)). Recompute the AES leg with an
+        // INDEPENDENT cipher instance to catch any σ / key-derivation / XOR-back bug — the
+        // full-suite circuit tests only prove garbler≡evaluator, not that the construction is
+        // the intended one.
+        for tweak in [0u64, 1, 2, 42, 0xdead_beef, u64::MAX] {
+            let x: Label =
+                core::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(tweak as u8));
+            let got = tccr_hash(&tccr_cipher(tweak), &x);
+
+            let s = sigma(&x);
+            let mut key = TCCR_SEED;
+            for (k, t) in key.iter_mut().zip(tweak.to_le_bytes()) {
+                *k ^= t;
+            }
+            let cipher = Aes128::new(GenericArray::from_slice(&key));
+            let mut enc = GenericArray::from(s);
+            cipher.encrypt_block(&mut enc);
+            let want: Label = core::array::from_fn(|i| enc[i] ^ s[i]);
+            assert_eq!(got, want, "tweak {tweak}: H = σ(x) ⊕ AES_(S⊕tweak)(σ(x))");
+        }
+    }
+
+    #[test]
+    fn tccr_hash_is_deterministic_and_tweak_sensitive() {
+        let x: Label = *b"a-128-bit-label!";
+        assert_eq!(
+            tccr_hash(&tccr_cipher(5), &x),
+            tccr_hash(&tccr_cipher(5), &x),
+            "deterministic"
+        );
+        assert_ne!(
+            tccr_hash(&tccr_cipher(5), &x),
+            tccr_hash(&tccr_cipher(6), &x),
+            "tweak-sensitive"
+        );
+        let y: Label = *b"b-128-bit-label!";
+        assert_ne!(
+            tccr_hash(&tccr_cipher(5), &x),
+            tccr_hash(&tccr_cipher(5), &y),
+            "input-sensitive"
+        );
     }
 
     fn gate_circuit(kind: u8) -> Circuit {

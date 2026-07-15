@@ -47,6 +47,7 @@
 pub mod channel;
 pub mod ecdhe;
 pub mod handshake;
+pub mod netschedule;
 pub mod record;
 pub mod schedule;
 pub mod verify;

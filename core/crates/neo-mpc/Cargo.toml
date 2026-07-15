@@ -14,6 +14,11 @@ curve25519-dalek.workspace = true
 chacha20poly1305.workspace = true
 getrandom.workspace = true
 crypto-bigint.workspace = true
+rayon.workspace = true
+# Fixed-key AES for the garbled-circuit correlation-robust hash (MMO-σ / Guo'20 MITCCRH).
+# Hardware-accelerated: AES-NI on x86_64 (the relays), ARMv8 crypto on aarch64 — via runtime
+# detection. ~9x faster per gate than the BLAKE3 RO hash it replaces.
+aes = "0.8"
 # Live 2PC-TLS (M45): real P-256 curve ops for the split-scalar ECDHE key share.
 p256.workspace = true
 # Optional: full X.509 chain-building verifier for the live 2PC-TLS handshake.
@@ -36,6 +41,5 @@ num-bigint.workspace = true
 hmac.workspace = true
 hkdf.workspace = true
 sha2.workspace = true
-aes = "0.8"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 rcgen = "0.13"

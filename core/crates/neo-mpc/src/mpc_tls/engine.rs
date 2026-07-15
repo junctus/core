@@ -122,7 +122,7 @@ mod tests {
         let ew: HashSet<usize> = HashSet::new();
         let bits: Vec<bool> = (0..c.input_bits).map(|i| i % 3 == 0).collect();
         let t = std::time::Instant::now();
-        let out = eval_circuit(EngineKind::Malicious, &c, &ew, &bits).unwrap();
+        let out = eval_circuit(EngineKind::Malicious, c, &ew, &bits).unwrap();
         eprintln!(
             "MALICIOUS sha256 ({} ANDs): {:?}",
             c.and_gates(),

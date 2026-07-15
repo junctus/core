@@ -359,19 +359,57 @@ pub fn combine(t0: &Triple, t1: &Triple, d: &Deltas) -> Result<Triple> {
     Ok(Triple(t0.0.xor(&t1.0), t0.1, z)) // {α}, {β⁰}, {αβ⁰}
 }
 
+/// A fresh dealer-model leaky-AND triple over random authenticated bits.
+fn fresh_triple(d: &Deltas) -> Result<Triple> {
+    let alpha_a = AShare::deal(rand_bit()?, d)?;
+    let alpha_b = AShare::deal(rand_bit()?, d)?;
+    let beta = AShare::deal(rand_bit()?, d)?;
+    leaky_and(&alpha_a, &alpha_b, &beta, d)
+}
+
+/// **Sacrifice check** (WRK17): validate that triple `t` satisfies `αβ = α∧β` by
+/// Beaver-multiplying with an independent honest triple `aux` and MAC-checked-opening
+/// `⟨c⟩ ⊕ ⟨a∧b⟩` to 0. A maliciously biased product share `c` — one that stayed
+/// MAC-consistent, so a plain `open` wouldn't flag it — is caught here and aborts.
+/// `aux` is consumed (sacrificed); its `â, b̂` one-time-pad the opened `d, e`, so the
+/// check reveals nothing about `t`. Mirrors [`wrk17::verify_triple`](super::wrk17) for
+/// this module's share type (the conditional XORs realise `⟨x⟩ · public_bit`).
+pub fn verify_triple(t: &Triple, aux: &Triple, d: &Deltas) -> Result<()> {
+    let dd = t.0.xor(&aux.0).open(d)?; // a ⊕ â
+    let ee = t.1.xor(&aux.1).open(d)?; // b ⊕ b̂
+    let mut cp = aux.2; // ⟨â∧b̂⟩
+    if dd {
+        cp = cp.xor(&aux.1); // ⊕ d·⟨b̂⟩
+    }
+    if ee {
+        cp = cp.xor(&aux.0); // ⊕ e·⟨â⟩
+    }
+    if dd & ee {
+        cp = cp.xor(&const_share(true, d)); // ⊕ d·e (public constant)
+    }
+    if t.2.xor(&cp).open(d)? {
+        return Err(Error::Crypto(
+            "authgarble: triple failed the sacrifice check (abort)".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Generate `n` malicious-secure AND triples: `n·bucket` [`leaky_and`] triples over
-/// fresh random authenticated bits, a public random shuffle, then fold each bucket of
-/// `bucket` with [`combine`] (corruption prob ≤ `2^{-bucket}`). The random bits are
-/// dealt here (dealer model); a deployment draws them from the aBit generation over
-/// [`kos`](super::kos).
+/// fresh random authenticated bits, a public random shuffle, fold each bucket of
+/// `bucket` with [`combine`] (corruption prob ≤ `2^{-bucket}`), then **sacrifice-check**
+/// each folded triple with [`verify_triple`] against a fresh independent triple.
+/// Bucketing removes *leakage*; the sacrifice removes *incorrectness* (a biased raw row
+/// whose `c` stayed MAC-consistent, which would otherwise silently flip a gate) — the two
+/// together give malicious correctness *and* security, not just leakage removal. The
+/// random bits are dealt here (dealer model); a deployment draws them from the aBit
+/// generation over [`kos`](super::kos) and the networked sacrifice in
+/// [`netprep`](super::netprep).
 pub fn bucketed_and_triples(n: usize, bucket: usize, d: &Deltas) -> Result<Vec<Triple>> {
     assert!(bucket >= 1, "bucket size must be ≥ 1");
     let mut leaky = Vec::with_capacity(n * bucket);
     for _ in 0..n * bucket {
-        let alpha_a = AShare::deal(rand_bit()?, d)?;
-        let alpha_b = AShare::deal(rand_bit()?, d)?;
-        let beta = AShare::deal(rand_bit()?, d)?;
-        leaky.push(leaky_and(&alpha_a, &alpha_b, &beta, d)?);
+        leaky.push(fresh_triple(d)?);
     }
     shuffle(&mut leaky)?;
     let mut out = Vec::with_capacity(n);
@@ -380,6 +418,11 @@ pub fn bucketed_and_triples(n: usize, bucket: usize, d: &Deltas) -> Result<Vec<T
         for t in &chunk[1..] {
             acc = combine(&acc, t, d)?;
         }
+        // Remove residual incorrectness: a corrupted raw row yields αβ ≠ α∧β that is
+        // MAC-consistent (so `open` wouldn't flag it) yet silently flips a gate. The
+        // sacrifice against a fresh independent triple catches it and aborts.
+        let aux = fresh_triple(d)?;
+        verify_triple(&acc, &aux, d)?;
         out.push(acc);
     }
     Ok(out)
@@ -407,6 +450,26 @@ mod tests {
             AShare::deal(b, d).unwrap(),
             AShare::deal(a & b, d).unwrap(),
         )
+    }
+
+    #[test]
+    fn sacrifice_catches_a_corrupted_product_share() {
+        let d = Deltas::random().unwrap();
+        // An honest triple passes the sacrifice check.
+        let good = fresh_triple(&d).unwrap();
+        assert!(
+            verify_triple(&good, &fresh_triple(&d).unwrap(), &d).is_ok(),
+            "an honest triple passes"
+        );
+        // Bias the product share's value while keeping it authenticated (⊕ the public
+        // constant {1}). `open` alone can't see this, but the sacrifice must.
+        let bad = Triple(good.0, good.1, good.2.xor(&const_share(true, &d)));
+        assert!(
+            verify_triple(&bad, &fresh_triple(&d).unwrap(), &d).is_err(),
+            "a biased product share must fail the sacrifice check (abort)"
+        );
+        // The generator now sacrifices every output, so it still yields correct triples.
+        assert_eq!(bucketed_and_triples(4, 3, &d).unwrap().len(), 4);
     }
 
     fn adder4() -> Circuit {
@@ -628,7 +691,7 @@ mod tests {
             .map(|_| deal_triple(rand_bit().unwrap(), rand_bit().unwrap(), &d))
             .collect();
 
-        let out = eval_garbled(&circuit, &inputs, &triples, &d).unwrap();
+        let out = eval_garbled(circuit, &inputs, &triples, &d).unwrap();
         assert_eq!(
             out,
             circuit.eval(&bits),
@@ -639,7 +702,7 @@ mod tests {
         let mut bad = inputs.clone();
         bad[0].e.dg[0] ^= 1;
         assert!(
-            eval_garbled(&circuit, &bad, &triples, &d).is_err(),
+            eval_garbled(circuit, &bad, &triples, &d).is_err(),
             "a tampered wire must abort the real-circuit evaluation"
         );
     }

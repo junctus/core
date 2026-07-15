@@ -16,7 +16,9 @@ use neo_core::Error;
 use quinn::{ClientConfig, Endpoint, RecvStream, SendStream, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
-const MAX_FRAME: usize = 16 * 1024 * 1024;
+// Match the TCP path's MAX_RECORD (1 MiB) so both transports enforce the same
+// per-message cap.
+const MAX_FRAME: usize = 1024 * 1024;
 
 /// A QUIC listener.
 pub struct QuicServer {

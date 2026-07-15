@@ -17,13 +17,17 @@
 //! block would be mis-padded). Multi-block messages would iterate the same circuit
 //! by Horner — that iteration is **not** implemented here.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use neo_core::{Error, Result};
 
 use super::circuit::{Builder, Circuit};
 use super::engine::{eval_circuit, EngineKind};
 use super::garble;
+use super::garble_net::{evaluator_run, garbler_run};
+use super::live::channel::Channel;
+use super::netengine::Party;
 
 /// 288-bit little-endian bignum as nine 32-bit limbs (holds products < 2²⁶⁰).
 type Big = [u64; 9];
@@ -301,6 +305,188 @@ pub fn tag_shared_multi_engine(
     Ok((mask, bits_to_16(&out)))
 }
 
+/// Peak-memory bound for the networked Poly1305: message blocks folded per garbled-circuit
+/// call. The monolithic tag unrolls into ONE circuit whose size grows with the message — a
+/// ~3 KB TLS Certificate record ⇒ millions of gates ⇒ **gigabytes** of garbled tables, which
+/// OOMs a small node. Instead we Horner-accumulate the shared 132-bit accumulator across
+/// `POLY_CHUNK`-block circuits, so peak memory is one small chunk regardless of message size.
+const POLY_CHUNK: usize = 2;
+
+/// Networked multi-block Poly1305, **streamed** so peak memory is bounded (the fix that lets
+/// the live handshake run on a small node). Folds the public `blocks` into the shared
+/// one-time key `(r, s)` `POLY_CHUNK` at a time — threading the shared 132-bit Horner
+/// accumulator between calls — then finalizes `(acc + s) mod 2¹²⁸`. `key_share` is this
+/// party's XOR-share of `(r, s)`. Returns this party's XOR-share of the 16-byte tag; the
+/// result equals the monolithic [`tag_shared_multi`].
+pub fn tag_shared_multi_net(
+    ch: &mut dyn Channel,
+    party: Party,
+    key_share: &[u8; 32],
+    blocks: &[[u8; 16]],
+) -> Result<[u8; 16]> {
+    if blocks.is_empty() {
+        return Err(Error::Crypto("poly1305 needs at least one block".into()));
+    }
+    let mut r_bits = vec![false; 128];
+    write_bits(&mut r_bits, &key_share[0..16]); // r share
+    let mut s_bits = vec![false; 128];
+    write_bits(&mut s_bits, &key_share[16..32]); // s share
+
+    // Horner over chunks, threading the shared 132-bit accumulator (starts at 0).
+    let mut acc = vec![false; 132];
+    for group in blocks.chunks(POLY_CHUNK) {
+        acc = poly_chunk_net(ch, party, &r_bits, &acc, group)?;
+    }
+    let tag_bits = poly_finalize_net(ch, party, &s_bits, &acc)?; // (acc + s) mod 2^128
+    Ok(bits_to_16(&tag_bits))
+}
+
+/// Fill a bit vector with fresh randomness (a garbler output mask).
+fn random_bits(dst: &mut [bool]) -> Result<()> {
+    let mut raw = vec![0u8; dst.len().div_ceil(8)];
+    getrandom::getrandom(&mut raw).map_err(|e| Error::Rng(e.to_string()))?;
+    for (i, b) in dst.iter_mut().enumerate() {
+        *b = (raw[i / 8] >> (i % 8)) & 1 == 1;
+    }
+    Ok(())
+}
+
+/// One Horner chunk over `ch`: fold `blocks.len()` public blocks into the shared 132-bit
+/// accumulator under the shared clamped `r`. Returns this party's share of the updated acc.
+fn poly_chunk_net(
+    ch: &mut dyn Channel,
+    party: Party,
+    r_bits: &[bool],
+    acc_share: &[bool],
+    blocks: &[[u8; 16]],
+) -> Result<Vec<bool>> {
+    let n = blocks.len();
+    let circuit = poly_chunk_circuit(n);
+    let n_inputs = 652 + n * 256;
+    // Evaluator owns rB, accB, and every blockB.
+    let mut ev: HashSet<usize> = (128..256).collect(); // rB
+    ev.extend(388..520); // accB
+    for i in 0..n {
+        let base_b = 520 + i * 256 + 128;
+        ev.extend(base_b..base_b + 128);
+    }
+    match party {
+        Party::A => {
+            let mut g = vec![false; n_inputs];
+            g[0..128].copy_from_slice(r_bits); // rA
+            g[256..388].copy_from_slice(acc_share); // accA
+            for (i, blk) in blocks.iter().enumerate() {
+                let base_a = 520 + i * 256;
+                write_bits(&mut g[base_a..base_a + 128], blk); // blockA (public)
+            }
+            let mut mask = vec![false; 132];
+            random_bits(&mut mask)?;
+            let mask_base = 520 + n * 256;
+            g[mask_base..mask_base + 132].copy_from_slice(&mask);
+            garbler_run(ch, &circuit, &ev, &g)?;
+            Ok(mask) // A's acc share = maskA
+        }
+        Party::B => {
+            let mut e = vec![false; n_inputs];
+            e[128..256].copy_from_slice(r_bits); // rB
+            e[388..520].copy_from_slice(acc_share); // accB; blockB stays 0
+            evaluator_run(ch, &circuit, &ev, &e) // = acc' ⊕ maskA
+        }
+    }
+}
+
+/// Finalize the tag over `ch`: `(acc + s) mod 2¹²⁸`, shared acc + shared s → shared tag.
+fn poly_finalize_net(
+    ch: &mut dyn Channel,
+    party: Party,
+    s_bits: &[bool],
+    acc_share: &[bool],
+) -> Result<Vec<bool>> {
+    let circuit = poly_finalize_circuit();
+    let n_inputs = 648;
+    let mut ev: HashSet<usize> = (132..264).collect(); // accB
+    ev.extend(392..520); // sB
+    match party {
+        Party::A => {
+            let mut g = vec![false; n_inputs];
+            g[0..132].copy_from_slice(acc_share); // accA
+            g[264..392].copy_from_slice(s_bits); // sA
+            let mut mask = vec![false; 128];
+            random_bits(&mut mask)?;
+            g[520..648].copy_from_slice(&mask);
+            garbler_run(ch, circuit, &ev, &g)?;
+            Ok(mask) // A's tag share = maskA
+        }
+        Party::B => {
+            let mut e = vec![false; n_inputs];
+            e[132..264].copy_from_slice(acc_share); // accB
+            e[392..520].copy_from_slice(s_bits); // sB
+            evaluator_run(ch, circuit, &ev, &e) // = tag ⊕ maskA
+        }
+    }
+}
+
+/// One Horner-chunk circuit: reconstruct clamped `r` (`rA ⊕ rB`) and the input accumulator
+/// (`accA ⊕ accB`, 132-bit), fold `n` public blocks (`acc = ((acc + blockᵢ')·r) mod p`), and
+/// output the updated 132-bit accumulator XOR-masked. Layout:
+/// `rA[128] ‖ rB[128] ‖ accA[132] ‖ accB[132] ‖ n×(blockA[128]‖blockB[128]) ‖ maskA[132]`.
+/// The loop body is identical to [`tag_circuit_multi`]'s, but the accumulator comes from
+/// input shares (so it can be threaded across calls) instead of starting at zero.
+fn poly_chunk_circuit(n: usize) -> Arc<Circuit> {
+    static CACHE: OnceLock<Mutex<HashMap<usize, Arc<Circuit>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(c) = cache.lock().expect("poly cache").get(&n) {
+        return Arc::clone(c);
+    }
+    let built = Arc::new(build_poly_chunk_circuit(n));
+    Arc::clone(cache.lock().expect("poly cache").entry(n).or_insert(built))
+}
+
+fn build_poly_chunk_circuit(n: usize) -> Circuit {
+    let n_inputs = 652 + n * 256;
+    let mut b = Builder::new(n_inputs);
+    let zero = b.zero();
+    let one = b.one();
+    let mut r: Vec<usize> = (0..128).map(|i| b.xor(i, 128 + i)).collect();
+    for &bit in &clamp_zero_bits() {
+        r[bit] = zero;
+    }
+    let r132 = pad(&r, 132, zero);
+    let mut acc: Vec<usize> = (0..132).map(|i| b.xor(256 + i, 388 + i)).collect();
+    for blk in 0..n {
+        let base_a = 520 + blk * 256;
+        let base_b = base_a + 128;
+        let block: Vec<usize> = (0..128).map(|i| b.xor(base_a + i, base_b + i)).collect();
+        let mut block_hi = block;
+        block_hi.push(one); // bit 128 = 1
+        let block_hi = pad(&block_hi, 132, zero);
+        let sum = b.add_mod(&acc, &block_hi);
+        let prod = mul_circuit(&mut b, &sum, &r132);
+        acc = pad(&reduce_circuit(&mut b, &prod, zero, one), 132, zero);
+    }
+    let mask_base = 520 + n * 256;
+    let outputs: Vec<usize> = (0..132).map(|i| b.xor(acc[i], mask_base + i)).collect();
+    b.build(n_inputs, outputs)
+}
+
+/// The Poly1305 finalize circuit: `(acc + s) mod 2¹²⁸`, XOR-masked. Layout:
+/// `accA[132] ‖ accB[132] ‖ sA[128] ‖ sB[128] ‖ maskA[128]`.
+fn poly_finalize_circuit() -> &'static Circuit {
+    static CIRCUIT: OnceLock<Circuit> = OnceLock::new();
+    CIRCUIT.get_or_init(build_poly_finalize_circuit)
+}
+
+fn build_poly_finalize_circuit() -> Circuit {
+    let n_inputs = 648;
+    let mut b = Builder::new(n_inputs);
+    let zero = b.zero();
+    let acc: Vec<usize> = (0..132).map(|i| b.xor(i, 132 + i)).collect();
+    let s: Vec<usize> = (0..128).map(|i| b.xor(264 + i, 392 + i)).collect();
+    let summed = b.add_mod(&pad(&acc, 128, zero), &s);
+    let outputs: Vec<usize> = (0..128).map(|i| b.xor(summed[i], 520 + i)).collect();
+    b.build(n_inputs, outputs)
+}
+
 /// The multi-block tag circuit: reconstruct `(r, s)` from the two key shares, then
 /// Horner-accumulate `acc = ((acc + blockᵢ') · r) mod p` over the blocks, finally
 /// `(acc + s) mod 2¹²⁸` XOR-masked. `tag_circuit_multi(1)` is structurally the
@@ -470,6 +656,7 @@ fn bits_to_16(bits: &[bool]) -> [u8; 16] {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]

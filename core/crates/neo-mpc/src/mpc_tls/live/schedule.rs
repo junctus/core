@@ -70,7 +70,7 @@ pub struct TrafficKeys {
 
 /// Plaintext HMAC-SHA256, for the public parts of the schedule (Early Secret, the first
 /// Derived). Built on the crate's public [`sha256`].
-fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+pub(crate) fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
     let mut k = [0u8; 64];
     if key.len() > 64 {
         k[..32].copy_from_slice(&sha256(key));
@@ -94,7 +94,12 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
 }
 
 /// Plaintext `HKDF-Expand-Label` (length ≤ 32), for the public branch.
-fn hkdf_expand_label(secret: &[u8; 32], label: &[u8], context: &[u8], length: u16) -> Vec<u8> {
+pub(crate) fn hkdf_expand_label(
+    secret: &[u8; 32],
+    label: &[u8],
+    context: &[u8],
+    length: u16,
+) -> Vec<u8> {
     let mut msg = hkdf_label(label, context, length);
     msg.push(0x01); // T(1)
     hmac_sha256(secret, &msg)[..length as usize].to_vec()
@@ -113,7 +118,7 @@ fn derive_secret_public(secret: &[u8; 32], label: &[u8], transcript: &[u8]) -> [
 /// The 32-byte constant `Derived` off the Early Secret with an empty transcript — the
 /// public salt for the Handshake-Secret extract. `Early Secret = HKDF-Extract(0, 0)`;
 /// `Derived = Derive-Secret(Early Secret, "derived", "")`.
-fn derived_early() -> [u8; 32] {
+pub(crate) fn derived_early() -> [u8; 32] {
     let early = hmac_sha256(&[0u8; 32], &[0u8; 32]); // Extract(salt=0^Hash.len, IKM=0^Hash.len)
     derive_secret_public(&early, b"derived", b"")
 }

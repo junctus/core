@@ -19,10 +19,18 @@ neo-routing.workspace = true
 neo-mix.workspace = true
 neo-dataplane.workspace = true
 neo-netstack.workspace = true
-neo-mpc.workspace = true
+# live-tls-webpki: committee 2PC-TLS members validate the destination's cert chain to real
+# trust anchors (full X.509 path building), not just a pinned leaf — needed to reach arbitrary
+# clearnet servers safely.
+neo-mpc = { workspace = true, features = ["live-tls-webpki"] }
 tokio.workspace = true
 tracing.workspace = true
 blake3.workspace = true
+# The committee member's ephemeral ECDHE scalar share for 2PC-TLS (committee_2pc).
+p256.workspace = true
+# Baked-in Mozilla CA trust anchors for the committee 2PC-TLS server-cert verifier — hermetic,
+# so a headless relay doesn't depend on the OS trust store being present/configured.
+webpki-roots = "1"
 socket2.workspace = true
 getrandom.workspace = true
 zeroize.workspace = true

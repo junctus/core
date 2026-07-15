@@ -41,7 +41,7 @@ use ml_kem::{Ciphertext, Encoded, EncodedSizeUser, KemCore, MlKem768};
 use neo_core::{Error, NodeId, NodeIdentity, Result};
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::session::Session;
 
@@ -146,7 +146,9 @@ pub struct PendingResponder {
     session: Session,
     peer: VerifyingKey,
     peer_id: NodeId,
-    k_confirm: [u8; 32],
+    // Wrapped in `Zeroizing` so the short-lived confirmation key is wiped from
+    // memory when this pending state drops, rather than dropped in the clear.
+    k_confirm: Zeroizing<[u8; 32]>,
     th: [u8; 32],
 }
 
@@ -295,7 +297,7 @@ pub fn responder_process(
             session: Session::new(k_r2i, k_i2r),
             peer,
             peer_id,
-            k_confirm,
+            k_confirm: Zeroizing::new(k_confirm),
             th,
         },
     ))
@@ -316,6 +318,8 @@ pub fn responder_confirm(pending: PendingResponder, msg3: &[u8]) -> Result<Hands
     if !ct_eq(tag, &expected) {
         return Err(Error::Crypto("key confirmation failed".into()));
     }
+    // `k_confirm` is `Zeroizing`, so the confirmation key is wiped when the
+    // remaining `pending` fields drop at the end of this move.
     Ok(HandshakeResult {
         session: pending.session,
         peer: pending.peer,

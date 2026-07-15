@@ -196,7 +196,10 @@ impl Direction {
             pt_a,
             pt_b,
         )?;
-        self.seq += 1;
+        self.seq = self
+            .seq
+            .checked_add(1)
+            .ok_or_else(|| Error::Crypto("tls: record sequence number space exhausted".into()))?;
         Ok(rec)
     }
 
@@ -211,7 +214,10 @@ impl Direction {
             self.seq,
             record_body,
         )?;
-        self.seq += 1;
+        self.seq = self
+            .seq
+            .checked_add(1)
+            .ok_or_else(|| Error::Crypto("tls: record sequence number space exhausted".into()))?;
         Ok(out)
     }
 
@@ -235,7 +241,10 @@ impl Direction {
             self.seq,
             record_body,
         )?;
-        self.seq += 1;
+        self.seq = self
+            .seq
+            .checked_add(1)
+            .ok_or_else(|| Error::Crypto("tls: record sequence number space exhausted".into()))?;
         // Tail-only scan: combine one byte at a time from the end, never the interior body.
         let mut end = pt_a.len();
         while end > 0 && (pt_a[end - 1] ^ pt_b[end - 1]) == 0 {

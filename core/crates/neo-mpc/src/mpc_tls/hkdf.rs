@@ -31,7 +31,7 @@ use neo_core::{Error, Result};
 
 use super::circuit::{Builder, Circuit};
 use super::engine::{eval_circuit, EngineKind};
-use super::sha256::{compress_circuit, H0};
+use super::sha256::{compress_circuit, hmac_key_state, sha256_from_block_state, H0};
 
 /// `HMAC-SHA256(kA ⊕ kB, msg)` under 2PC: the key is XOR-shared (`kA` party A, `kB`
 /// party B), `msg` is public. Returns XOR-shares `(outA, outB)` of the 32-byte tag,
@@ -151,6 +151,158 @@ pub fn hkdf_extract_shared_engine(
     Ok((bytes_from_be_words(&mask_bits), bytes_from_be_words(&out)))
 }
 
+// ---- networked (two-party, over-the-wire) gadgets -----------------------------
+//
+// The over-the-wire counterparts of the `*_engine` gadgets above: instead of assembling
+// both parties' shares in-process and calling `eval_circuit`, each party runs its side of
+// the same masked circuit over a `Channel` via `netengine::masked_eval` (constant-round
+// garbled online). Each returns **only this party's XOR-share** of the result. Validated
+// against the stock key schedule over TCP in `live::netschedule`.
+
+use super::live::channel::Channel;
+use super::netengine::{masked_eval, Party};
+
+/// Networked [`hmac_sha256_shared`]: `HMAC-SHA256(kA ⊕ kB, msg)` run as two parties over
+/// `ch`. `key_share` is this party's share of the key; returns this party's share of the tag.
+pub fn hmac_sha256_shared_net(
+    ch: &mut dyn Channel,
+    party: Party,
+    key_share: &[u8; 32],
+    msg: &[u8],
+) -> Result<[u8; 32]> {
+    let circuit = hmac_circuit(msg);
+    let mut share = vec![false; 256];
+    write_be_words(&mut share, key_share);
+    Ok(bytes_from_be_words(&masked_eval(
+        ch, party, &circuit, &share,
+    )?))
+}
+
+/// Networked [`hkdf_extract_shared`]: `HKDF-Extract(public salt, shared IKM)` over `ch`.
+/// `ikm_share` is this party's share of the IKM; returns this party's share of the PRK.
+pub fn hkdf_extract_shared_net(
+    ch: &mut dyn Channel,
+    party: Party,
+    salt: &[u8; 32],
+    ikm_share: &[u8; 32],
+) -> Result<[u8; 32]> {
+    let circuit = hmac_pub_key_circuit(salt);
+    let mut share = vec![false; 256];
+    write_be_words(&mut share, ikm_share);
+    Ok(bytes_from_be_words(&masked_eval(
+        ch, party, &circuit, &share,
+    )?))
+}
+
+/// Networked [`hkdf_expand_label_shared`]: `HKDF-Expand-Label(shared secret, public label,
+/// public context, length)` over `ch`. Returns this party's share of the 32-byte output.
+pub fn hkdf_expand_label_shared_net(
+    ch: &mut dyn Channel,
+    party: Party,
+    secret_share: &[u8; 32],
+    label: &[u8],
+    context: &[u8],
+    length: u16,
+) -> Result<[u8; 32]> {
+    let mut msg = hkdf_label(label, context, length);
+    msg.push(0x01); // HKDF-Expand T(1) counter
+    hmac_sha256_shared_net(ch, party, secret_share, &msg)
+}
+
+// ── HMAC key precomputation (DECO / Garble-then-Prove, eprint 2023/964) ──
+//
+// A key `K` used for several HMACs (TLS 1.3's `handshake_secret` keys 3 derivations,
+// `master` keys 2, each `*_ap` keys its key+iv) recomputed `compress(H0, K⊕ipad)` and
+// `compress(H0, K⊕opad)` every time. Precompute them ONCE per key, and — the DECO trick —
+// **open the inner state** so the message-side inner hash finishes in the clear, leaving
+// only the single outer compression under 2PC per HMAC. Net: ~4 garbled compressions per
+// HMAC → ~1 (+2 one-time per key), the dominant key-schedule cost.
+
+/// The two key-derived HMAC chaining states, precomputed once per key. The **inner** state
+/// is **opened** (public): `ipad_state = compress(H0, K⊕ipad)` is a one-way image of `K`, so
+/// revealing it leaks neither `K` nor any derived secret (each derived secret is
+/// `compress(opad_state, inner)`, which still needs the secret outer state). The **outer**
+/// state stays **secret-shared** — keeping `opad_state` split is exactly what keeps every
+/// secret derived from `K` (down to the application traffic keys) split across the two
+/// parties, so no single member can reconstruct it.
+pub struct PreparedKey {
+    /// `compress(H0, K⊕ipad)` — OPENED to both parties (public).
+    ipad_state: [u8; 32],
+    /// This party's XOR-share of `compress(H0, K⊕opad)` — NEVER opened.
+    opad_state_share: [u8; 32],
+}
+
+/// Precompute a shared HMAC key's chaining states over `ch`: two garbled compressions
+/// (`ipad_state`, `opad_state`) plus one open of the inner state. Reuse the result across
+/// every HMAC under this key via [`hmac_prepared_net`] / [`expand_label_prepared_net`].
+///
+/// SECURITY: only `ipad_state` is opened; `opad_state` is returned as a share and must stay
+/// shared (see [`PreparedKey`]).
+pub fn prepare_key_net(
+    ch: &mut dyn Channel,
+    party: Party,
+    key_share: &[u8; 32],
+) -> Result<PreparedKey> {
+    let mut share = vec![false; 256];
+    write_be_words(&mut share, key_share);
+
+    // ipad_state = compress(H0, K⊕ipad), then OPEN it (safe: one-way image of K).
+    let ipad_share =
+        bytes_from_be_words(&masked_eval(ch, party, &key_state_circuit(0x36), &share)?);
+    let ipad_state = open_shared(ch, &ipad_share)?;
+
+    // opad_state = compress(H0, K⊕opad), kept SHARED.
+    let opad_state_share =
+        bytes_from_be_words(&masked_eval(ch, party, &key_state_circuit(0x5c), &share)?);
+
+    Ok(PreparedKey {
+        ipad_state,
+        opad_state_share,
+    })
+}
+
+/// `HMAC-SHA256(K, msg)` for a [`PreparedKey`] and a **public** `msg`: the inner hash
+/// `H((K⊕ipad)‖msg)` finishes in the clear from the opened `ipad_state`, and only the single
+/// outer compression `compress(opad_state, inner)` runs under 2PC. Returns this party's share
+/// of the tag.
+pub fn hmac_prepared_net(
+    ch: &mut dyn Channel,
+    party: Party,
+    prepared: &PreparedKey,
+    msg: &[u8],
+) -> Result<[u8; 32]> {
+    let inner = sha256_from_block_state(&prepared.ipad_state, msg); // cleartext inner hash
+    let mut share = vec![false; 256];
+    write_be_words(&mut share, &prepared.opad_state_share);
+    Ok(bytes_from_be_words(&masked_eval(
+        ch,
+        party,
+        &outer_from_opad_circuit(&inner),
+        &share,
+    )?))
+}
+
+/// `HKDF-Expand-Label` for a [`PreparedKey`] (the common case: same secret, many labels).
+pub fn expand_label_prepared_net(
+    ch: &mut dyn Channel,
+    party: Party,
+    prepared: &PreparedKey,
+    label: &[u8],
+    context: &[u8],
+    length: u16,
+) -> Result<[u8; 32]> {
+    let mut msg = hkdf_label(label, context, length);
+    msg.push(0x01); // HKDF-Expand T(1) counter
+    hmac_prepared_net(ch, party, prepared, &msg)
+}
+
+/// XOR-open a 32-byte shared value (send our share, receive the peer's, combine).
+fn open_shared(ch: &mut dyn Channel, share: &[u8; 32]) -> Result<[u8; 32]> {
+    ch.send(share)?;
+    let peer = ch.recv_exact(32)?;
+    Ok(core::array::from_fn(|i| share[i] ^ peer[i]))
+}
+
 /// The public `HkdfLabel` struct: `uint16 length ‖ (len‖"tls13 "+label) ‖ (len‖context)`.
 pub(crate) fn hkdf_label(label: &[u8], context: &[u8], length: u16) -> Vec<u8> {
     let full_label = [b"tls13 ".as_slice(), label].concat();
@@ -208,15 +360,86 @@ fn hmac_circuit(msg: &[u8]) -> Circuit {
     b.build(768, outputs)
 }
 
+/// Garble `compress(H0, K⊕pad_block)` — the key-dependent HMAC chaining state for `pad`
+/// (`0x36` = ipad, `0x5c` = opad). Inputs `keyA[256] ‖ keyB[256] ‖ maskA[256]`, output the
+/// 256-bit state ⊕ maskA. **One** compression (vs the 4 in a full [`hmac_circuit`]).
+fn key_state_circuit(pad: u8) -> Circuit {
+    let mut b = Builder::new(768);
+    let key: Vec<Vec<usize>> = (0..8)
+        .map(|w| {
+            (0..32)
+                .map(|j| b.xor(w * 32 + j, 256 + w * 32 + j))
+                .collect()
+        })
+        .collect();
+    let h0: Vec<Vec<usize>> = H0.iter().map(|&h| b.word_const(h)).collect();
+    let pad_block = key_pad_block(&mut b, &key, pad);
+    let state = compress_circuit(&mut b, &h0, &pad_block);
+    let outputs: Vec<usize> = state
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .map(|(i, wire)| b.xor(wire, 512 + i))
+        .collect();
+    b.build(768, outputs)
+}
+
+/// Garble the HMAC **outer** compression `compress(opad_state, inner‖pad)` for a PUBLIC
+/// `inner` digest. Inputs `opadA[256] ‖ opadB[256] ‖ maskA[256]` (the shared opad state),
+/// output the 256-bit HMAC tag ⊕ maskA. **One** compression; the inner hash is done in the
+/// clear (see [`hmac_prepared_net`]).
+fn outer_from_opad_circuit(inner: &[u8; 32]) -> Circuit {
+    let mut b = Builder::new(768);
+    let state: Vec<Vec<usize>> = (0..8)
+        .map(|w| {
+            (0..32)
+                .map(|j| b.xor(w * 32 + j, 256 + w * 32 + j))
+                .collect()
+        })
+        .collect();
+    // Final block = inner digest (public) ‖ 0x80 ‖ 0-pad ‖ bit length (64+32)*8 = 768.
+    let mut inner_block = [0u8; 64];
+    inner_block[..32].copy_from_slice(inner);
+    let mut final_block: Vec<Vec<usize>> = (0..8)
+        .map(|w| b.word_const(be_word(&inner_block, w)))
+        .collect();
+    final_block.push(b.word_const(0x8000_0000));
+    for _ in 9..15 {
+        final_block.push(b.word_const(0));
+    }
+    final_block.push(b.word_const((64 + 32) * 8));
+    let ho = compress_circuit(&mut b, &state, &final_block);
+    let outputs: Vec<usize> = ho
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .map(|(i, wire)| b.xor(wire, 512 + i))
+        .collect();
+    b.build(768, outputs)
+}
+
 /// HMAC-SHA256 with a **public** key and a **shared** 32-byte message (`HKDF-Extract`
 /// direction): inputs `msgA[256] ‖ msgB[256] ‖ maskA[256]`, output `HMAC ⊕ maskA`
 /// (256 bits). The key `K` (≤ 32 bytes, zero-padded to the 64-byte block) is baked in as
 /// public constants; only the 32-byte message is shared, so both pad blocks
 /// (`K⊕ipad`, `K⊕opad`) are public and the inner/outer message blocks carry the shares.
 fn hmac_pub_key_circuit(key: &[u8; 32]) -> Circuit {
-    let mut b = Builder::new(768);
-    let h0: Vec<Vec<usize>> = H0.iter().map(|&h| b.word_const(h)).collect();
+    // The key is PUBLIC, so both HMAC key-block chaining states are computed in the CLEAR and
+    // baked in as constants — the circuit garbles only the two MESSAGE compressions (inner
+    // over the shared msg, outer over the shared inner digest), not the two key-block ones.
+    let ipad_state = hmac_key_state(key, 0x36);
+    let opad_state = hmac_key_state(key, 0x5c);
+    let state_words = |s: &[u8; 32], b: &mut Builder| -> Vec<Vec<usize>> {
+        (0..8)
+            .map(|w| {
+                b.word_const(u32::from_be_bytes(
+                    s[w * 4..w * 4 + 4].try_into().expect("4"),
+                ))
+            })
+            .collect()
+    };
 
+    let mut b = Builder::new(768);
     // msg = msgA ⊕ msgB, 8 big-endian 32-bit words (one SHA-256 block of shared data).
     let msg: Vec<Vec<usize>> = (0..8)
         .map(|w| {
@@ -226,34 +449,25 @@ fn hmac_pub_key_circuit(key: &[u8; 32]) -> Circuit {
         })
         .collect();
 
-    // K zero-padded to 64 bytes = 16 big-endian words; high 8 words are 0.
-    let mut kw = [0u32; 16];
-    for (w, slot) in kw.iter_mut().enumerate().take(8) {
-        *slot = u32::from_be_bytes(key[w * 4..w * 4 + 4].try_into().expect("4 bytes"));
-    }
-
-    // Inner: H((K⊕ipad) ‖ msg). Block 0 public (K⊕0x36…36); block 1 = msg(shared)+pad.
-    let ipad_block: Vec<Vec<usize>> = kw.iter().map(|&w| b.word_const(w ^ 0x3636_3636)).collect();
-    let mut h = compress_circuit(&mut b, &h0, &ipad_block);
+    // Inner: compress(ipad_state, msg ‖ pad) — ipad_state precomputed (public key).
+    let ipad_cv = state_words(&ipad_state, &mut b);
     let mut inner_block: Vec<Vec<usize>> = msg;
     inner_block.push(b.word_const(0x8000_0000)); // 0x80 after the 32-byte message
     for _ in 9..15 {
         inner_block.push(b.word_const(0));
     }
     inner_block.push(b.word_const((64 + 32) * 8)); // bit length = 768
-    h = compress_circuit(&mut b, &h, &inner_block);
-    let inner_digest = h; // 8 words, shared
+    let inner_digest = compress_circuit(&mut b, &ipad_cv, &inner_block);
 
-    // Outer: H((K⊕opad) ‖ inner_digest). Block 0 public (K⊕0x5c…5c); final = digest+pad.
-    let opad_block: Vec<Vec<usize>> = kw.iter().map(|&w| b.word_const(w ^ 0x5c5c_5c5c)).collect();
-    let mut ho = compress_circuit(&mut b, &h0, &opad_block);
+    // Outer: compress(opad_state, inner_digest ‖ pad).
+    let opad_cv = state_words(&opad_state, &mut b);
     let mut final_block: Vec<Vec<usize>> = inner_digest;
     final_block.push(b.word_const(0x8000_0000));
     for _ in 9..15 {
         final_block.push(b.word_const(0));
     }
     final_block.push(b.word_const((64 + 32) * 8));
-    ho = compress_circuit(&mut b, &ho, &final_block);
+    let ho = compress_circuit(&mut b, &opad_cv, &final_block);
 
     // Output HMAC ⊕ maskA.
     let outputs: Vec<usize> = ho
@@ -446,6 +660,65 @@ mod tests {
                 &got[..length as usize],
                 &okm[..],
                 "HKDF-Expand-Label({}) under 2PC",
+                String::from_utf8_lossy(label)
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_key_expand_matches_rustcrypto_and_reuses() {
+        // The DECO/Garble-then-Prove prepared-key path over two networked parties: prepare
+        // ONCE (reveal ipad_state, keep opad_state shared), then several HKDF-Expand-Label
+        // calls under the SAME key. Each combined output must equal the stock hkdf crate
+        // byte-for-byte — validating the reveal-inner-state construction, the outer-only
+        // gadget, and key reuse across labels.
+        use super::super::live::channel::TcpChannel;
+        use std::net::{TcpListener, TcpStream};
+        use std::thread;
+
+        let secret_a: [u8; 32] =
+            core::array::from_fn(|i| (i as u8).wrapping_mul(5).wrapping_add(2));
+        let secret_b: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(9) ^ 0x3c);
+        let secret = combine(&secret_a, &secret_b);
+        let cases: Vec<(Vec<u8>, Vec<u8>, u16)> = vec![
+            (b"c hs traffic".to_vec(), vec![0xab; 32], 32),
+            (b"s hs traffic".to_vec(), vec![0xab; 32], 32),
+            (b"derived".to_vec(), vec![], 32),
+            (b"key".to_vec(), vec![], 16),
+        ];
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cases_a = cases.clone();
+        let a = thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let mut ch = TcpChannel::from_stream(sock);
+            let pk = prepare_key_net(&mut ch, Party::A, &secret_a).unwrap();
+            cases_a
+                .iter()
+                .map(|(l, c, n)| {
+                    expand_label_prepared_net(&mut ch, Party::A, &pk, l, c, *n).unwrap()
+                })
+                .collect::<Vec<_>>()
+        });
+        let mut ch = TcpChannel::from_stream(TcpStream::connect(addr).unwrap());
+        let pk = prepare_key_net(&mut ch, Party::B, &secret_b).unwrap();
+        let shares_b: Vec<[u8; 32]> = cases
+            .iter()
+            .map(|(l, c, n)| expand_label_prepared_net(&mut ch, Party::B, &pk, l, c, *n).unwrap())
+            .collect();
+        let shares_a = a.join().unwrap();
+
+        for (i, (label, context, length)) in cases.iter().enumerate() {
+            let got = combine(&shares_a[i], &shares_b[i]);
+            let info = hkdf_label(label, context, *length);
+            let hk = Hkdf::<Sha256>::from_prk(&secret).unwrap();
+            let mut okm = vec![0u8; *length as usize];
+            hk.expand(&info, &mut okm).unwrap();
+            assert_eq!(
+                &got[..*length as usize],
+                &okm[..],
+                "prepared HKDF-Expand-Label({}) matches stock",
                 String::from_utf8_lossy(label)
             );
         }

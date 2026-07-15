@@ -13,8 +13,10 @@
 
 use neo_core::NodeIdentity;
 
+mod committee;
 mod tunnel;
 mod tunnel_stack;
+pub use committee::committee_fetch;
 pub use tunnel::{tunnel_connect, NeoPrivacy, NeoTunnelError, NeoTunnelSession};
 pub use tunnel_stack::{tunnel_stack_connect, NeoTunnelStackSession};
 

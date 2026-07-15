@@ -11,10 +11,24 @@ tested (the **Shipped** table below), including the frontier research (anonymous
 committee exit, PIR + ZK shuffle), three rounds of internal security review with every finding fixed
 (`SECURITY_REVIEW.md`), and the flagship — a **complete, adversarially-verified malicious-secure
 two-party MPC-TLS crypto stack** (M24) that now **runs live** against a real TLS 1.3 server (M45 ✅,
-interop-verified against stock `rustls`, both semi-honest and malicious engines). The one hard gate before
-anyone relies on neo is the **external cryptography audit**; the standing product gap is REALITY
-full-session indistinguishability (M27). **Nothing here is audited; do not rely on neo for real-world safety
-until the audit gate.**
+interop-verified against stock `rustls`, both semi-honest and malicious engines) — and, as the
+**committee** driver (M47), completes a live handshake between two exit members to a real public server
+so no single member holds the session key. The one hard gate before anyone relies on neo is the
+**external cryptography audit**; the standing product gap is REALITY full-session indistinguishability
+(M27). **Nothing here is audited; do not rely on neo for real-world safety until the audit gate.**
+
+> **Positioning of 2PC-TLS (M24/M45/M47) — a specialized capability, parked.** This is **not**
+> how neo browses the web. Browsing uses the onion overlay: the client does its own end-to-end
+> TLS to the destination and the exit forwards TCP (fast). 2PC-TLS is a research-grade oblivious
+> building block — two committee members jointly run TLS so neither holds the key — for **TLS
+> oracles (DECO-style), oblivious exits for high-sensitivity long-lived connections, and
+> split-trust exits**. It works end-to-end, but a handshake is **tens of seconds** (garbling
+> millions of AND gates + OT under 2PC); it is inherently far too slow for interactive use, so it
+> is parked pending a faster design (the certificate-flight 2PC and the per-record 2PC are the
+> costs; opening the *public* handshake-traffic keys and 2PC-ing only the *secret* application
+> epoch, plus silent-OT, are the leading un-park levers). Optimized this session (BLAKE3-hasher
+> hoist, level-parallel garbling, circuit caching, streamed flights, KOS OT-extension): ~69s →
+> ~39s inter-relay. Do not treat it as the transport.
 
 ---
 

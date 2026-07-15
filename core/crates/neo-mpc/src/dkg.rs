@@ -28,6 +28,19 @@
 //! whose dealt share fails its own Feldman commitment is identified (via
 //! [`KeyShare::verify`]) and the run aborts; a complaint/disqualification round
 //! for liveness under active faults is likewise deferred.
+//!
+//! A second, distinct Byzantine vector lives here too: **commitment equivocation.**
+//! Each member verifies a dealt share only against the commitment the *same dealer*
+//! sent *to it*, and the qualified-set reconciliation agrees only on the *index set*
+//! of accepted dealers — never on the commitment *values*. A dealer can therefore
+//! send peer A `(C_A, share_A)` and peer B `(C_B, share_B)` with `C_A ≠ C_B`, each
+//! internally consistent, so A and B accept it into QUAL yet aggregate *different*
+//! joint commitments and end up on **incompatible joint keys**. Like the accept-set
+//! split, this is a **liveness/availability** failure (circuits built against one
+//! key fail to combine against the other), not a secrecy one — it leaks neither `s`
+//! nor any plaintext. Closing it needs the same broadcast/agreement primitive as the
+//! accept-set case: round 2 must additionally exchange and intersect a hash of each
+//! accepted dealer's commitment, disqualifying any dealer seen with two commitments.
 
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 use curve25519_dalek::ristretto::RistrettoPoint;

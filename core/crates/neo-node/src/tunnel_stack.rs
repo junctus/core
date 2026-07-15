@@ -103,7 +103,9 @@ async fn handle_udp_flow(
     let (sink, stream) = match open_circuit(&identity, &circuit, &target).await {
         Ok(pair) => pair,
         Err(e) => {
-            tracing::debug!(%target, error = %e, "udp circuit open failed; dropping flow");
+            // Don't log the destination (%target) — keep flow destinations out of client
+            // logs, which may persist or be exfiltrated. The error alone is enough to debug.
+            tracing::debug!(error = %e, "udp circuit open failed; dropping flow");
             return;
         }
     };
@@ -155,7 +157,8 @@ async fn handle_flow(
     let (sink, stream) = match open_circuit(&identity, &circuit, &target).await {
         Ok(pair) => pair,
         Err(e) => {
-            tracing::debug!(%target, error = %e, "circuit open failed; dropping flow");
+            // Don't log the destination (%target) — keep flow destinations out of client logs.
+            tracing::debug!(error = %e, "circuit open failed; dropping flow");
             conn.close();
             return;
         }

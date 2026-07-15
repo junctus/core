@@ -11,6 +11,7 @@
 //! module's boundary.
 
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 use neo_core::{Error, Result};
 
@@ -122,6 +123,51 @@ pub fn sha256(msg: &[u8]) -> [u8; 32] {
     out
 }
 
+/// SHA-256 **continuation** from a mid-hash chaining state: the digest of
+/// `(64-byte first block already absorbed into `state`) ‖ msg`. Used for the HMAC **inner**
+/// hash `H((K⊕ipad) ‖ msg)` once the key-dependent `ipad_state = compress(H0, K⊕ipad)` is
+/// known in the clear — the message half then finishes outside the garbled circuit.
+pub(crate) fn sha256_from_block_state(state: &[u8; 32], msg: &[u8]) -> [u8; 32] {
+    let mut h = [0u32; 8];
+    for (i, hi) in h.iter_mut().enumerate() {
+        *hi = u32::from_be_bytes(state[i * 4..i * 4 + 4].try_into().expect("4 bytes"));
+    }
+    // Total hashed length includes the 64-byte prefix block already folded into `state`.
+    let total_bits = ((64 + msg.len()) as u64) * 8;
+    let mut m = msg.to_vec();
+    m.push(0x80);
+    while m.len() % 64 != 56 {
+        m.push(0);
+    }
+    m.extend_from_slice(&total_bits.to_be_bytes());
+    for block in m.chunks(64) {
+        let mut b = [0u8; 64];
+        b.copy_from_slice(block);
+        h = compress_ref(h, &b);
+    }
+    let mut out = [0u8; 32];
+    for i in 0..8 {
+        out[i * 4..i * 4 + 4].copy_from_slice(&h[i].to_be_bytes());
+    }
+    out
+}
+
+/// The HMAC key-block chaining state `compress(H0, (key‖0…) ⊕ pad^64)` for a ≤32-byte key,
+/// computed in the CLEAR — used to precompute the ipad/opad states of an HMAC whose key is
+/// PUBLIC (e.g. HKDF-Extract's salt), so the circuit need not garble those two compressions.
+pub(crate) fn hmac_key_state(key: &[u8; 32], pad: u8) -> [u8; 32] {
+    let mut block = [pad; 64];
+    for (b, k) in block.iter_mut().zip(key) {
+        *b ^= k;
+    }
+    let h = compress_ref(H0, &block);
+    let mut out = [0u8; 32];
+    for i in 0..8 {
+        out[i * 4..i * 4 + 4].copy_from_slice(&h[i].to_be_bytes());
+    }
+    out
+}
+
 /// One SHA-256 compression (`h' = h + block-mixing`), the reference for the circuit.
 fn compress_ref(h: [u32; 8], block: &[u8; 64]) -> [u32; 8] {
     let mut w = [0u32; 64];
@@ -183,7 +229,12 @@ fn ssig1(x: u32) -> u32 {
 
 /// A SHA-256 compression as a circuit: inputs `h_in[256] ‖ block[512]` (768),
 /// output the 256-bit updated chaining value. Verified against [`compress_ref`].
-pub fn sha256_compress_circuit() -> Circuit {
+pub fn sha256_compress_circuit() -> &'static Circuit {
+    static CIRCUIT: OnceLock<Circuit> = OnceLock::new();
+    CIRCUIT.get_or_init(build_sha256_compress_circuit)
+}
+
+fn build_sha256_compress_circuit() -> Circuit {
     let mut b = Builder::new(768);
     let h_in: Vec<Vec<usize>> = (0..8).map(|i| (i * 32..i * 32 + 32).collect()).collect();
     let block: Vec<Vec<usize>> = (0..16)
@@ -242,12 +293,6 @@ pub(crate) fn compress_circuit(
 fn xor_w(b: &mut Builder, x: &[usize], y: &[usize]) -> Vec<usize> {
     (0..32).map(|i| b.xor(x[i], y[i])).collect()
 }
-fn and_w(b: &mut Builder, x: &[usize], y: &[usize]) -> Vec<usize> {
-    (0..32).map(|i| b.and(x[i], y[i])).collect()
-}
-fn not_w(b: &mut Builder, x: &[usize]) -> Vec<usize> {
-    (0..32).map(|i| b.inv(x[i])).collect()
-}
 fn rotr(w: &[usize], n: usize) -> Vec<usize> {
     (0..32).map(|j| w[(j + n) % 32]).collect()
 }
@@ -257,18 +302,28 @@ fn shr(b: &mut Builder, w: &[usize], n: usize) -> Vec<usize> {
         .map(|j| if j + n < 32 { w[j + n] } else { z })
         .collect()
 }
+/// `Ch(x,y,z) = (x∧y) ⊕ (¬x∧z) = z ⊕ (x ∧ (y⊕z))` — the right form is **1 AND/bit**
+/// (vs 2 ANDs + a NOT for the literal definition).
 fn c_ch(b: &mut Builder, x: &[usize], y: &[usize], z: &[usize]) -> Vec<usize> {
-    let xy = and_w(b, x, y);
-    let nx = not_w(b, x);
-    let nxz = and_w(b, &nx, z);
-    xor_w(b, &xy, &nxz)
+    (0..32)
+        .map(|i| {
+            let yz = b.xor(y[i], z[i]);
+            let xyz = b.and(x[i], yz);
+            b.xor(z[i], xyz)
+        })
+        .collect()
 }
+/// `Maj(x,y,z) = (x∧y) ⊕ (x∧z) ⊕ (y∧z) = x ⊕ ((x⊕y) ∧ (x⊕z))` — **1 AND/bit** (vs 3).
+/// (x=0 ⇒ y∧z; x=1 ⇒ y∨z, i.e. the majority.)
 fn c_maj(b: &mut Builder, x: &[usize], y: &[usize], z: &[usize]) -> Vec<usize> {
-    let xy = and_w(b, x, y);
-    let xz = and_w(b, x, z);
-    let yz = and_w(b, y, z);
-    let t = xor_w(b, &xy, &xz);
-    xor_w(b, &t, &yz)
+    (0..32)
+        .map(|i| {
+            let xy = b.xor(x[i], y[i]);
+            let xz = b.xor(x[i], z[i]);
+            let t = b.and(xy, xz);
+            b.xor(x[i], t)
+        })
+        .collect()
 }
 fn c_bsig0(b: &mut Builder, x: &[usize]) -> Vec<usize> {
     let (a, c, d) = (rotr(x, 2), rotr(x, 13), rotr(x, 22));
