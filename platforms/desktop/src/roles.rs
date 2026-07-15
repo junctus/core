@@ -195,6 +195,7 @@ pub async fn run_relay(
                 }
                 Ok(Served::Circuit) => tracing::info!("circuit connection closed"),
                 Ok(Served::Committee) => tracing::info!("committee circuit handled"),
+                Ok(Served::CommitteeLink) => tracing::info!("committee-2pc member link handled"),
                 Err(e) => tracing::warn!("connection handling failed: {e}"),
             }
         });
@@ -323,6 +324,74 @@ pub async fn run_send(
     println!(
         "onion handed to the first hop — each relay peels one layer and forwards; \
          the exit delivers the message. No relay on the path can read it."
+    );
+    Ok(())
+}
+
+/// **Committee 2PC-TLS onion fetch** (experimental, audit-gated): fetch `dest` through a
+/// self-formed 2-member exit committee, anonymized via a disjoint relay path. Discovers the
+/// attested relay pool, picks a lead (an exit relay) + a follower + a disjoint path hop, and
+/// runs the client side — the request is XOR-shared across the members and the response is
+/// reconstructed from their two shares, so no committee member ever sees the client or the
+/// plaintext.
+pub async fn run_committee_2pc(
+    identity: NodeIdentity,
+    cfg: DiscoveryConfig,
+    dest: String,
+    request: Option<String>,
+) -> Result<()> {
+    let host = dest.rsplit_once(':').map(|(h, _)| h).unwrap_or(&dest).to_string();
+    let request = request.unwrap_or_else(|| {
+        format!("GET / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: neo-committee2pc\r\nConnection: close\r\n\r\n")
+    });
+    println!("this node : {} (committee-2pc client)", identity.id());
+    let snapshot = discovery::obtain_snapshot(&cfg).await?;
+    let relays = snapshot.relays(now_unix());
+    if relays.len() < 3 {
+        bail!(
+            "committee-2pc needs ≥3 relays (2 committee members + ≥1 disjoint path hop); found {}",
+            relays.len()
+        );
+    }
+    // Shuffle, then pick: lead = an exit-capable relay (it egresses); follower + one path hop
+    // from the rest, all distinct (members disjoint from the path).
+    let mut idx: Vec<usize> = (0..relays.len()).collect();
+    for i in (1..idx.len()).rev() {
+        let mut b = [0u8; 8];
+        getrandom::getrandom(&mut b).map_err(|e| anyhow::anyhow!("rng: {e}"))?;
+        idx.swap(i, (u64::from_le_bytes(b) % (i as u64 + 1)) as usize);
+    }
+    let lead_pos = idx
+        .iter()
+        .position(|&i| relays[i].exit)
+        .context("no exit-capable relay to lead the committee")?;
+    let lead_i = idx.remove(lead_pos);
+    let follower_i = idx.remove(0);
+    let path_i = idx.remove(0);
+    let hop_of = |r: &PeerRecord| -> Result<Hop> {
+        Ok(Hop {
+            id: r.id,
+            sphinx: r.sphinx,
+            addr: r.addrs.first().cloned().context("relay has no address")?,
+        })
+    };
+    let lead = hop_of(relays[lead_i])?;
+    let follower = hop_of(relays[follower_i])?;
+    let path = vec![hop_of(relays[path_i])?];
+    println!(
+        "committee: lead {} @ {} + follower {} @ {}; anonymized via path hop {} @ {}",
+        lead.id, lead.addr, follower.id, follower.addr, path[0].id, path[0].addr
+    );
+
+    let response =
+        neo_node::committee_2pc::committee_2pc_fetch(&identity, &path, &lead, &follower, &dest, request.as_bytes())
+            .await?;
+    let text = String::from_utf8_lossy(&response);
+    let status = text.lines().next().unwrap_or("(no status line)");
+    println!("✓ committee 2PC-TLS fetch of {dest} — server responded: {status}");
+    println!(
+        "  reconstructed {} bytes from the two members' shares — neither member saw the client or the plaintext.",
+        response.len()
     );
     Ok(())
 }

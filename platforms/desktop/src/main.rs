@@ -161,6 +161,28 @@ enum Command {
         #[arg(long)]
         threshold: Option<usize>,
     },
+    /// **Committee 2PC-TLS onion fetch** (experimental, audit-gated): fetch a destination
+    /// through a self-formed 2-member exit committee, anonymized via a disjoint relay path.
+    /// Discovers the attested pool, XOR-shares the request across the two members, and
+    /// reconstructs the response from their shares — no committee member sees the client or the
+    /// plaintext. Needs ≥3 relays (2 committee + ≥1 path).
+    Committee2pcOnion {
+        /// Destination `host:port`.
+        #[arg(long)]
+        dest: String,
+        /// Request bytes (default: `GET /`).
+        #[arg(long)]
+        request: Option<String>,
+        /// Override discovery mirror base URLs (repeatable).
+        #[arg(long = "mirror")]
+        mirrors: Vec<String>,
+        /// Override trusted witness keys, hex (repeatable).
+        #[arg(long = "witness")]
+        witnesses: Vec<String>,
+        /// Required distinct witness signatures.
+        #[arg(long)]
+        threshold: Option<usize>,
+    },
     /// Operator: sign a bootstrap record (current mirrors + witnesses) with a
     /// bootstrap key and print the DNS TXT value to publish for DoH rendezvous.
     BootstrapRecord {
@@ -422,6 +444,17 @@ async fn main() -> anyhow::Result<()> {
             let cfg = defaults::DiscoveryConfig::resolve(&mirrors, &witnesses, threshold)?;
             let identity = NodeIdentity::generate()?;
             roles::run_send(identity, cfg, message, hops).await?
+        }
+        Command::Committee2pcOnion {
+            dest,
+            request,
+            mirrors,
+            witnesses,
+            threshold,
+        } => {
+            let cfg = defaults::DiscoveryConfig::resolve(&mirrors, &witnesses, threshold)?;
+            let identity = NodeIdentity::generate()?;
+            roles::run_committee_2pc(identity, cfg, dest, request).await?
         }
         Command::BootstrapRecord {
             identity,
