@@ -48,7 +48,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 
 use crate::forward::{Hop, NextHop};
-use crate::run::{connect_verified, read_frame, write_frame};
+use crate::run::{connect_verified, connect_verified_ephemeral, read_frame, write_frame};
 
 /// Per-cell end-to-end MAC length.
 const CELL_MAC_LEN: usize = 16;
@@ -297,7 +297,7 @@ pub async fn open_circuit(
 /// target) — used by the committee-2PC client, whose exit payload is a binary
 /// `Committee2pcPayload`.
 pub async fn open_circuit_payload(
-    identity: &NodeIdentity,
+    _identity: &NodeIdentity,
     circuit: &[Hop],
     payload: &[u8],
 ) -> Result<(CircuitSink, CircuitStream)> {
@@ -315,7 +315,7 @@ pub async fn open_circuit_payload(
     // slot; create_packet_keyed hands us the per-hop secrets.
     let (packet, secrets) = create_packet_keyed(&hops, payload)?;
 
-    let (stream, result) = connect_verified(&circuit[0].addr, identity, &circuit[0].id).await?;
+    let (stream, result) = connect_verified_ephemeral(&circuit[0].addr, &circuit[0].id).await?;
     let (mut sealer, opener) = result.session.split();
     let (r, mut w) = stream.into_split();
     // Declare the circuit mode, then send the setup packet.
@@ -357,7 +357,9 @@ pub async fn serve_circuit<R: NextHop>(
         (s, o)
     };
 
-    let setup_frame = read_frame(&mut pr).await?;
+    let setup_frame = tokio::time::timeout(crate::run::HANDSHAKE_TIMEOUT, read_frame(&mut pr))
+        .await
+        .map_err(|_| Error::Config("circuit setup timed out".into()))??;
     let mut pr_opener = pr_opener;
     let packet_bytes = pr_opener.open(&setup_frame)?;
     let packet = SphinxPacket::from_bytes(&packet_bytes)?;

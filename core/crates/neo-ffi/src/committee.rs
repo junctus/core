@@ -130,7 +130,8 @@ fn default_request(dest: &str) -> Vec<u8> {
 ///
 /// `request` is the raw plaintext request bytes to send inside the committee's TLS
 /// (e.g. an HTTP request); pass an empty vector for a default `GET /`. `secret` is
-/// the caller's identity; `mirrors`/`witnesses`/`threshold` are the same
+/// the caller's application identity; fresh one-use transport identities hide it
+/// from both circuit entry relays. `mirrors`/`witnesses`/`threshold` are the same
 /// discovery inputs as [`crate::tunnel_stack_connect`]. `net_interface_index` pins
 /// the relay sockets to the physical interface (as the tunnel does) so they don't
 /// loop back when a tunnel is up; pass 0 when unscoped.
@@ -152,9 +153,7 @@ pub fn committee_fetch(
     // the OS points the default route at a TUN must use the physical interface or
     // they loop back. 0 = unscoped (no tunnel up). Process-wide, like the relay's
     // `--net-interface`; harmless to re-assert the interface an active tunnel set.
-    if net_interface_index != 0 {
-        neo_node::netif::set_bound_interface(net_interface_index);
-    }
+    let _interface = crate::tunnel_stack::acquire_interface(net_interface_index)?;
 
     let identity = NodeIdentity::from_bytes(&secret).map_err(|_| NeoTunnelError::Identity)?;
 

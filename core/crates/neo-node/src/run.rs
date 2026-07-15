@@ -65,17 +65,37 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>>
 /// Dial `addr` and run the initiator side of the handshake: init → cookie
 /// challenge → cookied init → m2 → key-confirmation m3.
 pub async fn connect(addr: &str, identity: &NodeIdentity) -> Result<(TcpStream, HandshakeResult)> {
-    let mut stream = crate::netif::connect_scoped(addr).await?;
-    let (state, init1) = initiator_message1(identity)?;
-    write_frame(&mut stream, &init1).await?;
-    // Anti-DoS cookie round-trip: echo the responder's challenge in a re-sent m1.
-    let cookie = read_frame(&mut stream).await?;
-    let init2 = state.with_cookie(&cookie);
-    write_frame(&mut stream, &init2).await?;
-    let msg2 = read_frame(&mut stream).await?;
-    let (msg3, result) = initiator_finish(state, &msg2)?;
-    write_frame(&mut stream, &msg3).await?;
-    Ok((stream, result))
+    connect_with_timeout(addr, identity, HANDSHAKE_TIMEOUT).await
+}
+
+async fn connect_with_timeout(
+    addr: &str,
+    identity: &NodeIdentity,
+    timeout: Duration,
+) -> Result<(TcpStream, HandshakeResult)> {
+    tokio::time::timeout(timeout, async {
+        let mut stream = crate::netif::connect_scoped(addr).await?;
+        let (state, init1) = initiator_message1(identity)?;
+        write_frame(&mut stream, &init1).await?;
+        // Anti-DoS cookie round-trip: echo the responder's challenge in a re-sent m1.
+        let cookie = read_frame(&mut stream).await?;
+        let init2 = state.with_cookie(&cookie);
+        write_frame(&mut stream, &init2).await?;
+        let msg2 = read_frame(&mut stream).await?;
+        let (msg3, result) = initiator_finish(state, &msg2)?;
+        write_frame(&mut stream, &msg3).await?;
+        Ok((stream, result))
+    })
+    .await
+    .map_err(|_| Error::Crypto("initiator handshake timed out".into()))?
+}
+
+/// Connect with a fresh one-use initiator identity. Client entry relays need to
+/// authenticate as the selected node, but they do not need a stable identifier for
+/// the client; rotating this pseudonym per circuit prevents cross-flow linkage.
+pub async fn connect_ephemeral(addr: &str) -> Result<(TcpStream, HandshakeResult)> {
+    let identity = NodeIdentity::generate()?;
+    connect(addr, &identity).await
 }
 
 /// Like [`connect`], but require the peer to authenticate as the `expected`
@@ -99,6 +119,17 @@ pub async fn connect_verified(
         )));
     }
     Ok((stream, result))
+}
+
+/// As [`connect_verified`], using a fresh one-use client transport identity.
+/// Relay-to-relay callers should continue using [`connect_verified`] with their
+/// stable relay identity so the next hop can authorize the authenticated peer.
+pub async fn connect_verified_ephemeral(
+    addr: &str,
+    expected: &NodeId,
+) -> Result<(TcpStream, HandshakeResult)> {
+    let identity = NodeIdentity::generate()?;
+    connect_verified(addr, &identity, expected).await
 }
 
 /// Accept one connection and run the responder side of the handshake. A
@@ -185,5 +216,42 @@ mod tests {
         // Each side cryptographically authenticated the other.
         assert_eq!(client_saw, server_key);
         assert_eq!(server_saw, client_key);
+    }
+
+    #[tokio::test]
+    async fn ephemeral_connect_rotates_the_client_node_id() {
+        let server_id = NodeIdentity::generate().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (_, first) = accept(&listener, &server_id).await.unwrap();
+            let (_, second) = accept(&listener, &server_id).await.unwrap();
+            (first.peer_id, second.peer_id)
+        });
+
+        connect_ephemeral(&addr).await.unwrap();
+        connect_ephemeral(&addr).await.unwrap();
+        let (first, second) = server.await.unwrap();
+        assert_ne!(
+            first, second,
+            "entry peers must not receive a durable client id"
+        );
+    }
+
+    #[tokio::test]
+    async fn initiator_handshake_times_out_on_a_stalled_peer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let stalled = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let identity = NodeIdentity::generate().unwrap();
+        let err = match connect_with_timeout(&addr, &identity, Duration::from_millis(25)).await {
+            Ok(_) => panic!("stalled peer completed the handshake"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("timed out"));
+        stalled.abort();
     }
 }

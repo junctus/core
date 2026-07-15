@@ -3,9 +3,8 @@
 //! - [`run_relay`] is a public node: it listens, publishes a signed record to
 //!   the seeds, re-registers on a heartbeat, and **forwards onion traffic** to
 //!   the next hop (or delivers it if it is the exit).
-//! - [`run_client`] is the zero-configuration consumer: it obtains a verified
-//!   relay snapshot, picks a relay, and completes an authenticated handshake —
-//!   no peer address typed by hand.
+//! - [`run_client`] obtains a quorum-verified relay snapshot, picks a relay, and
+//!   completes an authenticated handshake — no peer address typed by hand.
 //! - [`run_send`] routes a one-shot message through a discovered multi-hop
 //!   onion circuit.
 //!
@@ -13,6 +12,7 @@
 //! (`neo_node::forward`); discovery decides *who* to talk to.
 
 use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -184,11 +184,7 @@ pub async fn run_relay(
             .await
             {
                 Ok(Served::Message(Outcome::Delivered { payload })) => {
-                    println!(
-                        "delivered {} bytes: {}",
-                        payload.len(),
-                        String::from_utf8_lossy(&payload)
-                    );
+                    println!("delivered {} bytes", payload.len());
                 }
                 Ok(Served::Message(Outcome::Forwarded { next })) => {
                     tracing::info!("forwarded onion to {next}");
@@ -247,9 +243,9 @@ fn build_record(
     .context("signing relay record")
 }
 
-/// Run as a zero-configuration client: discover a relay and handshake with it.
+/// Run as a discovery-configured client: discover a relay and handshake with it.
 pub async fn run_client(identity: NodeIdentity, cfg: DiscoveryConfig) -> Result<()> {
-    println!("this node : {} (client)", identity.id());
+    println!("client identity loaded");
     println!("discovering relays via {} mirror(s)…", cfg.mirrors.len());
 
     let snapshot = discovery::obtain_snapshot(&cfg).await?;
@@ -628,16 +624,145 @@ pub async fn run_committee_send(
 /// the key back to disk.
 pub fn load_or_create_identity(path: &Path) -> Result<NodeIdentity> {
     if path.exists() {
-        return Ok(NodeIdentity::from_bytes(&std::fs::read(path)?)?);
+        if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+            bail!(
+                "refusing to load identity through symlink {}",
+                path.display()
+            );
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // O_NOFOLLOW closes the metadata/open race; O_NONBLOCK avoids hanging
+            // if an attacker swaps in a FIFO before the open.
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let mut file = options
+            .open(path)
+            .with_context(|| format!("opening identity {}", path.display()))?;
+        if !file.metadata()?.is_file() {
+            bail!("identity path is not a regular file: {}", path.display());
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        return Ok(NodeIdentity::from_bytes(&bytes)?);
     }
     let identity = NodeIdentity::generate()?;
-    std::fs::write(path, identity.to_bytes())
-        .with_context(|| format!("writing identity to {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    write_secret_file(path, &identity.to_bytes(), false)?;
     println!("generated a new relay identity at {}", path.display());
     Ok(identity)
+}
+
+/// Persist secret bytes without a world-readable creation window or symlink
+/// following. New files use an atomic no-clobber hard link; replacement renames a
+/// same-directory temporary file over the destination.
+pub fn write_secret_file(path: &Path, bytes: &[u8], replace: bool) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("secret path has no file name: {}", path.display()))?;
+    let mut nonce = [0u8; 8];
+    getrandom::getrandom(&mut nonce).context("generating secret-file nonce")?;
+    let tmp = parent.join(format!(
+        ".{}.tmp-{}",
+        name.to_string_lossy(),
+        hex::encode(nonce)
+    ));
+
+    let result = (|| -> Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&tmp)
+            .with_context(|| format!("creating {}", tmp.display()))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+
+        if replace {
+            #[cfg(windows)]
+            if std::fs::symlink_metadata(path).is_ok() {
+                std::fs::remove_file(path)?;
+            }
+            std::fs::rename(&tmp, path)?;
+        } else {
+            // hard_link is an atomic create-if-absent operation and never follows
+            // an existing destination symlink.
+            std::fs::hard_link(&tmp, path)?;
+            std::fs::remove_file(&tmp)?;
+        }
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result.with_context(|| format!("writing secret to {}", path.display()))
+}
+
+#[cfg(test)]
+mod secret_file_tests {
+    use super::*;
+
+    fn path(name: &str) -> std::path::PathBuf {
+        let mut random = [0u8; 8];
+        getrandom::getrandom(&mut random).unwrap();
+        std::env::temp_dir().join(format!("neo-{name}-{}", hex::encode(random)))
+    }
+
+    #[test]
+    fn secret_creation_is_no_clobber_and_owner_only() {
+        let path = path("secret");
+        write_secret_file(&path, b"first", false).unwrap();
+        assert!(write_secret_file(&path, b"second", false).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_replacement_replaces_a_symlink_instead_of_following_it() {
+        use std::os::unix::fs::symlink;
+        let target = path("target");
+        let link = path("link");
+        std::fs::write(&target, b"do not overwrite").unwrap();
+        symlink(&target, &link).unwrap();
+        write_secret_file(&link, b"new secret", true).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"do not overwrite");
+        assert_eq!(std::fs::read(&link).unwrap(), b"new secret");
+        std::fs::remove_file(target).unwrap();
+        std::fs::remove_file(link).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_loading_rejects_a_symlink() {
+        use std::os::unix::fs::symlink;
+        let target = path("identity-target");
+        let link = path("identity-link");
+        let identity = NodeIdentity::generate().unwrap();
+        write_secret_file(&target, &identity.to_bytes(), false).unwrap();
+        symlink(&target, &link).unwrap();
+        assert!(load_or_create_identity(&link).is_err());
+        std::fs::remove_file(target).unwrap();
+        std::fs::remove_file(link).unwrap();
+    }
 }

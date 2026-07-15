@@ -75,9 +75,12 @@ cargo run -p neo-cli -- identity generate
 
 ## Run the network
 
-`neo` finds the network with zero configuration — the only thing a client needs baked in (or via
-`NEO_MIRRORS`/`NEO_WITNESSES`) is a discovery seed to bootstrap from. Deploy a seed at your own domain
-with [`deploy/discovery/`](deploy/discovery/) (one command), or run the whole thing locally:
+`neo` discovers the network from untrusted mirrors, but accepts a snapshot only with signatures from
+at least two independently operated witnesses by default. The current baked bundle contains one
+witness and therefore intentionally fails closed until a second is provisioned; operators can supply
+their quorum via `NEO_MIRRORS`/`NEO_WITNESSES` and `--threshold`. Deploy seeds at independent domains
+with [`deploy/discovery/`](deploy/discovery/) (one command each), or run a threshold-1 development
+network locally:
 
 ```sh
 # 1. A discovery seed (finds peers, serves no user traffic).
@@ -95,7 +98,8 @@ neo send --message "no relay on this path can read me" --hops 2
 ```
 
 Each relay peels one Sphinx layer and forwards to the next; only the exit sees the payload.
-`neo run` with no flags is a zero-config client that discovers and connects to a relay.
+`neo run --threshold 1` is appropriate only for this single-witness local example. Production clients
+must retain the default threshold and configure at least two independent witness keys.
 
 ## Run a relay or exit node
 

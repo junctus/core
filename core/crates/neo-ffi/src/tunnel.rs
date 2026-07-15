@@ -103,19 +103,23 @@ pub struct NeoTunnelSession {
 }
 
 impl NeoTunnelSession {
-    /// Dial `peer_addr` (`host:port`), handshake with the identity in `secret`,
-    /// and start the tunnel. Blocks until the handshake resolves so the caller
-    /// (e.g. `startTunnel`) can fail fast.
+    /// Dial `peer_addr` (`host:port`) and start the tunnel. `secret` is validated
+    /// as the caller's application identity but is never sent to the entry peer;
+    /// the transport uses a fresh one-use identity. Blocks until the handshake
+    /// resolves so the caller (e.g. `startTunnel`) can fail fast.
     fn connect_inner(
         secret: Vec<u8>,
         peer_addr: String,
         privacy: NeoPrivacy,
     ) -> Result<NeoTunnelSession, NeoTunnelError> {
-        let identity = NodeIdentity::from_bytes(&secret).map_err(|_| NeoTunnelError::Identity)?;
+        // Validate the caller's stored identity, but never expose it to an entry
+        // peer. The transport handshake uses a fresh one-use pseudonym so separate
+        // tunnel sessions cannot be linked by a durable NodeId.
+        NodeIdentity::from_bytes(&secret).map_err(|_| NeoTunnelError::Identity)?;
         let rt = runtime();
 
         let (stream, handshake) = rt
-            .block_on(neo_node::run::connect(&peer_addr, &identity))
+            .block_on(neo_node::run::connect_ephemeral(&peer_addr))
             .map_err(|e| NeoTunnelError::Connect {
                 detail: e.to_string(),
             })?;

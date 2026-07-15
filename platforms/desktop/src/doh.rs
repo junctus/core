@@ -16,6 +16,7 @@ use neo_discovery::bootstrap::BootstrapRecord;
 use neo_discovery::now_unix;
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_DOH_BODY: usize = 256 * 1024;
 
 /// Resolve current mirrors + witnesses via DoH. `resolver` is a DoH JSON
 /// endpoint (e.g. `https://cloudflare-dns.com/dns-query`), `name` the TXT record
@@ -41,7 +42,21 @@ pub async fn resolve_via_doh(
     if !resp.status().is_success() {
         bail!("DoH resolver returned HTTP {}", resp.status());
     }
-    let body = resp.text().await.context("reading DoH response")?;
+    if resp
+        .content_length()
+        .is_some_and(|n| n > MAX_DOH_BODY as u64)
+    {
+        bail!("DoH response exceeds {MAX_DOH_BODY} bytes");
+    }
+    let mut bytes = Vec::new();
+    let mut resp = resp;
+    while let Some(chunk) = resp.chunk().await.context("reading DoH response")? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_DOH_BODY {
+            bail!("DoH response exceeds {MAX_DOH_BODY} bytes");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let body = String::from_utf8(bytes).context("DoH response is not UTF-8")?;
 
     // Each TXT answer may be split into <=255-char strings; try each joined
     // candidate until one parses and verifies.
